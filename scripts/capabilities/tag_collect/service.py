@@ -46,6 +46,7 @@ DETAIL_VERIFICATION_LEVELS = {"P0", "P1"}
 VERIFICATION_STATUS_UNVERIFIED = "unverified"
 VERIFICATION_STATUS_SAMPLE = "sample_verified"
 VERIFICATION_STATUS_VERIFIED = "verified"
+VERIFICATION_STATUS_PARTIAL = "partial_verified"
 VERIFICATION_STATUS_FAILED = "failed"
 
 
@@ -464,11 +465,13 @@ class TagCollectInput:
     categories: List[str]
     tags: List[str]
     keywords: List[str]
+    source_urls: List[str]
     exclude_tags: List[str]
     max_queries: int
     max_items_per_query: int
     sample_data: bool
     output_format: str
+    collect_source: str
 
 
 def _split_csv(value: str) -> List[str]:
@@ -484,21 +487,25 @@ def parse_input(
     categories: str = "",
     tags: str = "",
     keywords: str = "",
+    source_urls: str = "",
     exclude_tags: str = "",
     max_queries: int = 20,
     max_items_per_query: int = 20,
     sample_data: bool = False,
     output_format: str = "xlsx",
+    collect_source: str = "rpa",
 ) -> TagCollectInput:
     return TagCollectInput(
         categories=_split_csv(categories),
         tags=_split_csv(tags),
         keywords=_split_csv(keywords),
+        source_urls=_split_csv(source_urls),
         exclude_tags=_split_csv(exclude_tags),
         max_queries=min(MAX_QUERIES, max(1, max_queries)),
         max_items_per_query=min(MAX_ITEMS_PER_QUERY, max(1, max_items_per_query)),
         sample_data=sample_data,
         output_format=(output_format or "xlsx").lower(),
+        collect_source=(collect_source or "rpa").lower(),
     )
 
 
@@ -537,8 +544,9 @@ def build_filter_rule_summary(config: TagCollectInput) -> Dict[str, Any]:
     return {
         "and_tags": config.tags,
         "or_categories": config.categories,
+        "source_urls": config.source_urls,
         "exclude_tags": config.exclude_tags,
-        "notes": "MVP：类目/标签用于生成查询词；exclude_tags 对标题、类目、风险提示、标签来源做命中过滤。详情页字段仍需后续核验。",
+        "notes": "MVP：类目/标签用于生成查询词或辅助 URL 采集评分；source_urls 可直接指定真实 1688 页面；exclude_tags 对标题、类目、风险提示、标签来源做命中过滤。详情页字段仍需后续核验。",
     }
 
 
@@ -553,7 +561,8 @@ def _sample_products_for_query(query: str, limit: int) -> List[Product]:
 
 
 def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], List[str]]:
-    queries = build_queries(config)
+    direct_urls = config.source_urls if (not config.sample_data and config.collect_source == "rpa") else []
+    queries = direct_urls or build_queries(config)
     channel = _channel_from_tags(config.tags)
     seen: set[str] = set()
     rows: List[Dict[str, Any]] = []
@@ -561,9 +570,27 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     for query in queries:
         if config.sample_data:
             products = _sample_products_for_query(query, config.max_items_per_query)
-        else:
+        elif config.collect_source == "api":
             from capabilities.search.service import search_products
             products = search_products(query, channel=channel)[: config.max_items_per_query]
+        else:
+            from capabilities.tag_collect.rpa import collect_products_from_1688_page
+            products = [
+                Product(
+                    id=str(item.get("id", "")),
+                    title=str(item.get("title", "")),
+                    price=str(item.get("price", "-")),
+                    image=str(item.get("image", "")),
+                    url=str(item.get("url", "")),
+                    stats=item.get("stats") if isinstance(item.get("stats"), dict) else {},
+                )
+                for item in collect_products_from_1688_page(
+                    query if not direct_urls else "",
+                    config.max_items_per_query,
+                    source_url=query if direct_urls else "",
+                )
+                if str(item.get("id", "")).strip()
+            ]
         for product in products:
             if product.id in seen:
                 continue
@@ -577,6 +604,24 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     for index, row in enumerate(ranked, 1):
         row["seq"] = index
     return ranked, queries
+
+
+def friendly_collect_error(error: Exception) -> str:
+    """把 RPA/真实采集底层异常转成运营可理解的提示。"""
+    message = str(error)
+    if "login_required:" in message:
+        return message.split("login_required:", 1)[1].strip()
+    if "browser_closed:" in message:
+        return message.split("browser_closed:", 1)[1].strip()
+    if "Target page, context or browser has been closed" in message:
+        return (
+            "真实采集窗口已关闭或登录/验证未完成，未生成任何数据。"
+            "请保持弹出的 1688/淘宝登录窗口打开并完成扫码验证后重试；"
+            "如果账号仍登录不上，可以粘贴浏览器里能打开的 1688 搜索页或商品详情页 URL 做公开页面真实数据测试。"
+        )
+    if "真实页面 RPA 返回格式异常" in message:
+        return "真实页面 RPA 返回异常，未生成任何数据。请重试一次；如果仍失败，优先使用 1688 页面 URL 模式测试真实页面解析。"
+    return message
 
 
 def _excluded_by_tags(row: Dict[str, Any], exclude_tags: List[str]) -> bool:
@@ -801,6 +846,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
         "source_keyword": query,
         "matched_tags": ",".join(config.tags + config.categories),
         "tag_source": ",".join(config.tags + config.categories),
+        "list_source": "sample" if config.sample_data else config.collect_source,
         "recommendation_score": score,
         "recommendation_level": _level(score),
         "recommendation_reason": "；".join(reasons) or "待人工复核",
@@ -890,7 +936,9 @@ def _build_verification_evidence(
             "mode": mode,
             "status": field_status,
             "verified_at": verified_at,
-            "fail_reason": "" if field_status != VERIFICATION_STATUS_FAILED else (fail_reason or "样例详情数据缺失"),
+            "fail_reason": "" if field_status != VERIFICATION_STATUS_FAILED else (
+                fail_reason or ("样例详情数据缺失" if mode == "sample" else "真实详情页未提取到该字段")
+            ),
         })
     return records
 
@@ -899,6 +947,8 @@ def _queue_reason(row: Dict[str, Any]) -> str:
     reasons = []
     if row.get("recommendation_level") in DETAIL_VERIFICATION_LEVELS:
         reasons.append(f"{row.get('recommendation_level')} 高潜商品")
+    if row.get("list_source") == "rpa":
+        reasons.append("真实页面候选商品")
     if row.get("wechat_shop_suggestion") in ("可铺", "谨慎"):
         reasons.append(f"微信小店预判{row.get('wechat_shop_suggestion')}")
     if row.get("data_gap_risk"):
@@ -911,7 +961,7 @@ def build_verification_queue(rows: List[Dict[str, Any]], max_items: int = 20) ->
     for row in rows:
         if row.get("verification_status") not in ("", VERIFICATION_STATUS_UNVERIFIED):
             continue
-        if row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS:
+        if row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS and row.get("list_source") != "rpa":
             continue
         if not any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
             continue
@@ -969,11 +1019,15 @@ def _apply_verified_fields(
         status=status,
         fail_reason=fail_reason,
     )
-    if status in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED):
+    if status in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
         for record in evidence:
             if record["status"] != VERIFICATION_STATUS_FAILED:
                 row[record["field_key"]] = record["normalized"]
-        row["verification_status"] = status
+        if status == VERIFICATION_STATUS_VERIFIED and any(record["status"] == VERIFICATION_STATUS_FAILED for record in evidence):
+            row["verification_status"] = VERIFICATION_STATUS_PARTIAL
+            fail_reason = fail_reason or "真实详情页仅提取到部分关键字段"
+        else:
+            row["verification_status"] = status
         row["data_gap_risk"] = "" if not _has_blocking_detail_risk(row) else "详情核验存在履约/售后风险"
         row["after_sales_risk"] = "" if not _has_blocking_detail_risk(row) else "品退率或发货率需人工复核"
         row["risk_flags"] = "；".join(
@@ -1018,14 +1072,38 @@ def _sample_verify_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _real_verify_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        from capabilities.tag_collect.rpa import collect_detail_fields_from_1688_page
+        fields = collect_detail_fields_from_1688_page(str(row.get("url", "")), str(row.get("item_id", "")))
+    except Exception as exc:
+        return _apply_verified_fields(
+            row,
+            {},
+            status=VERIFICATION_STATUS_FAILED,
+            source="1688_detail_page_rpa",
+            source_url=str(row.get("url", "")),
+            mode="real",
+            fail_reason=f"真实详情页核验失败：{exc}",
+        )
+
+    if not fields:
+        return _apply_verified_fields(
+            row,
+            {},
+            status=VERIFICATION_STATUS_FAILED,
+            source="1688_detail_page_rpa",
+            source_url=str(row.get("url", "")),
+            mode="real",
+            fail_reason="真实详情页未提取到关键字段",
+        )
+
     return _apply_verified_fields(
         row,
-        {},
-        status=VERIFICATION_STATUS_FAILED,
-        source="prod_detail/rpa",
+        fields,
+        status=VERIFICATION_STATUS_VERIFIED,
+        source="1688_detail_page_rpa",
         source_url=str(row.get("url", "")),
         mode="real",
-        fail_reason="真实详情核验适配层尚未接入；后续通过 prod_detail 或 Playwright/RPA 补充",
     )
 
 
@@ -1066,7 +1144,7 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             continue
         records = _sample_verify_row(row) if sample_data else _real_verify_row(row)
         evidence.extend(records)
-        if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED):
+        if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
             verified_count += 1
         else:
             failed_count += 1
@@ -1075,7 +1153,7 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
     payload["verification_records"] = evidence
     payload["verified_count"] = len([
         row for row in rows
-        if isinstance(row, dict) and row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED)
+        if isinstance(row, dict) and row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL)
     ])
     payload["verification_failed_count"] = len([
         row for row in rows
@@ -1219,6 +1297,7 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["排除标签", ", ".join(payload.get("exclude_tags", []))],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
         ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
+        ["采集来源", payload.get("collect_source", "")],
         ["说明", "列表字段仅用于初筛；运费、品退率、发货率等关键字段需详情页核验后才可信。"],
     ]
     failed_rows = [labels] + [
@@ -1339,8 +1418,10 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "filter_rules": build_filter_rule_summary(config),
         "categories": config.categories,
         "tags": config.tags,
+        "source_urls": config.source_urls,
         "exclude_tags": config.exclude_tags,
         "sample_data": config.sample_data,
+        "collect_source": config.collect_source,
         "row_count": len(rows),
         "output_path": output_path,
         "rows": rows,
@@ -1362,10 +1443,12 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "data": {
             "run_id": run_id,
             "queries": queries,
+            "source_urls": config.source_urls,
             "row_count": len(rows),
             "output_path": output_path,
             "snapshot_path": snapshot_path,
             "sample_data": config.sample_data,
+            "collect_source": config.collect_source,
             "columns": [label for _, label in EXPORT_COLUMNS],
             "top_items": rows[:10],
             "verification_queue": payload["verification_queue"],
@@ -1388,6 +1471,8 @@ def build_markdown(payload: Dict[str, Any], snapshot_path: str) -> str:
     lines.append(f"- 快照文件：`{snapshot_path}`")
     if payload.get("sample_data"):
         lines.append("- 数据模式：样例数据（未调用 1688 接口）")
+    else:
+        lines.append(f"- 数据模式：真实数据（来源：{payload.get('collect_source') or 'rpa'}）")
     lines.append("\n### 人工复核说明")
     lines.append("导出后请在表格中更新 `人工复核状态`、`人工复核备注`、`微信小店铺货建议`。")
     lines.append("列表字段只做初筛，运费、品退率、发货率等关键字段仍需进入详情页核验。")

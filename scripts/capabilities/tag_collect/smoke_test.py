@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tag_collect 最小回归测试：字段、导出、Web token、样例采集。"""
+"""tag_collect 最小回归测试：字段、导出、Web token、真实模式开关、开发样例采集。"""
 
 import json
 import os
@@ -17,7 +17,10 @@ from capabilities.tag_collect import web
 from capabilities.tag_collect.service import (
     DETAIL_ONLY_FIELDS,
     DETAIL_VERIFICATION_PENDING,
+    Product,
+    build_verification_queue,
     get_numbered_export_columns,
+    product_to_export_row,
     parse_input,
     run_tag_collect,
     verify_run_details,
@@ -126,9 +129,40 @@ def test_sample_detail_verification():
         _assert("sample_detail" in record_xml, "核验记录 sheet 应包含样例来源")
 
 
+def test_real_page_candidates_enter_verification_queue():
+    config = parse_input(
+        categories="家居日用品",
+        tags="微信小店,一件代发",
+        source_urls="https://detail.1688.com/offer/1234567890.html",
+        sample_data=False,
+        collect_source="rpa",
+        output_format="xlsx",
+    )
+    _assert(
+        config.source_urls == ["https://detail.1688.com/offer/1234567890.html"],
+        "真实采集应支持直接指定 1688 页面 URL",
+    )
+    row = product_to_export_row(
+        Product(
+            id="1234567890",
+            title="真实页面采集候选商品",
+            price="19.9",
+            image="",
+            url="https://detail.1688.com/offer/1234567890.html",
+            stats={"rawText": "真实页面列表文本"},
+        ),
+        "家居日用品",
+        config,
+    )
+    _assert(row["list_source"] == "rpa", "真实页面候选商品应标记 list_source=rpa")
+    queue = build_verification_queue([row])
+    _assert(queue, "真实页面候选商品即使列表指标不足，也应进入详情核验队列")
+    _assert("真实页面候选商品" in queue[0]["reason"], "核验队列应标明真实页面来源")
+
+
 def test_web_token_and_sample_api():
     web.SERVER_TOKEN = "tag-collect-smoke-token"
-    web.ALLOW_REAL_COLLECT = False
+    web.ALLOW_REAL_COLLECT = True
     server = ThreadingHTTPServer(("127.0.0.1", 0), web.TagCollectHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -137,7 +171,7 @@ def test_web_token_and_sample_api():
         with urllib.request.urlopen(f"{base_url}/api/options", timeout=10) as response:
             options = json.loads(response.read().decode("utf-8"))["data"]
         _assert(options["token"] == web.SERVER_TOKEN, "options 应返回本地 token")
-        _assert(options["allow_real_collect"] is False, "真实采集默认应关闭")
+        _assert(options["allow_real_collect"] is True, "真实采集默认应开启")
         _assert(options["limits"]["max_queries"] == 50, "服务端查询词限额应为 50")
 
         try:
@@ -193,6 +227,7 @@ def test_web_token_and_sample_api():
         _assert(payload["data"]["verified_count"] >= 1, "Web 样例详情核验应补充商品")
         _assert(payload["data"]["verification_records"], "Web 样例详情核验应返回字段记录")
 
+        web.ALLOW_REAL_COLLECT = False
         status, payload = _post_json(
             f"{base_url}/api/collect",
             {
@@ -200,11 +235,12 @@ def test_web_token_and_sample_api():
                 "categories": ["女装/女士精品"],
                 "tags": ["微信小店"],
                 "sample_data": False,
+                "collect_source": "rpa",
                 "output_format": "csv",
             },
         )
-        _assert(status == 200, "未开启真实采集时应返回业务失败而非 HTTP 失败")
-        _assert(not payload["success"], "未开启 allow-real 时真实采集应被阻止")
+        _assert(status == 200, "关闭真实采集时应返回业务失败而非 HTTP 失败")
+        _assert(not payload["success"], "关闭真实采集时真实页面采集应被阻止")
     finally:
         server.shutdown()
         server.server_close()
@@ -215,6 +251,7 @@ def main():
     test_field_numbers()
     test_export_xlsx_and_exclude()
     test_sample_detail_verification()
+    test_real_page_candidates_enter_verification_queue()
     test_web_token_and_sample_api()
     print("tag_collect smoke tests passed")
 

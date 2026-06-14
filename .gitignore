@@ -7,6 +7,9 @@ __pycache__/
 *.so
 *.qoder
 
+# Node / Playwright 依赖
+node_modules/
+
 # 环境变量配置（可能包含敏感信息）
 .env
 .env.local

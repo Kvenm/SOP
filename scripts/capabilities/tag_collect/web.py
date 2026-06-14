@@ -16,6 +16,7 @@ from capabilities.tag_collect.service import (
     MAX_QUERIES,
     TAG_CATEGORY_TREE,
     TAG_FILTER_GROUPS,
+    friendly_collect_error,
     get_export_path,
     get_numbered_export_columns,
     get_run_payload,
@@ -26,7 +27,7 @@ from capabilities.tag_collect.service import (
 
 
 SERVER_TOKEN = ""
-ALLOW_REAL_COLLECT = False
+ALLOW_REAL_COLLECT = True
 
 
 def _json_bytes(payload: Dict[str, Any]) -> bytes:
@@ -134,16 +135,9 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                     "data": {"run_id": "", "verified_count": 0, "rows": [], "verification_queue": []},
                 })
                 return
-            sample_verify = bool(payload.get("sample_data", True))
+            sample_verify = bool(payload.get("sample_data", False))
             if isinstance(payload.get("sample_data"), str):
                 sample_verify = payload.get("sample_data", "").lower() in ("1", "true", "yes", "on")
-            if not sample_verify:
-                self._send_json(200, {
-                    "success": False,
-                    "markdown": "真实详情核验尚未接入。当前请使用样例核验；后续将通过 prod_detail 或 Playwright/RPA 接入。",
-                    "data": {"run_id": run_id, "verified_count": 0, "rows": [], "verification_queue": []},
-                })
-                return
             result = verify_run_details(
                 run_id,
                 sample_data=sample_verify,
@@ -152,23 +146,24 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
 
-        sample_data = bool(payload.get("sample_data", True))
+        sample_data = bool(payload.get("sample_data", False))
         if isinstance(payload.get("sample_data"), str):
             sample_data = payload.get("sample_data", "").lower() in ("1", "true", "yes", "on")
+        collect_source = str(payload.get("collect_source") or "rpa").lower()
 
         if not sample_data:
             if not ALLOW_REAL_COLLECT:
                 self._send_json(200, {
                     "success": False,
-                    "markdown": "当前 Web 工作台未开启真实采集。请用 `--allow-real` 启动服务，或切回样例数据模式。",
+                    "markdown": "当前 Web 工作台未开启真实采集。请重新用默认真实模式启动，或仅在开发时切回样例数据模式。",
                     "data": {"run_id": "", "row_count": 0, "rows": []},
                 })
                 return
             ak_id, _ = get_ak_from_env()
-            if not ak_id:
+            if collect_source == "api" and not ak_id:
                 self._send_json(200, {
                     "success": False,
-                    "markdown": "AK 未配置，当前 Web 工作台已阻止真实采集。请先配置 AK，或切回样例数据模式。",
+                    "markdown": "AK 未配置，当前 Web 工作台已阻止 API 真实采集。请先配置 AK，或改用真实页面 RPA 采集。",
                     "data": {"run_id": "", "row_count": 0, "rows": []},
                 })
                 return
@@ -178,11 +173,13 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 categories=_csv_join(payload.get("categories")),
                 tags=_csv_join(payload.get("tags")),
                 keywords=_csv_join(payload.get("keywords")),
+                source_urls=_csv_join(payload.get("source_urls")),
                 exclude_tags=_csv_join(payload.get("exclude_tags")),
                 max_queries=int(payload.get("max_queries") or 20),
                 max_items_per_query=int(payload.get("max_items_per_query") or 20),
                 sample_data=sample_data,
                 output_format=str(payload.get("output_format") or "xlsx"),
+                collect_source=collect_source,
             )
             result = run_tag_collect(config)
             data = dict(result["data"])
@@ -192,7 +189,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(200, {
                 "success": False,
-                "markdown": f"采集失败：{exc}",
+                "markdown": f"采集失败：{friendly_collect_error(exc)}",
                 "data": {"run_id": "", "row_count": 0, "rows": []},
             })
 
@@ -215,16 +212,16 @@ class TagCollectHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve_tag_collect_workbench(host: str = "127.0.0.1", port: int = 8765, allow_real: bool = False) -> None:
+def serve_tag_collect_workbench(host: str = "127.0.0.1", port: int = 8765, allow_real: bool = True) -> None:
     global ALLOW_REAL_COLLECT, SERVER_TOKEN
     ALLOW_REAL_COLLECT = bool(allow_real and host in ("127.0.0.1", "localhost", "::1"))
     SERVER_TOKEN = secrets.token_urlsafe(24)
     server = ThreadingHTTPServer((host, port), TagCollectHandler)
     print(f"标签选品 Web 工作台已启动：http://{host}:{port}")
     if ALLOW_REAL_COLLECT:
-        print("真实采集已开启；服务仅应监听本机地址，并受 AK 与限额保护。")
+        print("真实页面采集已开启；默认通过 Playwright/RPA 打开 1688 页面采集真实数据。")
     else:
-        print("真实采集未开启；默认仅用于样例数据筛选测试。")
+        print("真实采集未开启；仅用于开发样例模式。")
     print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()
@@ -799,8 +796,8 @@ HTML_PAGE = r"""<!doctype html>
     <div class="header-row">
       <h1>1688 标签选品工作台</h1>
       <div class="button-row">
-        <label class="sample-switch"><input id="sampleMode" type="checkbox" checked />样例数据</label>
-        <button id="runBtn" class="primary" type="button">运行采集</button>
+        <input id="sampleMode" type="checkbox" hidden />
+        <button id="runBtn" class="primary" type="button">真实采集</button>
         <a id="downloadLink" class="download" href="#" hidden>下载表格</a>
       </div>
     </div>
@@ -834,17 +831,28 @@ HTML_PAGE = r"""<!doctype html>
               <textarea id="keywords" placeholder="可输入多个搜索词，用逗号分隔"></textarea>
             </div>
             <div>
-              <label for="excludeTags">排除标签</label>
-              <textarea id="excludeTags" placeholder="例如 品牌风险,高退货"></textarea>
+              <label for="sourceUrls">1688 页面 URL</label>
+              <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
             </div>
           </div>
 
           <div class="grid two" style="margin-top: 12px;">
             <div>
+              <label for="excludeTags">排除标签</label>
+              <textarea id="excludeTags" placeholder="例如 品牌风险,高退货"></textarea>
+            </div>
+            <div>
               <label for="outputFormat">导出格式</label>
               <select id="outputFormat">
                 <option value="xlsx">XLSX</option>
                 <option value="csv">CSV</option>
+              </select>
+            </div>
+            <div>
+              <label for="collectSource">真实采集来源</label>
+              <select id="collectSource">
+                <option value="rpa">1688 页面 RPA</option>
+                <option value="api">1688 AK/API</option>
               </select>
             </div>
             <div class="grid two">
@@ -876,7 +884,7 @@ HTML_PAGE = r"""<!doctype html>
             <div><span>待核验高潜</span><strong id="queueCount">0</strong></div>
             <div><span>已核验商品</span><strong id="verifiedCount">0</strong></div>
             <div><span>核验记录</span><strong id="recordCount">0</strong></div>
-            <button id="verifyBtn" class="secondary" type="button" disabled>样例核验高潜</button>
+            <button id="verifyBtn" class="secondary" type="button" disabled>真实详情核验</button>
           </div>
           <div class="result-tools">
             <div>
@@ -903,6 +911,7 @@ HTML_PAGE = r"""<!doctype html>
                 <option value="">全部</option>
                 <option value="unverified">unverified</option>
                 <option value="sample_verified">sample_verified</option>
+                <option value="partial_verified">partial_verified</option>
                 <option value="verified">verified</option>
                 <option value="failed">failed</option>
               </select>
@@ -1065,7 +1074,7 @@ HTML_PAGE = r"""<!doctype html>
         return `<span class="badge ${cls}">${esc(value || "-")}</span>`;
       }
       if (key === "verification_status") {
-        const cls = value === "sample_verified" || value === "verified" ? "p0" : value === "failed" ? "no" : "p2";
+        const cls = value === "sample_verified" || value === "verified" ? "p0" : value === "partial_verified" ? "p1" : value === "failed" ? "no" : "p2";
         return `<span class="badge ${cls}">${esc(value || "-")}</span>`;
       }
       return esc(value);
@@ -1096,7 +1105,7 @@ HTML_PAGE = r"""<!doctype html>
       $("highCount").textContent = String(state.rows.filter(row => ["P0", "P1"].includes(row.recommendation_level)).length);
       $("suggestCount").textContent = String(state.rows.filter(row => ["可铺", "谨慎"].includes(row.wechat_shop_suggestion)).length);
       $("queueCount").textContent = String(state.verificationQueue.length);
-      $("verifiedCount").textContent = String(state.rows.filter(row => ["sample_verified", "verified"].includes(row.verification_status)).length);
+      $("verifiedCount").textContent = String(state.rows.filter(row => ["sample_verified", "verified", "partial_verified"].includes(row.verification_status)).length);
       $("recordCount").textContent = String(state.verificationRecords.length);
       $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
       renderRecords();
@@ -1112,7 +1121,7 @@ HTML_PAGE = r"""<!doctype html>
           <span>时间：${esc(record.verified_at || "-")}</span>
           ${record.fail_reason ? `<span>失败：${esc(record.fail_reason)}</span>` : ""}
         </div>
-      `).join("") || `<div class="record-item"><strong>暂无核验记录</strong><span>采集后点击“样例核验高潜”生成字段级记录。</span></div>`;
+      `).join("") || `<div class="record-item"><strong>暂无核验记录</strong><span>采集后点击“真实详情核验”生成字段级记录。</span></div>`;
     }
 
     async function runCollect() {
@@ -1123,10 +1132,12 @@ HTML_PAGE = r"""<!doctype html>
           categories: [...state.selectedCategories],
           tags: [...state.selectedTags],
           keywords: $("keywords").value,
+          source_urls: $("sourceUrls").value,
           exclude_tags: $("excludeTags").value,
           max_queries: Number($("maxQueries").value || 20),
           max_items_per_query: Number($("maxItems").value || 20),
           output_format: $("outputFormat").value,
+          collect_source: $("collectSource").value,
           sample_data: $("sampleMode").checked,
           token: state.options.token
         };
@@ -1151,7 +1162,9 @@ HTML_PAGE = r"""<!doctype html>
         updateSummary(result.data);
         $("downloadLink").href = result.data.download_url;
         $("downloadLink").hidden = false;
-        showNotice(`已生成 ${result.data.row_count} 条初筛商品；运费、品退率、发货率等关键字段仍需详情页核验。查询词：${(result.data.queries || []).join("，")}`, true);
+        const modeText = $("sampleMode").checked ? "开发样例" : `真实数据/${$("collectSource").value === "rpa" ? "1688页面RPA" : "AK/API"}`;
+        const queryLabel = $("sourceUrls").value.trim() ? "采集页面" : "查询词";
+        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；运费、品退率、发货率等关键字段仍需详情页核验。${queryLabel}：${(result.data.queries || []).join("，")}`, true);
         setTab("results");
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
@@ -1191,11 +1204,11 @@ HTML_PAGE = r"""<!doctype html>
         updateSummary(result.data);
         $("downloadLink").href = result.data.download_url;
         $("downloadLink").hidden = false;
-        showNotice(`已核验 ${result.data.verified_count} 个高潜商品，导出表已刷新。`, true);
+        showNotice(`已核验 ${result.data.verified_count} 个高潜商品，导出表已刷新；partial_verified 表示真实页面只提取到部分字段。`, true);
       } catch (err) {
         showNotice(`核验失败：${err.message}`, false);
       } finally {
-        $("verifyBtn").textContent = "样例核验高潜";
+        $("verifyBtn").textContent = $("sampleMode").checked ? "样例核验高潜" : "真实详情核验";
         $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
       }
     }
@@ -1241,9 +1254,21 @@ HTML_PAGE = r"""<!doctype html>
       state.options = result.data;
       $("maxQueries").max = state.options.limits.max_queries;
       $("maxItems").max = state.options.limits.max_items_per_query;
+      $("sampleMode").checked = false;
+      $("sampleMode").addEventListener("change", () => {
+        $("verifyBtn").textContent = $("sampleMode").checked ? "样例核验高潜" : "真实详情核验";
+        showNotice(
+          $("sampleMode").checked
+            ? "当前切换到开发样例模式，不会采集真实 1688 数据。正式测试请关闭开发样例。"
+            : "当前为真实数据模式：默认通过 1688 页面 RPA 采集；如果账号登录不上，可粘贴 1688 搜索页/商品详情页 URL 先做公开页面真实数据测试。",
+          true
+        );
+      });
       if (!state.options.allow_real_collect) {
         $("sampleMode").checked = true;
-        showNotice("当前为样例数据测试模式；真实采集需用 --allow-real 启动，并配置 AK。", true);
+        showNotice("当前真实采集被关闭，仅可用于开发样例模式。正式测试请用默认真实模式启动本地服务。", false);
+      } else {
+        showNotice("当前为真实数据模式：将打开 1688 页面采集真实数据；如账号登录不上，可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试。", true);
       }
       renderCategories();
       renderFilterGroups();

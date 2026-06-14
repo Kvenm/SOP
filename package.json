@@ -1,0 +1,12 @@
+{
+  "name": "sop-1688-tag-collector",
+  "private": true,
+  "version": "0.2.0",
+  "description": "SOP 1688 real-page tag selection collector",
+  "scripts": {
+    "install-browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.54.0"
+  }
+}

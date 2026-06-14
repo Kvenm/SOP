@@ -1,6 +1,6 @@
 # 标签选品采集指南（tag_collect）
 
-> 命令为只读/导出型；Web 工作台默认样例数据，不调用 1688 接口。真实采集依赖 AK，且必须遵守 1688 授权、限流与字段核验边界。
+> 命令为只读/导出型；Web 工作台默认真实数据模式，通过 Playwright/RPA 打开 1688 页面采集和详情核验。开发样例模式必须显式开启，不能作为正式测试结果。
 
 ## CLI 调用
 
@@ -24,21 +24,23 @@ python3 {baseDir}/cli.py tag_collect --categories "家居日用品,收纳清洁"
 | `--categories` | `""` | 复选类目标签，逗号分隔 |
 | `--tags` | `""` | 复选运营标签，逗号分隔 |
 | `--keywords` | `""` | 额外搜索词，逗号分隔；不传则由类目/标签生成 |
+| `--source-urls` | `""` | 直接采集真实 1688 搜索页或商品详情页 URL；适合账号登录受阻时测试公开页面真实数据 |
 | `--exclude-tags` | `""` | 排除标签；命中标题、类目、风险提示或标签来源时过滤，并写入任务快照 |
 | `--max-queries` | `20` | 最大查询词数量 |
 | `--max-items-per-query` | `20` | 每个查询词最多采集商品数 |
 | `--output-format` | `xlsx` | 导出格式：`xlsx` 或 `csv` |
-| `--sample-data` | false | CLI 使用内置样例数据，不调用 1688 接口 |
+| `--collect-source` | `rpa` | 真实采集来源：`rpa` 打开真实 1688 页面；`api` 调用 AK 接口 |
+| `--sample-data` | false | 开发样例模式，不调用 1688；正式测试不要开启 |
 
 ## Web 工作台使用
 
 - 推荐入口：`python3 cli.py tag_collect --serve --port 8765`，再打开 `http://127.0.0.1:8765`。
-- 页面默认勾选“样例数据”，用于验证类目/标签复选、字段编号、结果筛选、P0/P1 高潜核验队列、样例详情核验、下载导出和人工复核流程。
-- 采集后可点击“样例核验高潜”，将 P0/P1 且关键字段缺失的商品进入样例详情核验；该流程不调用 1688，不需要登录账号。
+- 页面默认关闭“开发样例”，即默认采集真实 1688 页面数据。若弹出登录或验证页面，用户需要在浏览器中扫码/处理验证。
+- 如果账号登录不上或一直触发校验，可以在“1688 页面 URL”粘贴浏览器里能打开的搜索页/商品详情页链接。URL 模式仍然读取真实页面，不会使用样例数据；但公开页面看不到的运费、品退率、发货率等字段仍会保持待核验或失败。
+- 采集后可点击“真实详情核验”，将候选商品进入真实商品详情页核验。
 - 样例详情核验会把行状态更新为 `sample_verified`，并生成字段级核验记录。`sample_verified` 只代表流程和字段映射已通过样例验证，不代表真实 1688 数据可信。
-- Web 发起真实采集时必须关闭样例数据；此时若 AK 未配置，工作台会阻止采集并提示先配置 AK 或切回样例数据。
-- 真实详情页核验/RPA 登录尚未接入；后续应通过 `prod_detail` 或 Playwright/RPA 低频补充真实字段。
-- Web 第一版不是绕过 1688 风控的爬虫，不做登录态模拟、验证码绕过、反爬规避或高频页面抓取。
+- `partial_verified` 表示真实详情页只提取到部分字段；未提取到的运费、品退率、发货率等字段必须人工复核。
+- Web 第一版不是绕过 1688 风控的爬虫，不做验证码绕过、反爬规避或高频页面抓取。
 
 ## 输出结构
 
@@ -54,7 +56,7 @@ Agent 收到的 CLI 标准输出：
     "row_count": 3,
     "output_path": ".../tag_collect_20260613_120000_000.xlsx",
     "snapshot_path": ".../tag_collect_20260613_120000_000.json",
-    "sample_data": true,
+    "sample_data": false,
     "columns": ["序号", "商品类目", "商品主图"],
     "top_items": [],
     "verification_queue": [],
@@ -101,8 +103,10 @@ Agent 收到的 CLI 标准输出：
 | 场景 | 表现 | Agent 应对 |
 |------|------|-----------|
 | Web 端口被占用 | 启动失败或无法监听 | 换一个端口，例如 `--port 8766` |
-| CLI 真实采集无 AK | `AK 未配置，无法采集 1688 商品` | 引导用户先 `configure`，或加 `--sample-data` 验证导出流程 |
-| Web 真实采集无 AK | `当前 Web 工作台已阻止真实采集` | 提示先配置 AK，或切回样例数据模式 |
+| 未安装 Playwright | `未安装 playwright` | 执行 `npm install` 和 `npm run install-browsers` |
+| RPA 弹出登录页 | 浏览器停在登录/验证页或返回 `login_required` | 用户扫码登录或处理验证；如果账号登录不上，先粘贴浏览器里能打开的 1688 URL 测试公开页面真实数据 |
+| 一直触发安全校验 | 返回 `login_required`，不会继续伪造数据 | 粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试公开页面真实数据；或运行 `scripts/capabilities/tag_collect/start_chrome_debug.sh`，用户在真实 Chrome 登录后设置 `TAG_COLLECT_CDP_URL=http://127.0.0.1:9222` |
+| API 真实采集无 AK | `AK 未配置` | 引导用户先 `configure`，或改用默认 RPA 真实页面采集 |
 | 导出后字段未核验 | `verification_status: unverified` 或字段为“待详情页核验” | 明确这是初筛结果，不能直接进入正式铺货结论 |
 | 样例详情核验完成 | `verification_status: sample_verified` | 明确这是样例核验结果，不是真实 1688 详情页核验 |
 | 真实采集限流/授权异常 | HTTP 401/429 等 | 按 `references/common/error-handling.md` 处理 |
