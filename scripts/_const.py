@@ -56,3 +56,4 @@ WORKSPACE_DIR = os.environ.get("OPENCLAW_WORKSPACE_DIR") or (
 SEARCH_DATA_DIR = os.path.join(WORKSPACE_DIR, "1688-skill-data", "products")
 PROD_DETAIL_DATA_DIR = os.path.join(WORKSPACE_DIR, "1688-skill-data", "prod_detail")
 PUBLISH_DATA_DIR = os.path.join(WORKSPACE_DIR, "1688-skill-data", "publish")
+TAG_COLLECT_DATA_DIR = os.path.join(WORKSPACE_DIR, "1688-skill-data", "tag_collect")

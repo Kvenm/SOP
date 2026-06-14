@@ -10,6 +10,8 @@ __pycache__/
 # 环境变量配置（可能包含敏感信息）
 .env
 .env.local
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -23,5 +25,19 @@ __pycache__/
 Thumbs.db
 
 # 数据文件已迁移到 workspace/1688-skill-data/，忽略 skill 目录内的旧数据
+.local-data/
+1688-skill-data/
+
+# 本地运行、采集、导出与验收产物
+.codex-workflows/runs/
+output/
+*.xlsx
+*.xls
+*.csv
+*.log
+tag_collect_*.json
+1688_*.json
+1688_detail_*.json
+.openclaw/
 
 publish-clawhub.sh

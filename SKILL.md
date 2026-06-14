@@ -3,8 +3,9 @@ name: 1688-shopkeeper
 description: |
   1688选品铺货 + 商机趋势专家。用于：(1) 在1688搜索商品/选品找货源 (2) 查询已绑定的下游店铺
   (3) 将商品铺货到抖音/拼多多/小红书/淘宝等平台 (4) 配置1688 AK密钥 (5) 查看即时商机热榜
-  (6) 查看类目/行业趋势与价格分布 (7) 生成店铺经营日报并输出主营商品选品建议。
-  触发词：帮我找商品、在1688搜、选品、铺货、上架、查店铺、配置AK、商机、热榜、排行榜、趋势、价格分布、经营日报、店铺日报、动销分析、经营分析、选品建议、1688找货。
+  (6) 查看类目/行业趋势与价格分布 (7) 生成店铺经营日报并输出主营商品选品建议
+  (8) 启动标签选品采集与 Web 筛选测试工作台。
+  触发词：帮我找商品、在1688搜、选品、铺货、上架、查店铺、配置AK、商机、热榜、排行榜、趋势、价格分布、经营日报、店铺日报、动销分析、经营分析、选品建议、标签选品、标签采集、筛选工作台、Web工作台、1688找货。
 metadata: {"openclaw": {"emoji": "🛒", "requires": {"bins": ["python3"]}, "primaryEnv": "ALI_1688_AK"}}
 ---
 
@@ -23,6 +24,7 @@ metadata: {"openclaw": {"emoji": "🛒", "requires": {"bins": ["python3"]}, "pri
 | `opportunities` | 商机热榜 | `cli.py opportunities` |
 | `trend` | 趋势洞察 | `cli.py trend --query "大码女装"` |
 | `shop_daily` | 店铺经营日报 | `cli.py shop_daily` |
+| `tag_collect` | 标签选品采集 / Web 筛选测试工作台 | `cli.py tag_collect --serve --port 8765` |
 | `configure` | 配置 AK | `cli.py configure YOUR_AK` |
 | `check` | 检查配置状态 | `cli.py check` |
 
@@ -43,12 +45,14 @@ Agent 根据用户意图**直接执行对应命令**，无需每次先执行 `ch
 - `opportunities`：用户想看“此刻/近1小时/热榜/趋势商机”。
 - `trend`：用户询问某宽泛类目/行业的周期趋势、价格分布、热品概况；关键词过长或过细时先按用户原词尝试，若空结果再提示用户换更宽泛/拆分词后重试。
 - `shop_daily`：用户想看“店铺经营日报/今日动销/渠道经营诊断/主营商品选品建议”。
+- `tag_collect`：用户想用复选类目/运营标签批量生成候选商品表、验证字段编号/导出流程，或要求打开“标签选品 Web 工作台/筛选测试工作台”。Web 第一版用于本地筛选测试、P0/P1 高潜样例核验与导出验收，默认样例数据，不是绕过 1688 风控的爬虫。`sample_verified` 只代表样例详情核验完成，不代表真实 1688 详情页数据可信。
 
 ## 安全声明
 
 | 风险级别 | 命令 | Agent 行为 |
 |---------|------|-----------|
 | **只读** | search, shops, check, opportunities, trend, shop_daily | 直接执行 |
+| **导出/本地工作台** | tag_collect | 直接执行；仅生成本地导出文件或启动本地 Web 工作台 |
 | **配置** | configure | 提示影响范围后执行 |
 | **写入** | publish | **必须先 dry-run 预检查；仅当写入目标不唯一时追问，目标唯一则直接执行** |
 
@@ -84,6 +88,7 @@ Agent 根据用户意图**直接执行对应命令**，无需每次先执行 `ch
 - 首次执行 `opportunities` 前：先完整阅读 `references/capabilities/opportunities.md`
 - 首次执行 `trend` 前：先完整阅读 `references/capabilities/trend.md`
 - 首次执行 `shop_daily` 前：先完整阅读 `references/capabilities/shop_daily.md`
+- 首次执行 `tag_collect` 前：先完整阅读 `references/capabilities/tag_collect.md`
 - 同一会话内后续重复调用同一能力可复用已加载知识；仅在规则冲突或文档更新时重读。
 
 ## AK 引导话术

@@ -17,6 +17,7 @@ Commands（更多参数见项目根目录 SKILL.md）:
     opportunities 商机热榜        python3 cli.py opportunities
     trend         趋势洞察        python3 cli.py trend --query "大码女装"
     shop_daily    店铺经营日报    python3 cli.py shop_daily
+    tag_collect   标签选品采集    python3 cli.py tag_collect --serve --port 8765
     configure     配置 AK         python3 cli.py configure YOUR_AK
     check         检查配置状态    python3 cli.py check
 
