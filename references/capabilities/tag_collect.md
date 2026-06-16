@@ -113,7 +113,7 @@ Agent 收到的 CLI 标准输出：
 | Web 端口被占用 | 启动失败或无法监听 | 换一个端口，例如 `--port 8766` |
 | 未安装 Playwright | `未安装 playwright` | 执行 `npm install` 和 `npm run install-browsers` |
 | RPA 弹出登录页 | 浏览器停在登录/验证页或返回 `login_required` | 用户扫码登录或处理验证；如果账号登录不上，先粘贴浏览器里能打开的 1688 URL 测试公开页面真实数据 |
-| 一直触发安全校验 | 返回 `login_required`，不会继续伪造数据 | 粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试公开页面真实数据；或运行 `scripts/capabilities/tag_collect/start_chrome_debug.sh`，用户在真实 Chrome 登录后设置 `TAG_COLLECT_CDP_URL=http://127.0.0.1:9222` |
+| 一直触发安全校验/滑块验证 | 返回 `security_verification_required`，不会绕过验证码，也不会继续采集或导出 | 用户在弹出的真实浏览器中手动完成滑块/验证码；或运行 `scripts/capabilities/tag_collect/start_chrome_debug.sh`，用户在真实 Chrome 登录并完成验证后设置 `TAG_COLLECT_CDP_URL=http://127.0.0.1:9222`；仍失败时可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试公开页面真实数据 |
 | API 真实采集无 AK | `AK 未配置` | 引导用户先 `configure`，或改用默认 RPA 真实页面采集 |
 | 导出后字段未核验 | `verification_status: unverified` 或字段为“待详情页核验” | 明确这是初筛结果，不能直接进入正式铺货结论 |
 | 原生筛选项找不到 | `filter_results.status: not_found` | 告知用户当前类目/页面没有展示该筛选项，不能当成筛选成功；必要时换类目或手动打开 1688 页面确认 |

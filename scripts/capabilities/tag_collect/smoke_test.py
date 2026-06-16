@@ -6,10 +6,12 @@ import os
 import sys
 import threading
 import tempfile
+import types
 import urllib.error
 import urllib.request
 import zipfile
 from http.server import ThreadingHTTPServer
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -17,10 +19,13 @@ from capabilities.tag_collect import web
 from capabilities.tag_collect.service import (
     DETAIL_ONLY_FIELDS,
     DETAIL_VERIFICATION_PENDING,
+    EXPORT_COLUMNS,
     Product,
+    REFERENCE_EXPORT_LABELS,
     build_filter_plan,
     build_queries,
     build_verification_queue,
+    friendly_collect_error,
     get_numbered_export_columns,
     metric_bucket,
     product_to_export_row,
@@ -28,6 +33,7 @@ from capabilities.tag_collect.service import (
     run_tag_collect,
     verify_run_details,
 )
+from _errors import ServiceError
 
 
 def _assert(condition, message):
@@ -52,12 +58,30 @@ def _get_bytes(url):
         return response.status, response.headers, response.read()
 
 
+def _xlsx_first_row_labels(workbook: zipfile.ZipFile, sheet_index: int = 1):
+    xml = workbook.read(f"xl/worksheets/sheet{sheet_index}.xml")
+    root = ET.fromstring(xml)
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    row = root.find("m:sheetData/m:row", ns)
+    if row is None:
+        return []
+    values = []
+    for cell in row.findall("m:c", ns):
+        inline = cell.find("m:is/m:t", ns)
+        value = cell.find("m:v", ns)
+        values.append((inline.text if inline is not None else value.text if value is not None else "") or "")
+    return values
+
+
 def test_field_numbers():
     fields = get_numbered_export_columns()
     numbers = [field["number"] for field in fields]
     keys = {field["key"] for field in fields}
+    labels = [label for _, label in EXPORT_COLUMNS]
     _assert(numbers[0] == "1.1", "字段编号应从 1.1 开始")
     _assert(numbers[-1] == "10.11", "字段编号应到 10.11 结束")
+    _assert(len(labels) == 79, "导出字段应保持附件基线的 79 列")
+    _assert(labels == REFERENCE_EXPORT_LABELS, "导出字段顺序应与用户确认的附件表头一致")
     _assert("product_refund_rate" in keys, "字段应包含品退率")
     _assert("shipment_rate" in keys, "字段应包含发货率")
     _assert("wholesale_shipping_fee" in keys, "字段应包含批发运费")
@@ -123,7 +147,10 @@ def test_export_xlsx_and_exclude():
         sheets = [name for name in names if name.startswith("xl/worksheets/sheet")]
         _assert(len(sheets) == 6, "xlsx 应包含 6 个工作表")
         workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+        result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
         field_xml = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
+        result_labels = _xlsx_first_row_labels(workbook, 1)
+        _assert(result_labels == REFERENCE_EXPORT_LABELS, "选品结果 sheet 表头应严格等于附件 79 列基线")
         _assert("选品结果" in workbook_xml, "应包含选品结果 sheet")
         _assert("字段说明" in workbook_xml, "应包含字段说明 sheet")
         _assert("标签配置" in workbook_xml, "应包含标签配置 sheet")
@@ -133,9 +160,22 @@ def test_export_xlsx_and_exclude():
         _assert("10.8" in field_xml, "字段说明应包含 10.8 核验状态")
         _assert("品退率" in field_xml, "字段说明应包含品退率")
         _assert("发货率" in field_xml, "字段说明应包含发货率")
+        for label in REFERENCE_EXPORT_LABELS:
+            _assert(label in result_xml, f"选品结果表头应包含附件基线字段：{label}")
         filter_xml = workbook.read("xl/worksheets/sheet6.xml").decode("utf-8")
         _assert("一件代发" in filter_xml, "筛选执行记录应包含一件代发")
         _assert("sample_skipped" in filter_xml, "样例模式应标记原生筛选未执行")
+
+
+def test_security_verification_error_message():
+    message = friendly_collect_error(
+        Exception(
+            "security_verification_required: 已等待你手动处理 1688 安全验证，"
+            "但当前页面仍停留在滑块/验证码校验。系统不会绕过或自动破解验证。"
+        )
+    )
+    _assert("安全验证" in message or "滑块" in message, "滑块验证应给出明确人工处理提示")
+    _assert("不会绕过" in message or "不会继续采集" in message, "提示应明确不会绕过验证码")
 
 
 def test_sample_detail_verification():
@@ -287,14 +327,63 @@ def test_web_token_and_sample_api():
         thread.join(timeout=5)
 
 
+def test_web_security_verification_does_not_export():
+    web.SERVER_TOKEN = "tag-collect-smoke-token"
+    web.ALLOW_REAL_COLLECT = True
+
+    def blocked_collect(*args, **kwargs):
+        raise ServiceError(
+            "security_verification_required: 1688 触发了安全滑块/验证码校验，"
+            "系统不会绕过或自动破解验证，也不会继续采集以免导出不可信数据。"
+        )
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=blocked_collect
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), web.TagCollectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, payload = _post_json(
+            f"{base_url}/api/collect",
+            {
+                "token": web.SERVER_TOKEN,
+                "categories": ["女装/女士精品"],
+                "tags": ["微信小店"],
+                "sample_data": False,
+                "collect_source": "rpa",
+                "output_format": "xlsx",
+            },
+        )
+        _assert(status == 200, "安全验证阻断应返回业务失败而非 HTTP 失败")
+        _assert(not payload["success"], "安全验证阻断不应采集成功")
+        _assert(payload["data"].get("run_id", "") == "", "安全验证阻断不应生成 run_id")
+        _assert(payload["data"].get("row_count", 0) == 0, "安全验证阻断不应生成商品")
+        _assert(payload["data"].get("rows", []) == [], "安全验证阻断不应返回 rows")
+        _assert("download_url" not in payload["data"], "安全验证阻断不应返回下载链接")
+        _assert("不会绕过" in payload["markdown"], "安全验证提示应明确不会绕过验证码")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
 def main():
     test_field_numbers()
     test_filter_plan_splits_native_and_metric_tags()
     test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
+    test_security_verification_error_message()
     test_sample_detail_verification()
     test_real_page_candidates_enter_verification_queue()
     test_web_token_and_sample_api()
+    test_web_security_verification_does_not_export()
     print("tag_collect smoke tests passed")
 
 

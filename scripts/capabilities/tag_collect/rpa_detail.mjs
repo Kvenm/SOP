@@ -36,18 +36,29 @@ function looksLikeBlockedPage(text, currentUrl) {
   const compact = String(text || "").replace(/\s+/g, "");
   return /login\.1688\.com|login\.taobao\.com|login\.tmall\.com/.test(currentUrl)
     || /扫码登录|密码登录|手机登录|会员登录/.test(compact)
-    || /安全验证|验证一下|滑块|请完成验证|访问受限|访问过于频繁|验证码/.test(compact);
+    || /安全验证|验证一下|滑块|请完成验证|访问受限|访问过于频繁|验证码|拖动下方滑块|验证失败|点击框体重试|error:2eDumg/.test(compact);
 }
 
 function looksLikeSecurityPage(text, currentUrl) {
   const compact = String(text || "").replace(/\s+/g, "");
+  return /安全验证|验证一下|滑块|请完成验证|访问受限|访问过于频繁|验证码|拖动下方滑块|验证失败|点击框体重试|error:2eDumg/.test(compact)
+    || /punish|captcha|nocaptcha|sec|verify/.test(currentUrl);
+}
+
+function looksLikeLoginPage(text, currentUrl) {
+  const compact = String(text || "").replace(/\s+/g, "");
   return /login\.1688\.com|login\.taobao\.com|login\.tmall\.com/.test(currentUrl)
-    || /安全验证|验证一下|滑块|请完成验证|访问受限|访问过于频繁|验证码/.test(compact);
+    || /扫码登录|密码登录|手机登录|会员登录/.test(compact);
 }
 
 function blockedMessage(currentUrl, waited) {
   const prefix = waited ? "已等待你处理登录/验证，但当前详情页仍需要登录或安全校验。" : "当前详情页需要登录或安全校验。";
   return `${prefix}不会写入样例字段。请先在真实 Chrome/1688 页面完成登录和验证后重试。当前页面：${currentUrl}`;
+}
+
+function securityMessage(currentUrl, waited) {
+  const prefix = waited ? "已等待你手动处理 1688 安全验证，但当前详情页仍停留在滑块/验证码校验。" : "1688 详情页触发了安全滑块/验证码校验。";
+  return `${prefix}系统不会绕过或自动破解验证，也不会写入任何详情字段。请在弹出的真实浏览器中手动完成验证，或使用已登录且已通过验证的 Chrome CDP 会话后重试。当前页面：${currentUrl}`;
 }
 
 async function openRuntime() {
@@ -85,8 +96,8 @@ try {
   await page.goto(url, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
   let pageText = await page.locator("body").innerText({ timeout: 10000 }).catch(() => "");
-  const needsLogin = looksLikeSecurityPage(pageText, page.url());
-  if (needsLogin && loginWaitMs > 0 && !headless) {
+  const needsManualGate = looksLikeSecurityPage(pageText, page.url()) || looksLikeLoginPage(pageText, page.url());
+  if (needsManualGate && loginWaitMs > 0 && !headless) {
     await page.waitForTimeout(loginWaitMs);
     pageText = await page.locator("body").innerText({ timeout: 10000 }).catch(() => pageText);
   }
@@ -94,13 +105,15 @@ try {
     await runtime.close();
     console.log(JSON.stringify({
       success: false,
-      code: "login_required",
+      code: looksLikeSecurityPage(pageText, page.url()) ? "security_verification_required" : "login_required",
       source: "1688_detail_page",
       cdp: Boolean(cdpUrl),
       item_id: itemId,
       url,
       page_url: page.url(),
-      message: blockedMessage(page.url(), needsLogin && loginWaitMs > 0 && !headless),
+      message: looksLikeSecurityPage(pageText, page.url())
+        ? securityMessage(page.url(), needsManualGate && loginWaitMs > 0 && !headless)
+        : blockedMessage(page.url(), needsManualGate && loginWaitMs > 0 && !headless),
     }));
     process.exit(0);
   }

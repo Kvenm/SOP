@@ -49,6 +49,88 @@ VERIFICATION_STATUS_VERIFIED = "verified"
 VERIFICATION_STATUS_PARTIAL = "partial_verified"
 VERIFICATION_STATUS_FAILED = "failed"
 
+REFERENCE_EXPORT_LABELS = [
+    "序号",
+    "商品类目",
+    "商品主图",
+    "商品标题",
+    "商品ID",
+    "商品链接(点击下方链接可跳转)",
+    "主图链接(点击下方链接可跳转)",
+    "来源关键词",
+    "命中标签",
+    "批发价",
+    "起批范围",
+    "代发价",
+    "批发运费",
+    "代发运费",
+    "是否包邮",
+    "标准化价格区间",
+    "上架时间",
+    "近30天订单数",
+    "近30天件数",
+    "近30天销售额",
+    "销售趋势(件)",
+    "月代发订单",
+    "收藏客户",
+    "下游铺货数",
+    "同款/相似款数量",
+    "商品标识",
+    "红海/蓝海判断",
+    "复购率",
+    "评论数",
+    "好评率",
+    "品退率",
+    "资质证书",
+    "好评率区间",
+    "品退率区间",
+    "评论数区间",
+    "复购率区间",
+    "权益保障",
+    "代发权益",
+    "面单支持",
+    "24小时揽收率",
+    "发货率",
+    "发货时效",
+    "是否一件代发",
+    "是否支持退换",
+    "发货率区间",
+    "近30天销量区间",
+    "代发订单量区间",
+    "店铺名称",
+    "所在地",
+    "综合服务",
+    "公司类型",
+    "卖家会员类型",
+    "卖家服务",
+    "诚信通年限",
+    "店铺链接(点击下方链接可跳转)",
+    "是否源头工厂",
+    "适合微信小店(规则预判)",
+    "适合抖店",
+    "适合拼多多",
+    "适合小红书",
+    "适合淘宝",
+    "推荐平台",
+    "查询视频",
+    "品牌/侵权风险",
+    "低价质损风险",
+    "售后风险",
+    "数据不足风险",
+    "库存",
+    "推荐分",
+    "推荐等级",
+    "推荐理由",
+    "风险提示",
+    "标签来源",
+    "采集批次",
+    "采集时间",
+    "核验状态",
+    "人工复核状态",
+    "人工复核备注",
+    "微信小店铺货建议(人工复核)",
+]
+
 
 @dataclass
 class Product:
@@ -1010,10 +1092,17 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
 def friendly_collect_error(error: Exception) -> str:
     """把 RPA/真实采集底层异常转成运营可理解的提示。"""
     message = str(error)
+    if "security_verification_required:" in message:
+        return message.split("security_verification_required:", 1)[1].strip()
     if "login_required:" in message:
         return message.split("login_required:", 1)[1].strip()
     if "browser_closed:" in message:
         return message.split("browser_closed:", 1)[1].strip()
+    if any(term in message for term in ("拖动下方滑块", "验证失败", "点击框体重试", "error:2eDumg", "安全滑块", "验证码")):
+        return (
+            "1688 触发了安全滑块/验证码校验，系统不会绕过或自动破解验证，也不会继续采集以免导出不可信数据。"
+            "请在弹出的真实浏览器中手动完成验证，或使用已登录且已通过验证的 Chrome CDP 会话后重试。"
+        )
     if "Target page, context or browser has been closed" in message:
         return (
             "真实采集窗口已关闭或登录/验证未完成，未生成任何数据。"
