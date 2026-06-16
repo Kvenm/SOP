@@ -25,6 +25,7 @@ try {
 const query = String(input.query || "").trim();
 const sourceUrl = String(input.source_url || input.url || "").trim();
 const limit = Math.max(1, Math.min(50, Number(input.limit || 20)));
+const nativeFilters = Array.isArray(input.native_filters) ? input.native_filters : [];
 if (!query && !sourceUrl) fail("缺少搜索词或 1688 页面 URL，无法打开真实页面");
 
 const profileDir = process.env.TAG_COLLECT_RPA_PROFILE
@@ -70,6 +71,79 @@ async function openRuntime() {
   return { page, close: async () => context.close() };
 }
 
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, "").trim();
+}
+
+async function applyNativeFilters(page, filters, query) {
+  if (!filters.length) return [];
+  const results = [];
+  const isDetailPage = /detail\.1688\.com\/offer\/\d+\.html/.test(page.url());
+  for (const filter of filters) {
+    const label = String(filter.label || filter.tag || filter.key || "").trim();
+    const texts = Array.isArray(filter.texts) && filter.texts.length ? filter.texts : [label];
+    const base = {
+      filter_key: String(filter.key || label),
+      tag: String(filter.tag || label),
+      label,
+      source: "1688_search_filter",
+      query,
+      page_url: page.url(),
+      matched_text: "",
+    };
+    if (isDetailPage) {
+      results.push({
+        ...base,
+        status: "not_applicable",
+        message: "当前为商品详情页URL，无法执行搜索页原生筛选",
+      });
+      continue;
+    }
+    const applied = await page.evaluate((candidateTexts) => {
+      const compact = (value) => String(value || "").replace(/\s+/g, "").trim();
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const nodes = Array.from(document.querySelectorAll("a, button, label, span, div, li"));
+      for (const text of candidateTexts) {
+        const needle = compact(text);
+        if (!needle) continue;
+        const matches = nodes
+          .filter((node) => visible(node) && compact(node.innerText || node.textContent || "").includes(needle))
+          .slice(0, 8);
+        for (const node of matches) {
+          const clickable = node.closest("a, button, label, li, [role='button'], [class*='filter'], [class*='checkbox']") || node;
+          if (!clickable || !visible(clickable)) continue;
+          clickable.scrollIntoView({ block: "center", inline: "center" });
+          clickable.click();
+          return { ok: true, matched_text: compact(node.innerText || node.textContent || "").slice(0, 80) };
+        }
+      }
+      return { ok: false, matched_text: "" };
+    }, texts).catch((error) => ({ ok: false, error: error.message || String(error), matched_text: "" }));
+
+    if (applied.ok) {
+      await page.waitForTimeout(1200);
+      results.push({
+        ...base,
+        page_url: page.url(),
+        matched_text: normalizeText(applied.matched_text),
+        status: "clicked",
+        message: "已在1688页面尝试点击/勾选该筛选项",
+      });
+    } else {
+      results.push({
+        ...base,
+        status: applied.error ? "click_failed" : "not_found",
+        message: applied.error ? `点击失败：${applied.error}` : "页面无此筛选项或当前类目未展示该筛选",
+      });
+    }
+  }
+  return results;
+}
+
 const runtime = await openRuntime();
 const page = runtime.page;
 page.setDefaultTimeout(45000);
@@ -86,6 +160,7 @@ try {
   }
 
   await page.waitForTimeout(2500);
+  const filterResults = await applyNativeFilters(page, nativeFilters, query);
   await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))).catch(() => {});
   await page.waitForTimeout(1500);
   const products = await page.evaluate((maxItems) => {
@@ -189,6 +264,7 @@ try {
     query,
     source_url: sourceUrl,
     page_url: page.url(),
+    filter_results: filterResults,
     products,
   }));
 } catch (error) {

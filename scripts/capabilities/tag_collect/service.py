@@ -103,7 +103,7 @@ def get_tag_collect_data_dir() -> str:
     raise PermissionError("未找到可写的 tag_collect 数据目录")
 
 
-TAG_CATEGORY_TREE = {
+LEGACY_TAG_CATEGORY_TREE = {
     "女装/女士精品": ["连衣裙", "女式T恤", "女式衬衫", "女式休闲裤", "半身裙", "牛仔裤", "大码女装", "防晒衣"],
     "男装": ["男式T恤", "男式衬衫", "男式休闲裤", "男式牛仔裤", "夹克", "卫衣", "短裤", "商务男装"],
     "内衣": ["文胸", "女士内裤", "男士内裤", "睡衣家居服", "保暖内衣", "袜子", "塑身衣", "吊带背心"],
@@ -145,7 +145,71 @@ TAG_CATEGORY_TREE = {
     "定制/加工": ["服装加工", "饰品加工", "包装定制", "礼品定制", "五金加工", "塑胶加工", "印刷加工", "OEM代工"],
 }
 
+
+def _legacy_to_nested_category_tree(tree: Dict[str, List[str]]) -> Dict[str, Dict[str, List[str]]]:
+    return {parent: {child: [] for child in children} for parent, children in tree.items()}
+
+
+def _load_category_dictionary() -> Dict[str, Any]:
+    """加载可追溯类目字典；完整 1688 字典未采集前，用本地种子增强三级展示。"""
+    dictionary = {
+        "version": "legacy-seed",
+        "source": "local_legacy_seed",
+        "status": "partial_seed",
+        "updated_at": "",
+        "tree": _legacy_to_nested_category_tree(LEGACY_TAG_CATEGORY_TREE),
+    }
+    path = Path(__file__).resolve().parent / "category_dict.json"
+    if not path.exists():
+        return dictionary
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return dictionary
+    nested = _legacy_to_nested_category_tree(LEGACY_TAG_CATEGORY_TREE)
+    for node in data.get("tree", []):
+        if not isinstance(node, dict):
+            continue
+        parent = str(node.get("name") or "").strip()
+        if not parent:
+            continue
+        nested.setdefault(parent, {})
+        for child_node in node.get("children", []):
+            if not isinstance(child_node, dict):
+                continue
+            child = str(child_node.get("name") or "").strip()
+            if not child:
+                continue
+            grandchildren = [
+                str(grandchild.get("name") or "").strip()
+                for grandchild in child_node.get("children", [])
+                if isinstance(grandchild, dict) and str(grandchild.get("name") or "").strip()
+            ]
+            nested[parent][child] = grandchildren
+    dictionary.update({
+        "version": str(data.get("version") or dictionary["version"]),
+        "source": str(data.get("source") or dictionary["source"]),
+        "status": str(data.get("status") or dictionary["status"]),
+        "updated_at": str(data.get("updated_at") or dictionary["updated_at"]),
+        "tree": nested,
+    })
+    return dictionary
+
+
+CATEGORY_DICTIONARY = _load_category_dictionary()
+TAG_CATEGORY_TREE = CATEGORY_DICTIONARY["tree"]
 TAG_CATEGORY_OPTIONS = list(TAG_CATEGORY_TREE.keys())
+
+METRIC_FILTER_GROUPS = {
+    "好评率": ["好评率>=90%", "好评率80%-90%", "好评率70%-80%", "好评率<70%"],
+    "品退率": ["品退率<2%", "品退率2%-5%", "品退率5%-10%", "品退率>=10%"],
+    "发货率": ["发货率>=95%", "发货率90%-95%", "发货率80%-90%", "发货率<80%"],
+    "评论数": ["评论数>=1000", "评论数300-999", "评论数100-299", "评论数30-99", "评论数<30"],
+    "复购率": ["复购率>=30%", "复购率20%-30%", "复购率10%-20%", "复购率<10%"],
+    "近30天销量": ["近30天销量>=5000", "近30天销量1000-4999", "近30天销量500-999", "近30天销量100-499", "近30天销量<100"],
+    "代发订单量": ["代发订单量>=1000", "代发订单量500-999", "代发订单量100-499", "代发订单量<100"],
+}
 
 TAG_FILTER_GROUPS = {
     "使用场景": [
@@ -182,6 +246,152 @@ TAG_FILTER_GROUPS = {
         "诚信通年限高",
     ],
     "风险控制": ["品牌风险低", "品退率低", "发货率高", "评论数充足", "库存充足", "低价质损风险低", "售后风险低", "数据完整度高"],
+    "指标区间": [
+        *METRIC_FILTER_GROUPS["好评率"],
+        *METRIC_FILTER_GROUPS["品退率"],
+        *METRIC_FILTER_GROUPS["发货率"],
+        *METRIC_FILTER_GROUPS["评论数"],
+        *METRIC_FILTER_GROUPS["复购率"],
+        *METRIC_FILTER_GROUPS["近30天销量"],
+        *METRIC_FILTER_GROUPS["代发订单量"],
+    ],
+}
+
+NATIVE_FILTER_SPECS: Dict[str, Dict[str, Any]] = {
+    "一件代发": {
+        "key": "dropship",
+        "label": "一件代发",
+        "texts": ["一件代发", "代发", "支持一件代发"],
+        "source": "1688_search_filter",
+    },
+    "一件代发包邮": {
+        "key": "dropship_free_shipping",
+        "label": "一件代发包邮",
+        "texts": ["一件代发包邮", "代发包邮", "包邮"],
+        "source": "1688_search_filter",
+    },
+    "批发包邮": {
+        "key": "wholesale_free_shipping",
+        "label": "批发包邮",
+        "texts": ["批发包邮", "包邮"],
+        "source": "1688_search_filter",
+    },
+    "48小时发货": {
+        "key": "ship_48h",
+        "label": "48小时发货",
+        "texts": ["48小时发货", "48小时内发货", "发货时间"],
+        "source": "1688_search_filter",
+    },
+    "7天包退货": {
+        "key": "seven_day_return",
+        "label": "7天包退货",
+        "texts": ["7天包退货", "七天无理由", "7天无理由", "7天包退"],
+        "source": "1688_search_filter",
+    },
+    "七天无理由": {
+        "key": "seven_day_return",
+        "label": "七天无理由",
+        "texts": ["七天无理由", "7天无理由", "7天包退货", "7天包退"],
+        "source": "1688_search_filter",
+    },
+    "赠运费险": {
+        "key": "freight_insurance",
+        "label": "赠运费险",
+        "texts": ["赠运费险", "运费险"],
+        "source": "1688_search_filter",
+    },
+    "工厂": {
+        "key": "factory",
+        "label": "工厂",
+        "texts": ["工厂", "生产厂家", "源头工厂"],
+        "source": "1688_search_filter",
+    },
+    "超级工厂": {
+        "key": "super_factory",
+        "label": "超级工厂",
+        "texts": ["超级工厂"],
+        "source": "1688_search_filter",
+    },
+    "实力商家": {
+        "key": "power_seller",
+        "label": "实力商家",
+        "texts": ["实力商家"],
+        "source": "1688_search_filter",
+    },
+}
+
+SYSTEM_RULE_TAGS = {
+    "微信小店",
+    "抖店",
+    "拼多多",
+    "小红书",
+    "淘宝",
+    "快手",
+    "京东",
+    "新店破零",
+    "引流款",
+    "利润款",
+    "复购款",
+    "蓝海款",
+    "上新款",
+    "应季款",
+    "内容种草款",
+    "低售后款",
+    "支持微信小店面单",
+    "支持抖音面单",
+    "支持拼多多面单",
+    "品牌风险低",
+    "低价质损风险低",
+    "售后风险低",
+    "数据完整度高",
+    "库存充足",
+    "诚信通年限高",
+    "收藏客户多",
+    "销售趋势上升",
+}
+
+POST_FILTER_ALIASES = {
+    "近30天订单数高": {"field": "orders_30d", "label": "近30天订单数高", "bucket": ">=1000", "status": "legacy_alias"},
+    "近30天件数高": {"field": "units_30d", "label": "近30天件数高", "bucket": ">=1000", "status": "legacy_alias"},
+    "近30天销售额高": {"field": "sales_amount_30d", "label": "近30天销售额高", "bucket": "needs_manual_threshold", "status": "needs-human-review"},
+    "月代发订单高": {"field": "monthly_dropship_orders", "label": "月代发订单高", "bucket": ">=500", "status": "legacy_alias"},
+    "复购率高": {"field": "repurchase_rate", "label": "复购率高", "bucket": ">=10%", "status": "legacy_alias"},
+    "品退率低": {"field": "product_refund_rate", "label": "品退率低", "bucket": "<5%", "status": "legacy_alias"},
+    "发货率高": {"field": "shipment_rate", "label": "发货率高", "bucket": ">=95%", "status": "legacy_alias"},
+    "评论数充足": {"field": "comment_count", "label": "评论数充足", "bucket": ">=30", "status": "legacy_alias"},
+}
+
+METRIC_TAG_SPECS = {
+    "好评率>=90%": {"field": "good_rate", "bucket": ">=90%", "op": ">=", "value": 90},
+    "好评率80%-90%": {"field": "good_rate", "bucket": "80%-90%", "op": "range", "min": 80, "max": 90},
+    "好评率70%-80%": {"field": "good_rate", "bucket": "70%-80%", "op": "range", "min": 70, "max": 80},
+    "好评率<70%": {"field": "good_rate", "bucket": "<70%", "op": "<", "value": 70},
+    "品退率<2%": {"field": "product_refund_rate", "bucket": "<2%", "op": "<", "value": 2},
+    "品退率2%-5%": {"field": "product_refund_rate", "bucket": "2%-5%", "op": "range", "min": 2, "max": 5},
+    "品退率5%-10%": {"field": "product_refund_rate", "bucket": "5%-10%", "op": "range", "min": 5, "max": 10},
+    "品退率>=10%": {"field": "product_refund_rate", "bucket": ">=10%", "op": ">=", "value": 10},
+    "发货率>=95%": {"field": "shipment_rate", "bucket": ">=95%", "op": ">=", "value": 95},
+    "发货率90%-95%": {"field": "shipment_rate", "bucket": "90%-95%", "op": "range", "min": 90, "max": 95},
+    "发货率80%-90%": {"field": "shipment_rate", "bucket": "80%-90%", "op": "range", "min": 80, "max": 90},
+    "发货率<80%": {"field": "shipment_rate", "bucket": "<80%", "op": "<", "value": 80},
+    "评论数>=1000": {"field": "comment_count", "bucket": ">=1000", "op": ">=", "value": 1000},
+    "评论数300-999": {"field": "comment_count", "bucket": "300-999", "op": "range", "min": 300, "max": 1000},
+    "评论数100-299": {"field": "comment_count", "bucket": "100-299", "op": "range", "min": 100, "max": 300},
+    "评论数30-99": {"field": "comment_count", "bucket": "30-99", "op": "range", "min": 30, "max": 100},
+    "评论数<30": {"field": "comment_count", "bucket": "<30", "op": "<", "value": 30},
+    "复购率>=30%": {"field": "repurchase_rate", "bucket": ">=30%", "op": ">=", "value": 30},
+    "复购率20%-30%": {"field": "repurchase_rate", "bucket": "20%-30%", "op": "range", "min": 20, "max": 30},
+    "复购率10%-20%": {"field": "repurchase_rate", "bucket": "10%-20%", "op": "range", "min": 10, "max": 20},
+    "复购率<10%": {"field": "repurchase_rate", "bucket": "<10%", "op": "<", "value": 10},
+    "近30天销量>=5000": {"field": "units_30d", "bucket": ">=5000", "op": ">=", "value": 5000},
+    "近30天销量1000-4999": {"field": "units_30d", "bucket": "1000-4999", "op": "range", "min": 1000, "max": 5000},
+    "近30天销量500-999": {"field": "units_30d", "bucket": "500-999", "op": "range", "min": 500, "max": 1000},
+    "近30天销量100-499": {"field": "units_30d", "bucket": "100-499", "op": "range", "min": 100, "max": 500},
+    "近30天销量<100": {"field": "units_30d", "bucket": "<100", "op": "<", "value": 100},
+    "代发订单量>=1000": {"field": "monthly_dropship_orders", "bucket": ">=1000", "op": ">=", "value": 1000},
+    "代发订单量500-999": {"field": "monthly_dropship_orders", "bucket": "500-999", "op": "range", "min": 500, "max": 1000},
+    "代发订单量100-499": {"field": "monthly_dropship_orders", "bucket": "100-499", "op": "range", "min": 100, "max": 500},
+    "代发订单量<100": {"field": "monthly_dropship_orders", "bucket": "<100", "op": "<", "value": 100},
 }
 
 CHANNEL_TAGS = {
@@ -251,6 +461,10 @@ EXPORT_FIELD_GROUPS: List[Tuple[str, str, List[Dict[str, str]]]] = [
         {"number": "5.3", "key": "good_rate", "label": "好评率", "source": "搜索 stats/详情", "verify": "建议核验"},
         {"number": "5.4", "key": "product_refund_rate", "label": "品退率", "source": "详情/商家页/可信来源", "verify": "是"},
         {"number": "5.5", "key": "certificates", "label": "资质证书", "source": "详情/商家页", "verify": "建议核验"},
+        {"number": "5.6", "key": "good_rate_bucket", "label": "好评率区间", "source": "计算", "verify": "建议核验"},
+        {"number": "5.7", "key": "product_refund_rate_bucket", "label": "品退率区间", "source": "计算", "verify": "是"},
+        {"number": "5.8", "key": "comment_count_bucket", "label": "评论数区间", "source": "计算", "verify": "建议核验"},
+        {"number": "5.9", "key": "repurchase_rate_bucket", "label": "复购率区间", "source": "计算", "verify": "建议核验"},
     ]),
     ("6", "履约能力", [
         {"number": "6.1", "key": "rights_protection", "label": "权益保障", "source": "详情", "verify": "是"},
@@ -261,6 +475,9 @@ EXPORT_FIELD_GROUPS: List[Tuple[str, str, List[Dict[str, str]]]] = [
         {"number": "6.6", "key": "shipment_speed", "label": "发货时效", "source": "详情", "verify": "是"},
         {"number": "6.7", "key": "supports_dropship", "label": "是否一件代发", "source": "详情", "verify": "是"},
         {"number": "6.8", "key": "return_exchange_support", "label": "是否支持退换", "source": "详情", "verify": "建议核验"},
+        {"number": "6.9", "key": "shipment_rate_bucket", "label": "发货率区间", "source": "计算", "verify": "是"},
+        {"number": "6.10", "key": "units_30d_bucket", "label": "近30天销量区间", "source": "计算", "verify": "建议核验"},
+        {"number": "6.11", "key": "monthly_dropship_orders_bucket", "label": "代发订单量区间", "source": "计算", "verify": "建议核验"},
     ]),
     ("7", "商家信息", [
         {"number": "7.1", "key": "shop_name", "label": "店铺名称", "source": "详情", "verify": "是"},
@@ -521,9 +738,96 @@ def _query_part_from_tag(tag: str) -> str:
     return SCENE_HINTS.get(tag, tag)
 
 
+def _dedupe_dicts(items: Iterable[Dict[str, Any]], key_name: str) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    result: List[Dict[str, Any]] = []
+    for item in items:
+        key = str(item.get(key_name) or item.get("label") or item.get("tag") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _category_leaf(category: str) -> str:
+    parts = [part.strip() for part in str(category or "").replace("/", ">").split(">") if part.strip()]
+    return parts[-1] if parts else ""
+
+
+def build_filter_plan(config: TagCollectInput) -> Dict[str, Any]:
+    """把复选标签拆成搜索词、1688页面原生筛选、后置指标筛选和系统规则。"""
+    search_terms: List[str] = []
+    native_filters: List[Dict[str, Any]] = []
+    post_filters: List[Dict[str, Any]] = []
+    system_rules: List[Dict[str, Any]] = []
+    unmapped_tags: List[str] = []
+
+    for tag in config.tags:
+        if tag in CHANNEL_TAGS:
+            system_rules.append({
+                "tag": tag,
+                "type": "target_platform",
+                "field": "recommended_platform",
+                "value": CHANNEL_TAGS[tag],
+                "status": "configured",
+            })
+            continue
+        if tag in NATIVE_FILTER_SPECS:
+            spec = dict(NATIVE_FILTER_SPECS[tag])
+            spec["tag"] = tag
+            spec["status"] = "planned"
+            native_filters.append(spec)
+            continue
+        if tag in METRIC_TAG_SPECS:
+            spec = dict(METRIC_TAG_SPECS[tag])
+            spec.update({
+                "tag": tag,
+                "label": tag,
+                "type": "metric_bucket",
+                "status": "planned",
+            })
+            post_filters.append(spec)
+            continue
+        if tag in POST_FILTER_ALIASES:
+            spec = dict(POST_FILTER_ALIASES[tag])
+            spec.update({
+                "tag": tag,
+                "type": "metric_alias",
+            })
+            post_filters.append(spec)
+            continue
+        if tag in SYSTEM_RULE_TAGS:
+            system_rules.append({
+                "tag": tag,
+                "type": "system_rule",
+                "status": "planned",
+            })
+            continue
+        if tag in SCENE_HINTS:
+            search_terms.append(_query_part_from_tag(tag))
+            continue
+        unmapped_tags.append(tag)
+        search_terms.append(_query_part_from_tag(tag))
+
+    return {
+        "search_terms": list(dict.fromkeys(term for term in search_terms if term)),
+        "native_filters": _dedupe_dicts(native_filters, "key"),
+        "post_filters": _dedupe_dicts(post_filters, "tag"),
+        "system_rules": _dedupe_dicts(system_rules, "tag"),
+        "unmapped_tags": list(dict.fromkeys(unmapped_tags)),
+        "notes": (
+            "标签已拆为搜索词、1688页面原生筛选、后置指标筛选和系统规则。"
+            "原生筛选必须由RPA尝试点击；未找到会记录 not_found，不再静默拼回搜索词。"
+        ),
+    }
+
+
 def build_queries(config: TagCollectInput) -> List[str]:
-    bases = config.keywords or config.categories or [""]
-    hints = [_query_part_from_tag(t) for t in config.tags if t not in CHANNEL_TAGS]
+    filter_plan = build_filter_plan(config)
+    bases = config.keywords or [_category_leaf(category) for category in config.categories] or [""]
+    bases = [base for base in bases if base]
+    hints = filter_plan["search_terms"]
 
     queries: List[str] = []
     for base in bases:
@@ -541,12 +845,23 @@ def build_queries(config: TagCollectInput) -> List[str]:
 
 
 def build_filter_rule_summary(config: TagCollectInput) -> Dict[str, Any]:
+    filter_plan = build_filter_plan(config)
     return {
         "and_tags": config.tags,
         "or_categories": config.categories,
         "source_urls": config.source_urls,
         "exclude_tags": config.exclude_tags,
-        "notes": "MVP：类目/标签用于生成查询词或辅助 URL 采集评分；source_urls 可直接指定真实 1688 页面；exclude_tags 对标题、类目、风险提示、标签来源做命中过滤。详情页字段仍需后续核验。",
+        "search_terms": filter_plan["search_terms"],
+        "native_filters": filter_plan["native_filters"],
+        "post_filters": filter_plan["post_filters"],
+        "system_rules": filter_plan["system_rules"],
+        "unmapped_tags": filter_plan["unmapped_tags"],
+        "category_dictionary": {
+            "version": CATEGORY_DICTIONARY.get("version", ""),
+            "source": CATEGORY_DICTIONARY.get("source", ""),
+            "status": CATEGORY_DICTIONARY.get("status", ""),
+        },
+        "notes": filter_plan["notes"],
     }
 
 
@@ -560,21 +875,102 @@ def _sample_products_for_query(query: str, limit: int) -> List[Product]:
     return (matched or SAMPLE_PRODUCTS)[:limit]
 
 
-def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _default_filter_results(filter_plan: Dict[str, Any], *, source: str, query: str = "") -> List[Dict[str, Any]]:
+    status = "sample_skipped" if source == "sample" else "not_applicable"
+    message = "样例模式未打开1688页面" if source == "sample" else "当前采集来源不支持页面点击筛选"
+    return [
+        {
+            "filter_key": spec.get("key", ""),
+            "label": spec.get("label", spec.get("tag", "")),
+            "tag": spec.get("tag", ""),
+            "status": status,
+            "source": source,
+            "query": query,
+            "page_url": "",
+            "message": message,
+            "matched_text": "",
+        }
+        for spec in filter_plan.get("native_filters", [])
+    ]
+
+
+def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, source: str, query: str) -> List[Dict[str, Any]]:
+    if not isinstance(results, list):
+        return _default_filter_results(filter_plan, source=source, query=query)
+    normalized: List[Dict[str, Any]] = []
+    for record in results:
+        if not isinstance(record, dict):
+            continue
+        normalized.append({
+            "filter_key": str(record.get("filter_key") or record.get("key") or ""),
+            "label": str(record.get("label") or record.get("tag") or ""),
+            "tag": str(record.get("tag") or record.get("label") or ""),
+            "status": str(record.get("status") or "unknown"),
+            "source": str(record.get("source") or source),
+            "query": str(record.get("query") or query),
+            "page_url": str(record.get("page_url") or ""),
+            "message": str(record.get("message") or ""),
+            "matched_text": str(record.get("matched_text") or record.get("text") or ""),
+        })
+    planned_keys = {
+        str(spec.get("key") or spec.get("label") or "")
+        for spec in filter_plan.get("native_filters", [])
+    }
+    seen_keys = {str(record.get("filter_key") or record.get("label") or "") for record in normalized}
+    missing = [
+        spec for spec in filter_plan.get("native_filters", [])
+        if str(spec.get("key") or spec.get("label") or "") not in seen_keys
+    ]
+    normalized.extend([
+        {
+            "filter_key": spec.get("key", ""),
+            "label": spec.get("label", spec.get("tag", "")),
+            "tag": spec.get("tag", ""),
+            "status": "not_reported",
+            "source": source,
+            "query": query,
+            "page_url": "",
+            "message": "RPA未返回该筛选项执行结果",
+            "matched_text": "",
+        }
+        for spec in missing
+    ])
+    return [record for record in normalized if record.get("filter_key") or record.get("label") or planned_keys]
+
+
+def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
+    filter_plan = build_filter_plan(config)
     direct_urls = config.source_urls if (not config.sample_data and config.collect_source == "rpa") else []
     queries = direct_urls or build_queries(config)
     channel = _channel_from_tags(config.tags)
     seen: set[str] = set()
     rows: List[Dict[str, Any]] = []
+    filter_results: List[Dict[str, Any]] = []
 
     for query in queries:
         if config.sample_data:
             products = _sample_products_for_query(query, config.max_items_per_query)
+            filter_results.extend(_default_filter_results(filter_plan, source="sample", query=query))
         elif config.collect_source == "api":
             from capabilities.search.service import search_products
             products = search_products(query, channel=channel)[: config.max_items_per_query]
+            filter_results.extend(_default_filter_results(filter_plan, source="api", query=query))
         else:
             from capabilities.tag_collect.rpa import collect_products_from_1688_page
+            rpa_result = collect_products_from_1688_page(
+                query if not direct_urls else "",
+                config.max_items_per_query,
+                source_url=query if direct_urls else "",
+                native_filters=filter_plan["native_filters"],
+                return_meta=True,
+            )
+            raw_products = rpa_result.get("products", []) if isinstance(rpa_result, dict) else rpa_result
+            filter_results.extend(_normalize_filter_results(
+                rpa_result.get("filter_results") if isinstance(rpa_result, dict) else [],
+                filter_plan,
+                source="rpa",
+                query=query,
+            ))
             products = [
                 Product(
                     id=str(item.get("id", "")),
@@ -584,11 +980,7 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                     url=str(item.get("url", "")),
                     stats=item.get("stats") if isinstance(item.get("stats"), dict) else {},
                 )
-                for item in collect_products_from_1688_page(
-                    query if not direct_urls else "",
-                    config.max_items_per_query,
-                    source_url=query if direct_urls else "",
-                )
+                for item in raw_products
                 if str(item.get("id", "")).strip()
             ]
         for product in products:
@@ -596,6 +988,10 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                 continue
             seen.add(product.id)
             row = product_to_export_row(product, query, config)
+            keep_by_filters, post_records = _evaluate_post_filters(row, filter_plan.get("post_filters", []))
+            row["filter_match_records"] = post_records
+            if not keep_by_filters:
+                continue
             if _excluded_by_tags(row, config.exclude_tags):
                 continue
             rows.append(row)
@@ -603,7 +999,12 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     ranked = sorted(rows, key=lambda item: item["recommendation_score"], reverse=True)
     for index, row in enumerate(ranked, 1):
         row["seq"] = index
-    return ranked, queries
+    filter_plan["filter_results"] = filter_results
+    filter_plan["filter_warnings"] = [
+        record for record in filter_results
+        if str(record.get("status") or "") in ("not_found", "click_failed", "ambiguous", "not_reported")
+    ]
+    return ranked, queries, filter_plan
 
 
 def friendly_collect_error(error: Exception) -> str:
@@ -660,6 +1061,154 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _parse_number(value: Any) -> Optional[float]:
+    if value in (None, "", DETAIL_VERIFICATION_PENDING, "待品退率核验"):
+        return None
+    text = str(value).replace(",", "").replace("，", "").replace("￥", "").replace("¥", "").strip()
+    if "万" in text:
+        multiplier = 10000.0
+        text = text.replace("万", "")
+    else:
+        multiplier = 1.0
+    is_percent = "%" in text
+    text = text.replace("%", "")
+    import re
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        number = float(match.group(0)) * multiplier
+    except ValueError:
+        return None
+    if is_percent:
+        return number
+    return number * 100 if 0 < number <= 1 and any(key in str(value) for key in ("0.", ".0")) else number
+
+
+def metric_bucket(field_key: str, value: Any) -> str:
+    number = _parse_number(value)
+    if number is None:
+        return DETAIL_VERIFICATION_PENDING
+    if field_key in ("good_rate", "repurchase_rate", "shipment_rate"):
+        if number >= 90 and field_key == "good_rate":
+            return ">=90%"
+        if field_key == "good_rate" and number >= 80:
+            return "80%-90%"
+        if field_key == "good_rate" and number >= 70:
+            return "70%-80%"
+        if field_key == "good_rate":
+            return "<70%"
+        if field_key == "shipment_rate":
+            if number >= 95:
+                return ">=95%"
+            if number >= 90:
+                return "90%-95%"
+            if number >= 80:
+                return "80%-90%"
+            return "<80%"
+        if number >= 30:
+            return ">=30%"
+        if number >= 20:
+            return "20%-30%"
+        if number >= 10:
+            return "10%-20%"
+        return "<10%"
+    if field_key == "product_refund_rate":
+        if number < 2:
+            return "<2%"
+        if number < 5:
+            return "2%-5%"
+        if number < 10:
+            return "5%-10%"
+        return ">=10%"
+    if field_key == "comment_count":
+        if number >= 1000:
+            return ">=1000"
+        if number >= 300:
+            return "300-999"
+        if number >= 100:
+            return "100-299"
+        if number >= 30:
+            return "30-99"
+        return "<30"
+    if field_key in ("units_30d", "monthly_dropship_orders"):
+        if number >= 5000 and field_key == "units_30d":
+            return ">=5000"
+        if field_key == "units_30d" and number >= 1000:
+            return "1000-4999"
+        if field_key == "units_30d" and number >= 500:
+            return "500-999"
+        if field_key == "units_30d" and number >= 100:
+            return "100-499"
+        if field_key == "units_30d":
+            return "<100"
+        if number >= 1000:
+            return ">=1000"
+        if number >= 500:
+            return "500-999"
+        if number >= 100:
+            return "100-499"
+        return "<100"
+    return ""
+
+
+def _match_metric_rule(value: Any, rule: Dict[str, Any]) -> Optional[bool]:
+    number = _parse_number(value)
+    if number is None:
+        return None
+    op = rule.get("op")
+    if op == ">=":
+        return number >= float(rule.get("value", 0))
+    if op == "<":
+        return number < float(rule.get("value", 0))
+    if op == "range":
+        return float(rule.get("min", 0)) <= number < float(rule.get("max", 0))
+    return None
+
+
+def _evaluate_post_filters(row: Dict[str, Any], post_filters: List[Dict[str, Any]]) -> Tuple[bool, List[Dict[str, Any]]]:
+    records: List[Dict[str, Any]] = []
+    should_keep = True
+    for rule in post_filters:
+        field_key = str(rule.get("field") or "")
+        if not field_key:
+            continue
+        raw_value = row.get(field_key, "")
+        if rule.get("op"):
+            matched = _match_metric_rule(raw_value, rule)
+            if matched is None:
+                status = "pending_detail" if field_key in DETAIL_ONLY_FIELDS else "manual_review_required"
+            elif matched:
+                status = "matched"
+            else:
+                status = "filtered_out"
+                should_keep = False
+        else:
+            matched = None
+            status = "pending_detail" if field_key in DETAIL_ONLY_FIELDS else str(rule.get("status") or "manual_review_required")
+        records.append({
+            "tag": rule.get("tag", ""),
+            "field_key": field_key,
+            "field_label": _field_label(field_key),
+            "expected": rule.get("bucket", rule.get("label", "")),
+            "raw": raw_value,
+            "bucket": metric_bucket(field_key, raw_value),
+            "status": status,
+            "message": "字段需详情页核验后判断" if status == "pending_detail" else "",
+        })
+    return should_keep, records
+
+
+def _refresh_metric_buckets(row: Dict[str, Any]) -> None:
+    row["good_rate_bucket"] = metric_bucket("good_rate", row.get("good_rate", ""))
+    row["product_refund_rate_bucket"] = metric_bucket("product_refund_rate", row.get("product_refund_rate", ""))
+    row["shipment_rate_bucket"] = metric_bucket("shipment_rate", row.get("shipment_rate", ""))
+    row["comment_count_bucket"] = metric_bucket("comment_count", row.get("comment_count", ""))
+    row["repurchase_rate_bucket"] = metric_bucket("repurchase_rate", row.get("repurchase_rate", ""))
+    row["units_30d_bucket"] = metric_bucket("units_30d", row.get("units_30d", ""))
+    row["monthly_dropship_orders_bucket"] = metric_bucket("monthly_dropship_orders", row.get("monthly_dropship_orders", ""))
 
 
 def _score_product(stats: Dict[str, Any], tags: List[str]) -> Tuple[int, List[str], List[str]]:
@@ -863,6 +1412,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
     row["wechat_shop_suggestion"] = _wechat_suggestion(row, risks)
     if any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
         row["data_gap_risk"] = "关键字段待详情页核验"
+    _refresh_metric_buckets(row)
     return row
 
 
@@ -1038,6 +1588,7 @@ def _apply_verified_fields(
             part for part in [str(row.get("recommendation_reason", "")), f"详情字段已通过{source}补充"]
             if part
         )
+        _refresh_metric_buckets(row)
     else:
         row["verification_status"] = VERIFICATION_STATUS_FAILED
         row["data_gap_risk"] = fail_reason or "详情页核验失败"
@@ -1295,7 +1846,13 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["类目标签", ", ".join(payload.get("categories", []))],
         ["运营标签", ", ".join(payload.get("tags", []))],
         ["排除标签", ", ".join(payload.get("exclude_tags", []))],
+        ["搜索词标签", ", ".join((payload.get("filter_plan") or {}).get("search_terms", []))],
+        ["1688原生筛选", json.dumps((payload.get("filter_plan") or {}).get("native_filters", []), ensure_ascii=False)],
+        ["指标区间筛选", json.dumps((payload.get("filter_plan") or {}).get("post_filters", []), ensure_ascii=False)],
+        ["系统规则", json.dumps((payload.get("filter_plan") or {}).get("system_rules", []), ensure_ascii=False)],
+        ["未映射标签", ", ".join((payload.get("filter_plan") or {}).get("unmapped_tags", []))],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
+        ["筛选执行记录", json.dumps(payload.get("filter_results", []), ensure_ascii=False)],
         ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
         ["采集来源", payload.get("collect_source", "")],
         ["说明", "列表字段仅用于初筛；运费、品退率、发货率等关键字段需详情页核验后才可信。"],
@@ -1334,6 +1891,31 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         for record in payload.get("verification_records", [])
         if isinstance(record, dict)
     ]
+    filter_rows = [[
+        "筛选键",
+        "筛选标签",
+        "显示名称",
+        "状态",
+        "来源",
+        "查询/页面",
+        "页面URL",
+        "匹配文本",
+        "提示",
+    ]] + [
+        [
+            record.get("filter_key", ""),
+            record.get("tag", ""),
+            record.get("label", ""),
+            record.get("status", ""),
+            record.get("source", ""),
+            record.get("query", ""),
+            record.get("page_url", ""),
+            record.get("matched_text", ""),
+            record.get("message", ""),
+        ]
+        for record in payload.get("filter_results", [])
+        if isinstance(record, dict)
+    ]
 
     sheets = [
         ("选品结果", result_rows),
@@ -1341,6 +1923,7 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ("标签配置", config_rows),
         ("核验失败", failed_rows),
         ("核验记录", verification_rows),
+        ("筛选执行记录", filter_rows),
     ]
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", _content_types_xml(len(sheets)))
@@ -1405,7 +1988,7 @@ def get_export_path(run_id: str) -> Optional[str]:
 
 
 def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
-    rows, queries = collect_products(config)
+    rows, queries, filter_plan = collect_products(config)
     now = datetime.now()
     run_id = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
     for row in rows:
@@ -1416,6 +1999,15 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "run_id": run_id,
         "queries": queries,
         "filter_rules": build_filter_rule_summary(config),
+        "filter_plan": filter_plan,
+        "filter_results": filter_plan.get("filter_results", []),
+        "filter_warnings": filter_plan.get("filter_warnings", []),
+        "category_dictionary": {
+            "version": CATEGORY_DICTIONARY.get("version", ""),
+            "source": CATEGORY_DICTIONARY.get("source", ""),
+            "status": CATEGORY_DICTIONARY.get("status", ""),
+            "updated_at": CATEGORY_DICTIONARY.get("updated_at", ""),
+        },
         "categories": config.categories,
         "tags": config.tags,
         "source_urls": config.source_urls,
@@ -1451,7 +2043,12 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "collect_source": config.collect_source,
             "columns": [label for _, label in EXPORT_COLUMNS],
             "top_items": rows[:10],
+            "filter_plan": filter_plan,
+            "filter_results": payload["filter_results"],
+            "filter_warnings": payload["filter_warnings"],
+            "category_dictionary": payload["category_dictionary"],
             "verification_queue": payload["verification_queue"],
+            "verification_records": payload["verification_records"],
             "verified_count": 0,
         },
     }
@@ -1465,6 +2062,27 @@ def build_markdown(payload: Dict[str, Any], snapshot_path: str) -> str:
         lines.append(f"- 类目标签：{', '.join(payload['categories'])}")
     if payload.get("tags"):
         lines.append(f"- 运营标签：{', '.join(payload['tags'])}")
+    filter_plan = payload.get("filter_plan") or {}
+    if filter_plan.get("native_filters"):
+        labels = [str(item.get("label") or item.get("tag") or "") for item in filter_plan.get("native_filters", [])]
+        lines.append(f"- 1688页面原生筛选：{', '.join(label for label in labels if label)}")
+    if filter_plan.get("post_filters"):
+        labels = [str(item.get("label") or item.get("tag") or "") for item in filter_plan.get("post_filters", [])]
+        lines.append(f"- 指标区间筛选：{', '.join(label for label in labels if label)}")
+    if payload.get("filter_warnings"):
+        warning_text = "；".join(
+            f"{record.get('label') or record.get('tag')}={record.get('status')} {record.get('message', '')}".strip()
+            for record in payload.get("filter_warnings", [])
+            if isinstance(record, dict)
+        )
+        lines.append(f"- 筛选提示：{warning_text}")
+    category_dictionary = payload.get("category_dictionary") or {}
+    if category_dictionary:
+        lines.append(
+            "- 类目字典："
+            f"{category_dictionary.get('source', '')}/{category_dictionary.get('version', '')}"
+            f"（{category_dictionary.get('status', '')}）"
+        )
     lines.append(f"- 商品数：{payload['row_count']}")
     lines.append(f"- 待详情页核验商品：{len(payload.get('verification_queue', []))}")
     lines.append(f"- 导出文件：`{payload['output_path']}`")

@@ -18,8 +18,11 @@ from capabilities.tag_collect.service import (
     DETAIL_ONLY_FIELDS,
     DETAIL_VERIFICATION_PENDING,
     Product,
+    build_filter_plan,
+    build_queries,
     build_verification_queue,
     get_numbered_export_columns,
+    metric_bucket,
     product_to_export_row,
     parse_input,
     run_tag_collect,
@@ -58,6 +61,38 @@ def test_field_numbers():
     _assert("product_refund_rate" in keys, "字段应包含品退率")
     _assert("shipment_rate" in keys, "字段应包含发货率")
     _assert("wholesale_shipping_fee" in keys, "字段应包含批发运费")
+    _assert("good_rate_bucket" in keys, "字段应包含好评率区间")
+    _assert("shipment_rate_bucket" in keys, "字段应包含发货率区间")
+
+
+def test_filter_plan_splits_native_and_metric_tags():
+    config = parse_input(
+        categories="女装/女士精品>防晒衣>冰丝防晒衣",
+        tags="微信小店,一件代发,48小时发货,好评率>=90%,评论数30-99,防晒",
+        sample_data=True,
+    )
+    plan = build_filter_plan(config)
+    queries = build_queries(config)
+    query_text = " ".join(queries)
+    native_labels = {item["label"] for item in plan["native_filters"]}
+    post_tags = {item["tag"] for item in plan["post_filters"]}
+    _assert("一件代发" in native_labels, "一件代发应进入1688原生筛选")
+    _assert("48小时发货" in native_labels, "48小时发货应进入1688原生筛选")
+    _assert("好评率>=90%" in post_tags, "好评率区间应进入后置指标筛选")
+    _assert("评论数30-99" in post_tags, "评论数区间应进入后置指标筛选")
+    _assert("防晒" in query_text, "场景词防晒应保留为搜索词")
+    _assert("一件代发" not in query_text, "原生筛选不应拼进搜索词")
+    _assert("48小时发货" not in query_text, "原生筛选不应拼进搜索词")
+
+
+def test_metric_bucket_ranges():
+    _assert(metric_bucket("good_rate", "96.2%") == ">=90%", "好评率应按 >=90% 分桶")
+    _assert(metric_bucket("good_rate", "85%") == "80%-90%", "好评率应按 80%-90% 分桶")
+    _assert(metric_bucket("good_rate", "75%") == "70%-80%", "好评率应按 70%-80% 分桶")
+    _assert(metric_bucket("good_rate", "69%") == "<70%", "好评率应按 <70% 分桶")
+    _assert(metric_bucket("shipment_rate", "93.4%") == "90%-95%", "发货率应细化分桶")
+    _assert(metric_bucket("product_refund_rate", "6.8%") == "5%-10%", "品退率应细化分桶")
+    _assert(metric_bucket("comment_count", "86") == "30-99", "评论数应细化分桶")
 
 
 def test_export_xlsx_and_exclude():
@@ -86,7 +121,7 @@ def test_export_xlsx_and_exclude():
     with zipfile.ZipFile(data["output_path"]) as workbook:
         names = workbook.namelist()
         sheets = [name for name in names if name.startswith("xl/worksheets/sheet")]
-        _assert(len(sheets) == 5, "xlsx 应包含 5 个工作表")
+        _assert(len(sheets) == 6, "xlsx 应包含 6 个工作表")
         workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
         field_xml = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
         _assert("选品结果" in workbook_xml, "应包含选品结果 sheet")
@@ -94,9 +129,13 @@ def test_export_xlsx_and_exclude():
         _assert("标签配置" in workbook_xml, "应包含标签配置 sheet")
         _assert("核验失败" in workbook_xml, "应包含核验失败 sheet")
         _assert("核验记录" in workbook_xml, "应包含核验记录 sheet")
+        _assert("筛选执行记录" in workbook_xml, "应包含筛选执行记录 sheet")
         _assert("10.8" in field_xml, "字段说明应包含 10.8 核验状态")
         _assert("品退率" in field_xml, "字段说明应包含品退率")
         _assert("发货率" in field_xml, "字段说明应包含发货率")
+        filter_xml = workbook.read("xl/worksheets/sheet6.xml").decode("utf-8")
+        _assert("一件代发" in filter_xml, "筛选执行记录应包含一件代发")
+        _assert("sample_skipped" in filter_xml, "样例模式应标记原生筛选未执行")
 
 
 def test_sample_detail_verification():
@@ -213,6 +252,7 @@ def test_web_token_and_sample_api():
             with zipfile.ZipFile(tmp.name) as workbook:
                 workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
                 _assert("核验记录" in workbook_xml, "download xlsx 应包含核验记录 sheet")
+                _assert("筛选执行记录" in workbook_xml, "download xlsx 应包含筛选执行记录 sheet")
 
         status, payload = _post_json(
             f"{base_url}/api/verify",
@@ -249,6 +289,8 @@ def test_web_token_and_sample_api():
 
 def main():
     test_field_numbers()
+    test_filter_plan_splits_native_and_metric_tags()
+    test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
     test_sample_detail_verification()
     test_real_page_candidates_enter_verification_queue()

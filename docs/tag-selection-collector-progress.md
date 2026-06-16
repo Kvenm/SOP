@@ -2,11 +2,15 @@
 
 ## 最新状态：真实数据测试口径
 
-记录时间：2026-06-14 11:12 CST
+记录时间：2026-06-16 09:58 CST
 
 用户已明确要求测试时必须使用真实 1688 页面和真实数据，不再以样例数据作为默认验收链路。本项目已切换为：
 
 - Web 工作台默认真实数据模式，通过 Playwright/RPA 打开 1688 搜索页采集候选商品。
+- 标签已拆成四类：搜索词、1688 页面原生筛选、后置指标区间筛选、系统规则；`一件代发`、`48小时发货`、`7天包退货/七天无理由` 不再静默拼进搜索词。
+- RPA 会在 1688 搜索页尝试点击/勾选原生筛选项，并把 `clicked`、`not_found`、`click_failed`、`not_applicable` 写入页面提示、快照和导出表。
+- 指标区间已细化：好评率、品退率、发货率、评论数、复购率、近30天销量、代发订单量均有区间标签；页面读不到的字段保持待核验或人工复核，不猜值。
+- Web 类目区已支持一级/二级/三级路径展示，并引入可追溯类目字典文件 `scripts/capabilities/tag_collect/category_dict.json`。当前状态为本地种子 `partial_seed_needs_official_sync`，不能宣称已经是完整官方 1688 类目树。
 - 如遇登录、扫码或安全验证，需要用户在弹出的浏览器中处理；如果处理后仍失败，RPA 会明确返回 `login_required`，不会继续伪造数据。
 - Web 和 CLI 已支持直接传入 1688 搜索页/商品详情页 URL，用于账号登录受阻时测试公开页面真实数据解析。
 - “真实详情核验”会打开真实商品详情页，启发式提取运费、品退率、发货率等关键字段。
@@ -23,7 +27,7 @@
 
 ## 当前阶段
 
-已完成第一版 Web 筛选测试工作台 MVP，以及第二阶段第一片样例详情核验能力。当前可作为“标签复选 + 样例采集 + P0/P1 高潜核验队列 + 样例详情核验 + 字段编号 + Excel 导出”的测试基线；下一阶段应接入真实 `prod_detail` 或 Playwright/RPA 详情页核验。
+已完成第一版 Web 筛选测试工作台 MVP、真实页面 RPA 采集、详情核验第一版，以及本轮“标签意图拆分 + 1688 原生筛选动作记录 + 指标区间初筛 + 三级类目入口”。当前可作为“标签复选 + 原生筛选点击记录 + 指标区间 + P0/P1 高潜核验队列 + 字段编号 + Excel 导出”的测试基线；后续重点是补完整官方 1688 类目字典和更多真实页面字段样本。
 
 本轮按用户要求补充使用 GitHub 前端设计 skill：
 
@@ -43,6 +47,10 @@
   - 产品 agent：确认下一片应做 P0/P1 详情核验队列和字段级证据模型，不应先拆前后端或多人化。
   - 验证 agent：补充要求 Web rows 保持未核验占位、Web 下载端到端、未核验提示必须可见。
   - 架构 agent：原始输出可读但 JSON 校验失败；结论同样建议先在 `tag_collect.service` 补服务层契约，Web 只做薄接口。
+- 2026-06-16 已继续运行 `.codex-workflows/workflows/tag-collect-next.workflow.js` 多 agent 评审：
+  - 产品 agent：确认下一片必须先做“标签意图拆分 + 1688 原生筛选点击 + 指标区间可见化”。
+  - 架构 agent：建议保留现有单体 Web 工作台，不急于前后端拆分；先补 `filter_plan`、RPA `filter_results`、字段证据和导出兼容。
+  - 验证 agent：要求 smoke 覆盖原生筛选不进搜索词、筛选失败提示、区间字段、导出记录。
 
 ## 已实现
 
@@ -62,28 +70,22 @@ python3 cli.py tag_collect --sample-data --categories "女装/女士精品" --ta
 python3 cli.py tag_collect --serve --port 8765
 ```
 
-真实采集 Web 模式需要显式开关：
-
-```bash
-python3 cli.py tag_collect --serve --port 8765 --allow-real
-```
-
-且仅允许本机 host 开启真实采集。
+Web 工作台默认面向本机真实 1688 页面采集；开发样例需要在页面里显式开启。真实采集仅建议在本机地址使用，登录或验证由用户在浏览器中手动完成。
 
 ### Web 工作台
 
 已实现本地 Web 页面：
 
-- 类目标签复选，含一级/二级类目树。
-- 运营筛选标签复选。
+- 类目标签复选，含一级/二级/三级路径树。
+- 运营筛选标签复选，并拆分为 1688 原生筛选、指标区间、平台/系统规则等意图。
 - 搜索词、排除标签、查询词上限、每词商品上限。
-- 样例数据默认开启，不调用 1688。
+- 开发样例需要显式开启；正式测试默认真实数据。
 - 结果表格筛选：标题/类目、最低分、推荐等级、核验状态、微信小店规则预判。
 - 字段编号页。
 - 下载导出文件。
 - 本地 token 校验，无 token 的 POST 会拒绝。
-- 真实采集默认关闭，未加 `--allow-real` 时关闭样例数据也会被阻止。
-- 已完成浏览器交互验收：复选 `女装/女士精品`、`微信小店`、`一件代发`、`48小时发货` 后运行采集，生成 3 条样例结果和下载链接。
+- 本机 Web 默认可进行真实采集；局域网访问适合查看页面和导出，不建议暴露真实采集能力。
+- 已完成 smoke 验收：复选 `女装/女士精品`、`微信小店`、`一件代发`、`48小时发货`、`好评率>=90%` 后，`一件代发/48小时发货` 进入原生筛选计划，不再拼进查询词。
 - 已新增结果页“样例核验高潜”按钮：
   - 采集后展示待核验高潜、已核验商品、核验记录数量。
   - 默认仅核验 P0/P1 且关键详情字段存在缺口的商品。
@@ -102,9 +104,9 @@ python3 cli.py tag_collect --serve --port 8765 --allow-real
 字段编号已改为 PRD 的 1-10 分组体系：
 
 - `1.1` 到 `10.11`
-- 共 72 个字段定义。
+- 共 79 个字段定义。
 - 字段定义同源用于 Web 字段页、导出列、字段说明 sheet。
-- 已包含用户重点字段：批发运费、代发运费、品退率、24 小时揽收率、发货率、发货时效、是否一件代发、核验状态、人工复核状态。
+- 已包含用户重点字段：批发运费、代发运费、品退率、24 小时揽收率、发货率、发货时效、是否一件代发、核验状态、人工复核状态，以及好评率/品退率/发货率/评论数/复购率/近30天销量/代发订单量区间字段。
 
 注意：关键字段当前仍为“待详情页核验”，没有伪装成可信数据。本轮已将详情页核验字段统一收敛到 `DETAIL_ONLY_FIELDS`，包括起批范围、代发价、批发运费、代发运费、品退率、发货率、发货时效、是否一件代发、面单支持、24 小时揽收率、月代发订单。
 
@@ -113,15 +115,16 @@ python3 cli.py tag_collect --serve --port 8765 --allow-real
 已支持：
 
 - `.xlsx`，默认导出格式。
-- `.csv`。
+- `.csv`，仅导出 `选品结果` 明细，不包含审计类工作表。
 
-`.xlsx` 是真正的工作簿 zip 格式，当前包含 5 个工作表：
+`.xlsx` 是真正的工作簿 zip 格式，当前包含 6 个工作表：
 
 - `选品结果`
 - `字段说明`
 - `标签配置`
 - `核验失败`
 - `核验记录`
+- `筛选执行记录`
 
 ### 风险隔离
 
@@ -131,9 +134,10 @@ python3 cli.py tag_collect --serve --port 8765 --allow-real
 - 真实采集才懒加载现有 `search` capability。
 - 服务端强制限额：`MAX_QUERIES = 50`，`MAX_ITEMS_PER_QUERY = 50`。
 - Web POST 必须带服务端 token。
-- Web 真实采集必须 `--allow-real` 且本机 host。
+- Web 真实采集默认按本机安全边界运行；局域网访问不建议开放真实采集。
 - `exclude_tags` 已在 MVP 中实际生效，会匹配标题、类目、风险提示、标签来源等并过滤。
 - 过滤规则会写入快照和 `标签配置` sheet。
+- 1688 原生筛选执行结果会写入快照、Web 筛选记录和 `筛选执行记录` sheet。
 
 ## 已验证
 
@@ -157,13 +161,13 @@ python3 cli.py tag_collect --sample-data --categories "女装/女士精品" --ta
 - `tag_collect` 能被 CLI 发现。
 - 样例采集成功生成 `.xlsx` 和 JSON 快照。
 - `exclude-tags "红海"` 会过滤样例中的红海商品。
-- `.xlsx` 文件可作为 zip 打开，并包含 5 个 sheet。
+- `.xlsx` 文件可作为 zip 打开，并包含 6 个 sheet。
 - 字段说明中可找到 `10.8`、品退率、发货率。
 - Web `/api/options` 返回 token、限额、字段编号。
 - 无 token 调 `/api/collect` 返回 403。
 - 带 token 调 `/api/collect` 成功生成样例结果。
 - `/download?run_id=...` 用 GET 可下载 xlsx，响应类型为 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`。
-- 已新增并通过 `scripts/capabilities/tag_collect/smoke_test.py`，覆盖字段编号、xlsx 五个 sheet、token 拒绝、样例 API 成功、真实采集未授权阻止、exclude 过滤。
+- 已新增并通过 `scripts/capabilities/tag_collect/smoke_test.py`，覆盖字段编号、xlsx 六个 sheet、标签意图拆分、指标区间、token 拒绝、样例 API 成功、真实采集未授权阻止、exclude 过滤。
 - 已补充 smoke test 断言：`DETAIL_ONLY_FIELDS` 在详情页核验前必须保持“待详情页核验”，`verification_status` 保持 `unverified`。
 - 已补充 smoke test 断言：
   - `DETAIL_ONLY_FIELDS` 在详情页核验前必须保持“待详情页核验”，`verification_status` 保持 `unverified`。
@@ -171,6 +175,9 @@ python3 cli.py tag_collect --sample-data --categories "女装/女士精品" --ta
   - 样例详情核验后必须生成字段级核验记录。
   - 核验后批发运费、品退率、发货率不再是占位值。
   - Web `/download?run_id=...` 端到端返回可打开的 xlsx，并包含 `核验记录` sheet。
+  - `一件代发/48小时发货` 不进入查询词，而进入 `native_filters`。
+  - `好评率>=90%/评论数30-99` 等进入 `post_filters`。
+  - 样例导出包含 `筛选执行记录` sheet，原生筛选状态为 `sample_skipped`。
 - 已完成浏览器交互检查，本地截图在 `output/playwright/`，不随 Git 提交：
   - 首页/类目树截图：`output/playwright/tag_collect_initial.png`
   - 结果页截图：`output/playwright/tag_collect_results.png`

@@ -11,11 +11,13 @@ from urllib.parse import parse_qs, urlparse
 
 from _auth import get_ak_from_env
 from capabilities.tag_collect.service import (
+    CATEGORY_DICTIONARY,
     EXPORT_COLUMNS,
     MAX_ITEMS_PER_QUERY,
     MAX_QUERIES,
     TAG_CATEGORY_TREE,
     TAG_FILTER_GROUPS,
+    METRIC_FILTER_GROUPS,
     friendly_collect_error,
     get_export_path,
     get_numbered_export_columns,
@@ -91,7 +93,14 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                         "max_items_per_query": MAX_ITEMS_PER_QUERY,
                     },
                     "category_tree": TAG_CATEGORY_TREE,
+                    "category_dictionary": {
+                        "version": CATEGORY_DICTIONARY.get("version", ""),
+                        "source": CATEGORY_DICTIONARY.get("source", ""),
+                        "status": CATEGORY_DICTIONARY.get("status", ""),
+                        "updated_at": CATEGORY_DICTIONARY.get("updated_at", ""),
+                    },
                     "filter_groups": TAG_FILTER_GROUPS,
+                    "metric_filter_groups": METRIC_FILTER_GROUPS,
                     "columns": [{"key": key, "label": label} for key, label in EXPORT_COLUMNS],
                     "numbered_columns": get_numbered_export_columns(),
                 },
@@ -523,6 +532,17 @@ HTML_PAGE = r"""<!doctype html>
     .category-children .tier-label {
       margin-bottom: 8px;
     }
+    .category-secondary {
+      background: rgba(255, 255, 255, .42);
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      margin-top: 8px;
+      padding: 8px;
+    }
+    .category-secondary .tag-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 6px;
+    }
     .tag-grid {
       display: grid;
       gap: 8px;
@@ -808,7 +828,7 @@ HTML_PAGE = r"""<!doctype html>
       <div class="panel-title">
         <div>
           <h2>一级类目</h2>
-          <div class="subtle-count">先圈定采集范围，再用二级类目细化</div>
+          <div class="subtle-count">按一级 / 二级 / 三级路径圈定采集范围</div>
         </div>
         <button id="clearCategories" class="secondary" type="button">清空</button>
       </div>
@@ -871,6 +891,15 @@ HTML_PAGE = r"""<!doctype html>
           <div id="filterGroups"></div>
 
           <div id="notice" class="notice"></div>
+          <div class="verification-records">
+            <div class="panel-title">
+              <div>
+                <h2>筛选计划与执行记录</h2>
+                <div class="subtle-count">原生筛选必须在 1688 页面点击；找不到会显示 not_found</div>
+              </div>
+            </div>
+            <div id="filterRecordList" class="record-list"></div>
+          </div>
           <div class="summary">
             <div class="metric"><span>采集批次</span><strong id="runId">-</strong></div>
             <div class="metric"><span>商品数</span><strong id="rowCount">0</strong></div>
@@ -957,6 +986,9 @@ HTML_PAGE = r"""<!doctype html>
       runId: "",
       verificationQueue: [],
       verificationRecords: [],
+      filterPlan: {},
+      filterResults: [],
+      filterWarnings: [],
       selectedCategories: new Set(),
       selectedTags: new Set(),
       tableColumns: [
@@ -1001,11 +1033,31 @@ HTML_PAGE = r"""<!doctype html>
       const wrap = $("categoryTree");
       const q = $("categorySearch").value.trim().toLowerCase();
       const tree = state.options.category_tree;
-      wrap.innerHTML = Object.entries(tree).map(([parent, children]) => {
-        const matchedChildren = children.filter(child => (`${parent} ${child}`).toLowerCase().includes(q));
-        if (q && !parent.toLowerCase().includes(q) && matchedChildren.length === 0) return "";
-        const childHtml = matchedChildren.map(child => chipHtml(`${parent}>${child}`, child, "category")).join("");
-        const selectedChildren = children.filter(child => state.selectedCategories.has(`${parent}>${child}`)).length;
+      const dict = state.options.category_dictionary || {};
+      wrap.innerHTML = `<div class="record-item"><strong>类目字典 ${esc(dict.version || "-")}</strong><span>${esc(dict.source || "-")} · ${esc(dict.status || "-")}</span></div>` + Object.entries(tree).map(([parent, children]) => {
+        const entries = Array.isArray(children)
+          ? children.map(child => [child, []])
+          : Object.entries(children || {});
+        const filteredEntries = entries.map(([child, grandchildren]) => {
+          const grandList = Array.isArray(grandchildren) ? grandchildren : [];
+          const matchedGrandchildren = grandList.filter(grand => (`${parent} ${child} ${grand}`).toLowerCase().includes(q));
+          const childMatches = (`${parent} ${child}`).toLowerCase().includes(q);
+          if (q && !childMatches && matchedGrandchildren.length === 0) return null;
+          return [child, q && !childMatches ? matchedGrandchildren : grandList];
+        }).filter(Boolean);
+        if (q && !parent.toLowerCase().includes(q) && filteredEntries.length === 0) return "";
+        const childHtml = filteredEntries.map(([child, grandchildren]) => {
+          const childValue = `${parent}>${child}`;
+          const grandHtml = (grandchildren || []).map(grand => chipHtml(`${parent}>${child}>${grand}`, grand, "category")).join("");
+          return `
+            <div class="category-secondary">
+              ${chipHtml(childValue, child, "category")}
+              ${grandchildren && grandchildren.length ? `<div class="tier-label">三级筛选</div><div class="tag-grid">${grandHtml}</div>` : ""}
+            </div>
+          `;
+        }).join("");
+        const selectedChildren = entries.filter(([child]) => state.selectedCategories.has(`${parent}>${child}`)).length
+          + entries.reduce((sum, [child, grandchildren]) => sum + (grandchildren || []).filter(grand => state.selectedCategories.has(`${parent}>${child}>${grand}`)).length, 0);
         const active = state.selectedCategories.has(parent) || selectedChildren > 0;
         return `
           <div class="category-group ${active ? "is-active" : ""}">
@@ -1015,11 +1067,11 @@ HTML_PAGE = r"""<!doctype html>
                 <span class="tier-label">一级筛选</span>
                 <strong>${esc(parent)}</strong>
               </span>
-              <span class="category-count">${selectedChildren ? `${selectedChildren}/` : ""}${children.length} 个二级</span>
+              <span class="category-count">${selectedChildren ? `${selectedChildren}/` : ""}${entries.length} 个二级</span>
             </label>
             <div class="category-children">
               <div class="tier-label">二级筛选</div>
-              <div class="tag-grid">${childHtml}</div>
+              ${childHtml}
             </div>
           </div>
         `;
@@ -1100,6 +1152,9 @@ HTML_PAGE = r"""<!doctype html>
       state.runId = data.run_id || state.runId || "";
       state.verificationQueue = data.verification_queue || state.verificationQueue || [];
       state.verificationRecords = data.verification_records || state.verificationRecords || [];
+      state.filterPlan = data.filter_plan || state.filterPlan || {};
+      state.filterResults = data.filter_results || state.filterResults || [];
+      state.filterWarnings = data.filter_warnings || state.filterWarnings || [];
       $("runId").textContent = data.run_id || "-";
       $("rowCount").textContent = String(state.rows.length);
       $("highCount").textContent = String(state.rows.filter(row => ["P0", "P1"].includes(row.recommendation_level)).length);
@@ -1109,6 +1164,34 @@ HTML_PAGE = r"""<!doctype html>
       $("recordCount").textContent = String(state.verificationRecords.length);
       $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
       renderRecords();
+      renderFilterRecords();
+    }
+
+    function renderFilterRecords() {
+      const planned = [
+        ...(state.filterPlan.native_filters || []).map(item => ({...item, plan_type: "1688原生筛选"})),
+        ...(state.filterPlan.post_filters || []).map(item => ({...item, plan_type: "指标区间"})),
+        ...(state.filterPlan.system_rules || []).map(item => ({...item, plan_type: "系统规则"}))
+      ];
+      const execution = state.filterResults || [];
+      const rows = execution.length
+        ? execution.map(record => ({
+            title: `${record.label || record.tag || record.filter_key || "-"} · ${record.status || "-"}`,
+            line1: `来源：${record.source || "-"} · ${record.query || "-"}`,
+            line2: record.message || record.matched_text || "-"
+          }))
+        : planned.map(record => ({
+            title: `${record.plan_type} · ${record.label || record.tag || record.key || "-"}`,
+            line1: `字段：${record.field || record.key || "-"} · 状态：${record.status || "planned"}`,
+            line2: record.bucket || record.value || record.type || "待执行"
+          }));
+      $("filterRecordList").innerHTML = rows.slice(0, 20).map(record => `
+        <div class="record-item">
+          <strong>${esc(record.title)}</strong>
+          <span>${esc(record.line1)}</span>
+          <span>${esc(record.line2)}</span>
+        </div>
+      `).join("") || `<div class="record-item"><strong>暂无筛选计划</strong><span>选择标签后运行采集，会展示搜索词/原生筛选/指标区间拆分。</span></div>`;
     }
 
     function renderRecords() {
@@ -1158,13 +1241,18 @@ HTML_PAGE = r"""<!doctype html>
         state.runId = result.data.run_id || "";
         state.verificationQueue = result.data.verification_queue || [];
         state.verificationRecords = result.data.verification_records || [];
+        state.filterPlan = result.data.filter_plan || {};
+        state.filterResults = result.data.filter_results || [];
+        state.filterWarnings = result.data.filter_warnings || [];
         renderTable();
         updateSummary(result.data);
         $("downloadLink").href = result.data.download_url;
         $("downloadLink").hidden = false;
         const modeText = $("sampleMode").checked ? "开发样例" : `真实数据/${$("collectSource").value === "rpa" ? "1688页面RPA" : "AK/API"}`;
         const queryLabel = $("sourceUrls").value.trim() ? "采集页面" : "查询词";
-        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；运费、品退率、发货率等关键字段仍需详情页核验。${queryLabel}：${(result.data.queries || []).join("，")}`, true);
+        const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
+        const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
+        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}运费、品退率、发货率等关键字段仍需详情页核验。`, (state.filterWarnings || []).length === 0);
         setTab("results");
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);

@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 from _errors import ServiceError
 
@@ -54,14 +54,24 @@ def _run_node_script(script_name: str, payload: Dict[str, Any], timeout: int = 1
     return result
 
 
-def collect_products_from_1688_page(query: str, limit: int, source_url: str = "") -> List[Dict[str, Any]]:
+def collect_products_from_1688_page(
+    query: str,
+    limit: int,
+    source_url: str = "",
+    native_filters: Optional[List[Dict[str, Any]]] = None,
+    return_meta: bool = False,
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """打开或连接真实 Chrome 的 1688 搜索页，从真实页面提取候选商品。"""
     result = _run_node_script(
         "rpa_collect.mjs",
-        {"query": query, "limit": limit, "source_url": source_url},
+        {"query": query, "limit": limit, "source_url": source_url, "native_filters": native_filters or []},
         timeout=int(os.environ.get("TAG_COLLECT_RPA_TIMEOUT", "180")),
     )
     products = result.get("products", [])
+    if return_meta:
+        result["products"] = products if isinstance(products, list) else []
+        result["filter_results"] = result.get("filter_results", []) if isinstance(result.get("filter_results"), list) else []
+        return result
     return products if isinstance(products, list) else []
 
 

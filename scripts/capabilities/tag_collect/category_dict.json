@@ -1,0 +1,82 @@
+{
+  "version": "1688-seed-2026-06-16",
+  "source": "1688_category_seed_local_manual",
+  "status": "partial_seed_needs_official_sync",
+  "updated_at": "2026-06-16",
+  "tree": [
+    {
+      "id": "apparel_women",
+      "name": "女装/女士精品",
+      "children": [
+        {"id": "women_dress", "name": "连衣裙", "children": [{"id": "women_dress_summer", "name": "夏季连衣裙"}, {"id": "women_dress_commute", "name": "通勤连衣裙"}, {"id": "women_dress_big_size", "name": "大码连衣裙"}]},
+        {"id": "women_tshirt", "name": "女式T恤", "children": [{"id": "women_tshirt_short", "name": "短袖T恤"}, {"id": "women_tshirt_sunscreen", "name": "防晒T恤"}, {"id": "women_tshirt_basic", "name": "基础款T恤"}]},
+        {"id": "women_pants", "name": "女式休闲裤", "children": [{"id": "women_pants_wide", "name": "阔腿裤"}, {"id": "women_pants_suit", "name": "西装裤"}, {"id": "women_pants_casual", "name": "休闲长裤"}]},
+        {"id": "women_sunscreen", "name": "防晒衣", "children": [{"id": "women_sunscreen_jacket", "name": "防晒外套"}, {"id": "women_sunscreen_ice", "name": "冰丝防晒衣"}, {"id": "women_sunscreen_outdoor", "name": "户外防晒衣"}]}
+      ]
+    },
+    {
+      "id": "home_daily",
+      "name": "家居日用品",
+      "children": [
+        {"id": "rain_goods", "name": "雨具", "children": [{"id": "rain_poncho", "name": "连体雨衣、雨披"}, {"id": "rain_umbrella", "name": "晴雨伞"}, {"id": "rain_shoe_cover", "name": "雨鞋/鞋套"}]},
+        {"id": "cleaning_tools", "name": "清洁工具", "children": [{"id": "cleaning_mop", "name": "拖把"}, {"id": "cleaning_brush", "name": "清洁刷"}, {"id": "cleaning_wipe", "name": "抹布/百洁布"}]},
+        {"id": "cups", "name": "杯壶", "children": [{"id": "cups_thermos", "name": "保温杯"}, {"id": "cups_plastic", "name": "塑料杯"}, {"id": "cups_sports", "name": "运动水壶"}]},
+        {"id": "daily_small", "name": "居家小件", "children": [{"id": "daily_hooks", "name": "挂钩"}, {"id": "daily_laundry", "name": "衣架晾晒"}, {"id": "daily_protect", "name": "防护用品"}]}
+      ]
+    },
+    {
+      "id": "storage_cleaning",
+      "name": "收纳清洁",
+      "children": [
+        {"id": "storage_box", "name": "收纳盒", "children": [{"id": "storage_box_desktop", "name": "桌面收纳盒"}, {"id": "storage_box_clothes", "name": "衣物收纳盒"}, {"id": "storage_box_kitchen", "name": "厨房收纳盒"}]},
+        {"id": "storage_rack", "name": "收纳架", "children": [{"id": "storage_rack_floor", "name": "落地收纳架"}, {"id": "storage_rack_bathroom", "name": "浴室置物架"}, {"id": "storage_rack_kitchen", "name": "厨房置物架"}]},
+        {"id": "cleaning_agent", "name": "清洁剂", "children": [{"id": "cleaning_agent_kitchen", "name": "厨房清洁剂"}, {"id": "cleaning_agent_bathroom", "name": "浴室清洁剂"}, {"id": "cleaning_agent_laundry", "name": "衣物清洁剂"}]}
+      ]
+    },
+    {
+      "id": "appliance",
+      "name": "家用电器",
+      "children": [
+        {"id": "life_appliance", "name": "生活电器", "children": [{"id": "life_appliance_dryer", "name": "干衣机"}, {"id": "life_appliance_fan", "name": "电风扇"}, {"id": "life_appliance_heater", "name": "取暖器"}]},
+        {"id": "kitchen_appliance", "name": "厨房电器", "children": [{"id": "kitchen_appliance_cooker", "name": "电饭煲"}, {"id": "kitchen_appliance_blender", "name": "破壁机/榨汁机"}, {"id": "kitchen_appliance_airfryer", "name": "空气炸锅"}]},
+        {"id": "clean_appliance", "name": "清洁电器", "children": [{"id": "clean_appliance_vacuum", "name": "吸尘器"}, {"id": "clean_appliance_sweeper", "name": "扫地机"}, {"id": "clean_appliance_uv", "name": "除螨仪"}]}
+      ]
+    },
+    {
+      "id": "mother_baby",
+      "name": "母婴用品",
+      "children": [
+        {"id": "baby_feeding", "name": "婴童喂养", "children": [{"id": "baby_bottle", "name": "奶瓶"}, {"id": "baby_bowl", "name": "儿童餐具"}, {"id": "baby_bib", "name": "围兜/罩衣"}]},
+        {"id": "baby_care", "name": "洗护用品", "children": [{"id": "baby_towel", "name": "婴童毛巾"}, {"id": "baby_bath", "name": "洗澡用品"}, {"id": "baby_skin", "name": "婴童护肤"}]},
+        {"id": "baby_travel", "name": "婴儿推车", "children": [{"id": "baby_stroller", "name": "婴儿推车"}, {"id": "baby_carrier", "name": "腰凳/背带"}, {"id": "baby_seat", "name": "安全座椅"}]}
+      ]
+    },
+    {
+      "id": "toys",
+      "name": "玩具",
+      "children": [
+        {"id": "educational_toys", "name": "益智玩具", "children": [{"id": "edu_puzzle", "name": "拼图"}, {"id": "edu_board", "name": "桌游"}, {"id": "edu_math", "name": "数学教具"}]},
+        {"id": "plush_toys", "name": "毛绒玩具", "children": [{"id": "plush_doll", "name": "毛绒公仔"}, {"id": "plush_pillow", "name": "抱枕玩偶"}, {"id": "plush_keychain", "name": "挂件玩偶"}]},
+        {"id": "blocks", "name": "积木拼插", "children": [{"id": "blocks_small", "name": "小颗粒积木"}, {"id": "blocks_large", "name": "大颗粒积木"}, {"id": "blocks_magnetic", "name": "磁力片"}]}
+      ]
+    },
+    {
+      "id": "digital_mobile",
+      "name": "手机通讯",
+      "children": [
+        {"id": "phone_case", "name": "手机壳膜", "children": [{"id": "phone_case_case", "name": "手机壳"}, {"id": "phone_case_film", "name": "钢化膜"}, {"id": "phone_case_lens", "name": "镜头膜"}]},
+        {"id": "charger", "name": "充电器", "children": [{"id": "charger_fast", "name": "快充充电器"}, {"id": "charger_car", "name": "车载充电器"}, {"id": "charger_wireless", "name": "无线充电器"}]},
+        {"id": "cable", "name": "数据线", "children": [{"id": "cable_typec", "name": "Type-C数据线"}, {"id": "cable_lightning", "name": "苹果数据线"}, {"id": "cable_multi", "name": "多合一数据线"}]}
+      ]
+    },
+    {
+      "id": "outdoor_sports",
+      "name": "运动户外",
+      "children": [
+        {"id": "camping", "name": "露营装备", "children": [{"id": "camping_tent", "name": "帐篷"}, {"id": "camping_chair", "name": "折叠桌椅"}, {"id": "camping_light", "name": "露营灯"}]},
+        {"id": "fitness", "name": "健身器材", "children": [{"id": "fitness_yoga", "name": "瑜伽用品"}, {"id": "fitness_band", "name": "弹力带"}, {"id": "fitness_dumbbell", "name": "哑铃"}]},
+        {"id": "outdoor_clothes", "name": "户外服装", "children": [{"id": "outdoor_sunscreen", "name": "防晒服"}, {"id": "outdoor_jacket", "name": "冲锋衣"}, {"id": "outdoor_hat", "name": "户外帽"}]}
+      ]
+    }
+  ]
+}

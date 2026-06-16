@@ -23,7 +23,7 @@ python3 {baseDir}/cli.py tag_collect --categories "家居日用品,收纳清洁"
 | `--port` | `8765` | Web 监听端口 |
 | `--categories` | `""` | 复选类目标签，逗号分隔 |
 | `--tags` | `""` | 复选运营标签，逗号分隔 |
-| `--keywords` | `""` | 额外搜索词，逗号分隔；不传则由类目/标签生成 |
+| `--keywords` | `""` | 额外搜索词，逗号分隔；不传则由类目和搜索型标签生成 |
 | `--source-urls` | `""` | 直接采集真实 1688 搜索页或商品详情页 URL；适合账号登录受阻时测试公开页面真实数据 |
 | `--exclude-tags` | `""` | 排除标签；命中标题、类目、风险提示或标签来源时过滤，并写入任务快照 |
 | `--max-queries` | `20` | 最大查询词数量 |
@@ -36,6 +36,10 @@ python3 {baseDir}/cli.py tag_collect --categories "家居日用品,收纳清洁"
 
 - 推荐入口：`python3 cli.py tag_collect --serve --port 8765`，再打开 `http://127.0.0.1:8765`。
 - 页面默认关闭“开发样例”，即默认采集真实 1688 页面数据。若弹出登录或验证页面，用户需要在浏览器中扫码/处理验证。
+- 标签不会全部拼成搜索词。`一件代发`、`48小时发货`、`7天包退货/七天无理由`、`批发包邮`、`实力商家` 等会进入 `native_filters`，由 RPA 在 1688 搜索页尝试点击/勾选。
+- 如果当前类目或页面没有某个原生筛选项，系统会记录 `not_found` 并在 Web、JSON 快照、XLSX `筛选执行记录` 中提示，不能把它当作已筛选成功。
+- 好评率、品退率、发货率、评论数、复购率、近30天销量、代发订单量支持区间标签；页面读不到的字段保持待详情页核验或人工复核，不猜值。
+- 类目区支持一级/二级/三级路径。当前 `category_dict.json` 是本地种子字典，状态为 `partial_seed_needs_official_sync`，后续仍需采集/确认完整官方 1688 类目字典。
 - 如果账号登录不上或一直触发校验，可以在“1688 页面 URL”粘贴浏览器里能打开的搜索页/商品详情页链接。URL 模式仍然读取真实页面，不会使用样例数据；但公开页面看不到的运费、品退率、发货率等字段仍会保持待核验或失败。
 - 采集后可点击“真实详情核验”，将候选商品进入真实商品详情页核验。
 - 样例详情核验会把行状态更新为 `sample_verified`，并生成字段级核验记录。`sample_verified` 只代表流程和字段映射已通过样例验证，不代表真实 1688 数据可信。
@@ -58,6 +62,8 @@ Agent 收到的 CLI 标准输出：
     "snapshot_path": ".../tag_collect_20260613_120000_000.json",
     "sample_data": false,
     "columns": ["序号", "商品类目", "商品主图"],
+    "filter_plan": {"native_filters": [], "post_filters": []},
+    "filter_results": [],
     "top_items": [],
     "verification_queue": [],
     "verified_count": 0
@@ -95,8 +101,10 @@ Agent 收到的 CLI 标准输出：
 - `标签配置`
 - `核验失败`
 - `核验记录`
+- `筛选执行记录`
 
 `核验记录` 保存字段级记录：商品 ID、字段键、字段名、原始值、标准化值、来源、来源链接、模式、状态、核验时间、失败原因。
+`筛选执行记录` 保存 1688 原生筛选动作：筛选键、标签、显示名称、状态、来源、查询/页面、页面 URL、匹配文本、提示。
 
 ## 异常处理
 
@@ -108,5 +116,6 @@ Agent 收到的 CLI 标准输出：
 | 一直触发安全校验 | 返回 `login_required`，不会继续伪造数据 | 粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试公开页面真实数据；或运行 `scripts/capabilities/tag_collect/start_chrome_debug.sh`，用户在真实 Chrome 登录后设置 `TAG_COLLECT_CDP_URL=http://127.0.0.1:9222` |
 | API 真实采集无 AK | `AK 未配置` | 引导用户先 `configure`，或改用默认 RPA 真实页面采集 |
 | 导出后字段未核验 | `verification_status: unverified` 或字段为“待详情页核验” | 明确这是初筛结果，不能直接进入正式铺货结论 |
+| 原生筛选项找不到 | `filter_results.status: not_found` | 告知用户当前类目/页面没有展示该筛选项，不能当成筛选成功；必要时换类目或手动打开 1688 页面确认 |
 | 样例详情核验完成 | `verification_status: sample_verified` | 明确这是样例核验结果，不是真实 1688 详情页核验 |
 | 真实采集限流/授权异常 | HTTP 401/429 等 | 按 `references/common/error-handling.md` 处理 |
