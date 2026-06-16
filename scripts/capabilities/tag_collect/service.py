@@ -39,6 +39,9 @@ DETAIL_ONLY_FIELDS = {
     "company_type",
     "seller_member_type",
     "source_factory",
+    "certificates",
+    "trustpass_years",
+    "seller_locations",
     "stock",
     "video_query",
 }
@@ -364,6 +367,18 @@ NATIVE_FILTER_SPECS: Dict[str, Dict[str, Any]] = {
         "texts": ["48小时发货", "48小时内发货", "发货时间"],
         "source": "1688_search_filter",
     },
+    "24小时发货": {
+        "key": "ship_24h",
+        "label": "24小时发货",
+        "texts": ["24小时发货", "24小时内发货", "发货时间"],
+        "source": "1688_search_filter",
+    },
+    "72小时发货": {
+        "key": "ship_72h",
+        "label": "72小时发货",
+        "texts": ["72小时发货", "72小时内发货", "发货时间"],
+        "source": "1688_search_filter",
+    },
     "7天包退货": {
         "key": "seven_day_return",
         "label": "7天包退货",
@@ -398,6 +413,108 @@ NATIVE_FILTER_SPECS: Dict[str, Dict[str, Any]] = {
         "key": "power_seller",
         "label": "实力商家",
         "texts": ["实力商家"],
+        "source": "1688_search_filter",
+    },
+    "诚信通": {
+        "key": "trustpass",
+        "label": "诚信通",
+        "texts": ["诚信通"],
+        "source": "1688_search_filter",
+    },
+    "支持微信小店面单": {
+        "key": "waybill_wechat",
+        "label": "支持微信小店面单",
+        "texts": ["微信小店", "微信面单", "视频号面单", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持淘宝面单": {
+        "key": "waybill_taobao",
+        "label": "支持淘宝面单",
+        "texts": ["淘宝面单", "淘宝", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持抖音面单": {
+        "key": "waybill_douyin",
+        "label": "支持抖音面单",
+        "texts": ["抖音面单", "抖店面单", "抖音", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持拼多多面单": {
+        "key": "waybill_pinduoduo",
+        "label": "支持拼多多面单",
+        "texts": ["拼多多面单", "拼多多", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持小红书面单": {
+        "key": "waybill_xiaohongshu",
+        "label": "支持小红书面单",
+        "texts": ["小红书面单", "小红书", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持快手面单": {
+        "key": "waybill_kuaishou",
+        "label": "支持快手面单",
+        "texts": ["快手面单", "快手", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "支持京东面单": {
+        "key": "waybill_jd",
+        "label": "支持京东面单",
+        "texts": ["京东面单", "京东", "面单支持"],
+        "source": "1688_search_filter",
+    },
+    "先采后付": {
+        "key": "buy_first_pay_later",
+        "label": "先采后付",
+        "texts": ["先采后付"],
+        "source": "1688_search_filter",
+    },
+    "新品": {
+        "key": "new_product",
+        "label": "新品",
+        "texts": ["新品", "新款"],
+        "source": "1688_search_filter",
+    },
+    "1688严选": {
+        "key": "strict_selected_1688",
+        "label": "1688严选",
+        "texts": ["1688严选", "严选"],
+        "source": "1688_search_filter",
+    },
+    "跨境Select": {
+        "key": "cross_border_select",
+        "label": "跨境Select",
+        "texts": ["跨境Select", "跨境 Select", "Select"],
+        "source": "1688_search_filter",
+    },
+    "支持定制": {
+        "key": "customizable",
+        "label": "支持定制",
+        "texts": ["支持定制", "定制"],
+        "source": "1688_search_filter",
+    },
+    "镇店之宝": {
+        "key": "treasure_product",
+        "label": "镇店之宝",
+        "texts": ["镇店之宝"],
+        "source": "1688_search_filter",
+    },
+    "跨境专供货源": {
+        "key": "cross_border_supply",
+        "label": "跨境专供货源",
+        "texts": ["跨境专供", "跨境货源", "跨境"],
+        "source": "1688_search_filter",
+    },
+    "授权自有品牌": {
+        "key": "authorized_own_brand",
+        "label": "授权自有品牌",
+        "texts": ["授权自有品牌", "自有品牌", "品牌授权"],
+        "source": "1688_search_filter",
+    },
+    "店铺": {
+        "key": "seller_shop",
+        "label": "店铺",
+        "texts": ["店铺", "商家"],
         "source": "1688_search_filter",
     },
 }
@@ -617,6 +734,221 @@ def get_numbered_export_columns() -> List[Dict[str, Any]]:
     return [dict(field) for field in EXPORT_FIELD_DEFINITIONS]
 
 
+LIBRARY_FILTER_SCHEMA: List[Dict[str, Any]] = [
+    {
+        "key": "scope",
+        "title": "类目范围",
+        "description": "对齐店雷达 1688 选品库的类目入口，类目字典来自本地可追溯种子。",
+        "fields": [
+            {
+                "key": "category_paths",
+                "label": "选择类目",
+                "type": "category_tree",
+                "multi": True,
+                "status": "supported",
+                "mapping": "categories",
+            },
+            {
+                "key": "template_name",
+                "label": "我的模板",
+                "type": "text",
+                "status": "reserved",
+                "mapping": "template_metadata",
+            },
+        ],
+    },
+    {
+        "key": "precise_search",
+        "title": "精准搜索",
+        "description": "生成 1688 搜索词和采集入口。",
+        "fields": [
+            {
+                "key": "search_keyword",
+                "label": "商品关键词",
+                "type": "text",
+                "status": "supported",
+                "mapping": "keywords",
+            },
+            {
+                "key": "match_type",
+                "label": "匹配方式",
+                "type": "radio",
+                "options": ["模糊匹配", "精准匹配"],
+                "default": "模糊匹配",
+                "status": "reserved",
+                "mapping": "search_metadata",
+            },
+            {
+                "key": "history_keyword",
+                "label": "历史搜索",
+                "type": "text",
+                "status": "reserved",
+                "mapping": "search_metadata",
+            },
+            {
+                "key": "source_urls",
+                "label": "1688页面URL",
+                "type": "textarea",
+                "status": "supported",
+                "mapping": "source_urls",
+            },
+        ],
+    },
+    {
+        "key": "selection_mode",
+        "title": "选品模式",
+        "description": "店雷达的模式入口，当前先转译为搜索/原生筛选/规则标签。",
+        "fields": [
+            {
+                "key": "selection_modes",
+                "label": "选品模式",
+                "type": "multi_chip",
+                "options": ["新品热卖", "无货源选品", "同期热卖", "源头工厂"],
+                "status": "partial_supported",
+                "mapping": "tags_and_system_rules",
+            },
+        ],
+    },
+    {
+        "key": "advanced",
+        "title": "高级筛选",
+        "description": "平台、地区、跨境、自有品牌等筛选。",
+        "fields": [
+            {
+                "key": "downstream_platforms",
+                "label": "主营下游平台",
+                "type": "multi_chip",
+                "options": ["淘宝", "抖店", "拼多多", "小红书", "快手", "京东", "微信小店"],
+                "status": "supported",
+                "mapping": "platform_tags",
+            },
+            {
+                "key": "sales_regions",
+                "label": "主要销售地区",
+                "type": "multi_chip",
+                "options": ["华东", "华南", "华北", "华中", "西南", "东北", "西北", "港澳台", "海外"],
+                "status": "reserved",
+                "mapping": "detail_or_seller_region",
+            },
+            {
+                "key": "cross_border_supply",
+                "label": "跨境专供货源",
+                "type": "boolean",
+                "status": "supported",
+                "mapping": "native_filter",
+            },
+            {
+                "key": "authorized_own_brand",
+                "label": "授权自有品牌",
+                "type": "boolean",
+                "status": "supported",
+                "mapping": "native_filter",
+            },
+        ],
+    },
+    {
+        "key": "sales",
+        "title": "销售信息",
+        "description": "可从列表 stats 初筛的字段会直接过滤，详情字段保留核验记录。",
+        "fields": [
+            {"key": "sales_orders", "label": "销售订单数", "type": "range", "field": "orders_30d", "status": "supported", "mapping": "post_filter"},
+            {"key": "sales_units", "label": "销售件数", "type": "range", "field": "units_30d", "status": "supported", "mapping": "post_filter"},
+            {"key": "sales_amount", "label": "销售额", "type": "range", "field": "sales_amount_30d", "status": "supported", "mapping": "post_filter"},
+            {"key": "order_growth_7d", "label": "7日订单增长率(%)", "type": "range", "field": "order_growth_7d", "status": "reserved", "mapping": "future_metric"},
+            {"key": "purchase_concentration_7d", "label": "7日采购集中率(倍)", "type": "range", "field": "purchase_concentration_7d", "status": "reserved", "mapping": "future_metric"},
+        ],
+    },
+    {
+        "key": "product",
+        "title": "商品信息",
+        "description": "价格、起批、代发、资质和履约权益。",
+        "fields": [
+            {"key": "wholesale_price", "label": "批发价", "type": "range", "field": "wholesale_price", "status": "supported", "mapping": "post_filter"},
+            {"key": "min_order", "label": "最低起批量", "type": "range", "field": "min_order_range", "status": "detail_required", "mapping": "post_filter_after_verify"},
+            {"key": "dropship_price", "label": "代发价", "type": "range", "field": "dropship_price", "status": "detail_required", "mapping": "post_filter_after_verify"},
+            {"key": "repurchase_rate", "label": "复购率(%)", "type": "range", "field": "repurchase_rate", "status": "supported", "mapping": "post_filter"},
+            {"key": "certificates", "label": "资质证书", "type": "multi_chip", "options": ["质检报告", "3C认证", "CE", "FDA", "RoHS", "商标注册证", "专利证书"], "status": "detail_required", "mapping": "detail_verify"},
+            {"key": "listed_time", "label": "上架时间", "type": "select", "options": ["近7天", "近30天", "近90天", "半年内", "一年内"], "status": "reserved", "mapping": "time_filter"},
+            {"key": "product_marks", "label": "商品标识", "type": "multi_chip", "options": ["新品", "1688严选", "跨境Select", "支持定制", "镇店之宝"], "status": "supported", "mapping": "native_filter"},
+            {"key": "rights_protection", "label": "权益保障", "type": "multi_chip", "options": ["批发包邮", "7天包退货", "赠运费险"], "status": "supported", "mapping": "native_filter"},
+            {"key": "fulfillment_times", "label": "发货时间", "type": "multi_chip", "options": ["24小时", "48小时", "72小时"], "status": "supported", "mapping": "native_filter"},
+            {"key": "waybill_support", "label": "面单支持", "type": "multi_chip", "options": ["淘宝", "抖音", "拼多多", "小红书", "快手", "京东", "微信小店"], "status": "supported", "mapping": "native_filter"},
+            {"key": "dropship_rights", "label": "代发权益", "type": "multi_chip", "options": ["一件代发包邮", "先采后付"], "status": "partial_supported", "mapping": "native_filter"},
+        ],
+    },
+    {
+        "key": "seller",
+        "title": "卖家信息",
+        "description": "卖家能力字段多数需要详情页或商家页核验。",
+        "fields": [
+            {"key": "trustpass_years", "label": "诚信通年限", "type": "range", "field": "trustpass_years", "status": "detail_required", "mapping": "detail_verify"},
+            {"key": "shop_fans", "label": "店铺粉丝数", "type": "range", "field": "shop_fans", "status": "reserved", "mapping": "seller_page_metric"},
+            {"key": "seller_locations", "label": "卖家所属地", "type": "multi_chip", "options": ["广东", "浙江", "江苏", "山东", "福建", "河北", "河南", "上海", "义乌", "广州", "深圳", "泉州"], "status": "detail_required", "mapping": "detail_verify"},
+            {"key": "company_type", "label": "公司类型", "type": "radio", "options": ["不限", "店铺", "工厂"], "status": "supported", "mapping": "native_filter"},
+            {"key": "seller_services", "label": "卖家服务", "type": "multi_chip", "options": ["深度验厂", "买家保障", "极速退款", "破损包赔", "材质保障"], "status": "reserved", "mapping": "seller_service"},
+            {"key": "seller_member_types", "label": "卖家会员类型", "type": "multi_chip", "options": ["实力商家", "超级工厂", "诚信通"], "status": "supported", "mapping": "native_filter"},
+        ],
+    },
+    {
+        "key": "batch_export",
+        "title": "批量与导出",
+        "description": "对齐店雷达列表工具栏，当前实现导出和详情核验，铺货为 dry-run 预留。",
+        "fields": [
+            {"key": "stat_period", "label": "统计周期", "type": "select", "options": ["近7天", "近30天", "近90天"], "default": "近30天", "status": "reserved", "mapping": "run_metadata"},
+            {"key": "sort_by", "label": "排序", "type": "select", "options": ["推荐分", "销售订单数", "销售件数", "销售额", "复购率", "批发价"], "default": "推荐分", "status": "reserved", "mapping": "result_sort"},
+            {"key": "actions", "label": "批量操作", "type": "actions", "options": ["全选", "关注商品", "导出", "铺货Temu", "铺货dry-run"], "status": "partial_supported", "mapping": "ui_action_contract"},
+        ],
+    },
+]
+
+
+def get_library_filter_schema() -> List[Dict[str, Any]]:
+    return json.loads(json.dumps(LIBRARY_FILTER_SCHEMA, ensure_ascii=False))
+
+
+def get_library_capabilities() -> Dict[str, Any]:
+    return {
+        "source": "dianleida_1688_category_library_reference",
+        "status_values": {
+            "supported": "已接入当前采集/后筛/导出链路",
+            "partial_supported": "部分接入，剩余字段进入预留或详情核验",
+            "detail_required": "详情页或商家页核验后才可信",
+            "reserved": "接口已预留，当前不伪造筛选结果",
+        },
+        "implemented": [
+            "类目范围",
+            "商品关键词",
+            "1688页面URL",
+            "选品模式转译",
+            "主营下游平台",
+            "跨境专供货源",
+            "授权自有品牌",
+            "销售订单数/件数/销售额后筛",
+            "批发价/复购率后筛",
+            "商品标识",
+            "权益保障",
+            "发货时间",
+            "面单支持",
+            "代发权益",
+            "公司类型",
+            "卖家会员类型",
+            "导出与详情核验",
+        ],
+        "reserved": [
+            "筛选模板持久化",
+            "历史搜索",
+            "7日增长率",
+            "采购集中率",
+            "上架时间精确过滤",
+            "店铺粉丝数",
+            "卖家服务",
+            "关注商品",
+            "铺货Temu",
+            "在线文档同步",
+        ],
+    }
+
+
 SAMPLE_PRODUCTS = [
     Product(
         id="932994257210",
@@ -771,6 +1103,7 @@ class TagCollectInput:
     sample_data: bool
     output_format: str
     collect_source: str
+    library_filters: Dict[str, Any]
 
 
 def _split_csv(value: str) -> List[str]:
@@ -780,6 +1113,18 @@ def _split_csv(value: str) -> List[str]:
         if item:
             items.append(item)
     return items
+
+
+def _parse_library_filters(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def parse_input(
@@ -793,19 +1138,95 @@ def parse_input(
     sample_data: bool = False,
     output_format: str = "xlsx",
     collect_source: str = "rpa",
+    library_filters: Any = None,
 ) -> TagCollectInput:
+    parsed_library_filters = _parse_library_filters(library_filters)
     return TagCollectInput(
-        categories=_split_csv(categories),
-        tags=_split_csv(tags),
-        keywords=_split_csv(keywords),
-        source_urls=_split_csv(source_urls),
+        categories=_dedupe_strings(_split_csv(categories) + _library_categories(parsed_library_filters)),
+        tags=_dedupe_strings(_split_csv(tags) + _library_tags(parsed_library_filters)),
+        keywords=_dedupe_strings(_split_csv(keywords) + _library_keywords(parsed_library_filters)),
+        source_urls=_dedupe_strings(_split_csv(source_urls) + _library_source_urls(parsed_library_filters)),
         exclude_tags=_split_csv(exclude_tags),
         max_queries=min(MAX_QUERIES, max(1, max_queries)),
         max_items_per_query=min(MAX_ITEMS_PER_QUERY, max(1, max_items_per_query)),
         sample_data=sample_data,
         output_format=(output_format or "xlsx").lower(),
         collect_source=(collect_source or "rpa").lower(),
+        library_filters=parsed_library_filters,
     )
+
+
+def _dedupe_strings(items: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return _split_csv(value)
+    if value in (None, False):
+        return []
+    return [str(value).strip()]
+
+
+def _library_categories(filters: Dict[str, Any]) -> List[str]:
+    return _as_list(filters.get("category_paths") or filters.get("categories"))
+
+
+def _library_keywords(filters: Dict[str, Any]) -> List[str]:
+    keywords = _as_list(filters.get("search_keyword") or filters.get("keyword"))
+    keywords.extend(_as_list(filters.get("history_keyword")))
+    return keywords
+
+
+def _library_source_urls(filters: Dict[str, Any]) -> List[str]:
+    return _as_list(filters.get("source_urls"))
+
+
+def _library_tags(filters: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    for mode in _as_list(filters.get("selection_modes")):
+        if mode == "新品热卖":
+            tags.extend(["新品", "近30天订单数高"])
+        elif mode == "无货源选品":
+            tags.extend(["一件代发", "一件代发包邮"])
+        elif mode == "同期热卖":
+            tags.extend(["近30天件数高", "销售趋势上升"])
+        elif mode == "源头工厂":
+            tags.extend(["工厂", "超级工厂"])
+    tags.extend(_as_list(filters.get("downstream_platforms")))
+    if filters.get("cross_border_supply"):
+        tags.append("跨境专供货源")
+    if filters.get("authorized_own_brand"):
+        tags.append("授权自有品牌")
+    tags.extend(_as_list(filters.get("product_marks")))
+    tags.extend(_as_list(filters.get("rights_protection")))
+    tags.extend([f"{item}发货" for item in _as_list(filters.get("fulfillment_times"))])
+    tags.extend([
+        f"支持{item}面单" if item not in ("微信小店", "抖音", "拼多多") else {
+            "微信小店": "支持微信小店面单",
+            "抖音": "支持抖音面单",
+            "拼多多": "支持拼多多面单",
+        }[item]
+        for item in _as_list(filters.get("waybill_support"))
+    ])
+    tags.extend(_as_list(filters.get("dropship_rights")))
+    company_type = str(filters.get("company_type") or "").strip()
+    if company_type and company_type != "不限":
+        tags.append(company_type)
+    tags.extend(_as_list(filters.get("seller_member_types")))
+    return _dedupe_strings(tags)
 
 
 def _channel_from_tags(tags: Iterable[str]) -> str:
@@ -892,16 +1313,205 @@ def build_filter_plan(config: TagCollectInput) -> Dict[str, Any]:
         unmapped_tags.append(tag)
         search_terms.append(_query_part_from_tag(tag))
 
+    library_plan = build_library_filter_plan(config.library_filters)
+    search_terms.extend(library_plan["search_terms"])
+    native_filters.extend(library_plan["native_filters"])
+    post_filters.extend(library_plan["post_filters"])
+    system_rules.extend(library_plan["system_rules"])
+
     return {
         "search_terms": list(dict.fromkeys(term for term in search_terms if term)),
         "native_filters": _dedupe_dicts(native_filters, "key"),
         "post_filters": _dedupe_dicts(post_filters, "tag"),
         "system_rules": _dedupe_dicts(system_rules, "tag"),
         "unmapped_tags": list(dict.fromkeys(unmapped_tags)),
+        "library_filters": config.library_filters,
+        "library_filter_results": library_plan["results"],
+        "library_reserved_fields": library_plan["reserved_fields"],
         "notes": (
             "标签已拆为搜索词、1688页面原生筛选、后置指标筛选和系统规则。"
             "原生筛选必须由RPA尝试点击；未找到会记录 not_found，不再静默拼回搜索词。"
         ),
+    }
+
+
+def _range_rule(
+    filters: Dict[str, Any],
+    prefix: str,
+    field: str,
+    label: str,
+    *,
+    status: str = "planned",
+    detail_required: bool = False,
+) -> Optional[Dict[str, Any]]:
+    min_value = filters.get(f"{prefix}_min")
+    max_value = filters.get(f"{prefix}_max")
+    if min_value in (None, "") and max_value in (None, ""):
+        value = filters.get(prefix)
+        if not isinstance(value, dict):
+            return None
+        min_value = value.get("min")
+        max_value = value.get("max")
+    has_min = min_value not in (None, "")
+    has_max = max_value not in (None, "")
+    if not has_min and not has_max:
+        return None
+    rule: Dict[str, Any] = {
+        "tag": f"{label}{min_value or ''}-{max_value or ''}",
+        "label": label,
+        "field": field,
+        "type": "library_range",
+        "status": "detail_required" if detail_required else status,
+        "bucket": f"{min_value or '-∞'}~{max_value or '+∞'}",
+        "source": "library_filters",
+    }
+    try:
+        if has_min and has_max:
+            rule.update({"op": "range", "min": float(min_value), "max": float(max_value)})
+        elif has_min:
+            rule.update({"op": ">=", "value": float(min_value)})
+        else:
+            rule.update({"op": "<=", "value": float(max_value)})
+    except (TypeError, ValueError):
+        rule.update({"op": "", "status": "manual_review_required"})
+    return rule
+
+
+def _library_result(field_key: str, label: str, status: str, mapping: str, message: str = "") -> Dict[str, Any]:
+    return {
+        "field_key": field_key,
+        "label": label,
+        "status": status,
+        "mapping": mapping,
+        "message": message,
+    }
+
+
+def build_library_filter_plan(filters: Dict[str, Any]) -> Dict[str, Any]:
+    """把店雷达选品库字段转成当前采集链路可执行/待核验/预留的计划。"""
+    if not filters:
+        return {
+            "search_terms": [],
+            "native_filters": [],
+            "post_filters": [],
+            "system_rules": [],
+            "results": [],
+            "reserved_fields": [],
+        }
+
+    search_terms: List[str] = []
+    native_filters: List[Dict[str, Any]] = []
+    post_filters: List[Dict[str, Any]] = []
+    system_rules: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    reserved_fields: List[Dict[str, Any]] = []
+
+    for tag in _library_tags(filters):
+        if tag in NATIVE_FILTER_SPECS:
+            spec = dict(NATIVE_FILTER_SPECS[tag])
+            spec["tag"] = tag
+            spec["status"] = "planned"
+            spec["source"] = "library_filters"
+            native_filters.append(spec)
+        elif tag in CHANNEL_TAGS:
+            system_rules.append({
+                "tag": tag,
+                "type": "target_platform",
+                "field": "recommended_platform",
+                "value": CHANNEL_TAGS[tag],
+                "status": "configured",
+                "source": "library_filters",
+            })
+        else:
+            system_rules.append({
+                "tag": tag,
+                "type": "library_rule",
+                "status": "planned",
+                "source": "library_filters",
+            })
+
+    range_specs = [
+        ("sales_orders", "orders_30d", "销售订单数", False),
+        ("sales_units", "units_30d", "销售件数", False),
+        ("sales_amount", "sales_amount_30d", "销售额", False),
+        ("wholesale_price", "wholesale_price", "批发价", False),
+        ("repurchase_rate", "repurchase_rate", "复购率(%)", False),
+        ("min_order", "min_order_range", "最低起批量", True),
+        ("dropship_price", "dropship_price", "代发价", True),
+        ("trustpass_years", "trustpass_years", "诚信通年限", True),
+    ]
+    for prefix, field, label, detail_required in range_specs:
+        rule = _range_rule(filters, prefix, field, label, detail_required=detail_required)
+        if rule:
+            post_filters.append(rule)
+            results.append(_library_result(
+                prefix,
+                label,
+                "detail_required" if detail_required else "supported",
+                "post_filter",
+                "详情页核验后判断" if detail_required else "列表字段初筛",
+            ))
+
+    list_field_map = [
+        ("category_paths", "选择类目", "categories", _library_categories(filters)),
+        ("search_keyword", "商品关键词", "keywords", _library_keywords(filters)),
+        ("source_urls", "1688页面URL", "source_urls", _library_source_urls(filters)),
+        ("selection_modes", "选品模式", "tags_and_rules", _as_list(filters.get("selection_modes"))),
+        ("downstream_platforms", "主营下游平台", "platform_tags", _as_list(filters.get("downstream_platforms"))),
+        ("product_marks", "商品标识", "native_filter", _as_list(filters.get("product_marks"))),
+        ("rights_protection", "权益保障", "native_filter", _as_list(filters.get("rights_protection"))),
+        ("fulfillment_times", "发货时间", "native_filter", _as_list(filters.get("fulfillment_times"))),
+        ("waybill_support", "面单支持", "native_filter", _as_list(filters.get("waybill_support"))),
+        ("dropship_rights", "代发权益", "native_filter", _as_list(filters.get("dropship_rights"))),
+        ("seller_member_types", "卖家会员类型", "native_filter", _as_list(filters.get("seller_member_types"))),
+    ]
+    for key, label, mapping, values in list_field_map:
+        if values:
+            results.append(_library_result(key, label, "supported", mapping, ",".join(values)))
+
+    if filters.get("cross_border_supply"):
+        results.append(_library_result("cross_border_supply", "跨境专供货源", "supported", "native_filter"))
+    if filters.get("authorized_own_brand"):
+        results.append(_library_result("authorized_own_brand", "授权自有品牌", "supported", "native_filter"))
+    if str(filters.get("company_type") or "").strip():
+        results.append(_library_result("company_type", "公司类型", "supported", "native_filter", str(filters.get("company_type"))))
+
+    reserved_specs = [
+        ("template_name", "我的模板", "模板管理待持久化"),
+        ("match_type", "匹配方式", "当前记录元数据，RPA 暂不区分 1688 搜索匹配模式"),
+        ("history_keyword", "历史搜索", "历史搜索列表待持久化"),
+        ("sales_regions", "主要销售地区", "需商家页或店雷达数据源支撑"),
+        ("order_growth_7d", "7日订单增长率(%)", "当前 1688 列表未稳定提供"),
+        ("purchase_concentration_7d", "7日采购集中率(倍)", "当前 1688 列表未稳定提供"),
+        ("listed_time", "上架时间", "待补时间解析与范围过滤"),
+        ("certificates", "资质证书", "需详情页/商家页核验"),
+        ("shop_fans", "店铺粉丝数", "需商家页采集"),
+        ("seller_locations", "卖家所属地", "需详情页/商家页核验"),
+        ("seller_services", "卖家服务", "需商家页服务标签"),
+        ("stat_period", "统计周期", "当前导出为近30天基线"),
+        ("sort_by", "排序", "当前按推荐分排序"),
+    ]
+    for key, label, message in reserved_specs:
+        value = filters.get(key)
+        has_range_value = filters.get(f"{key}_min") not in (None, "") or filters.get(f"{key}_max") not in (None, "")
+        has_value = bool(_as_list(value)) if not isinstance(value, dict) else any(v not in (None, "") for v in value.values())
+        if has_value:
+            record = _library_result(key, label, "reserved", "interface_reserved", message)
+            reserved_fields.append(record)
+            results.append(record)
+        elif has_range_value:
+            record = _library_result(key, label, "reserved", "interface_reserved", message)
+            record["bucket"] = f"{filters.get(f'{key}_min') or '-∞'}~{filters.get(f'{key}_max') or '+∞'}"
+            reserved_fields.append(record)
+            results.append(record)
+
+    return {
+        "search_terms": search_terms,
+        "native_filters": native_filters,
+        "post_filters": post_filters,
+        "system_rules": system_rules,
+        "results": _dedupe_dicts(results, "field_key"),
+        "reserved_fields": _dedupe_dicts(reserved_fields, "field_key"),
     }
 
 
@@ -938,6 +1548,9 @@ def build_filter_rule_summary(config: TagCollectInput) -> Dict[str, Any]:
         "post_filters": filter_plan["post_filters"],
         "system_rules": filter_plan["system_rules"],
         "unmapped_tags": filter_plan["unmapped_tags"],
+        "library_filters": config.library_filters,
+        "library_filter_results": filter_plan.get("library_filter_results", []),
+        "library_reserved_fields": filter_plan.get("library_reserved_fields", []),
         "category_dictionary": {
             "version": CATEGORY_DICTIONARY.get("version", ""),
             "source": CATEGORY_DICTIONARY.get("source", ""),
@@ -1252,6 +1865,8 @@ def _match_metric_rule(value: Any, rule: Dict[str, Any]) -> Optional[bool]:
         return number >= float(rule.get("value", 0))
     if op == "<":
         return number < float(rule.get("value", 0))
+    if op == "<=":
+        return number <= float(rule.get("value", 0))
     if op == "range":
         return float(rule.get("min", 0)) <= number < float(rule.get("max", 0))
     return None
@@ -1940,6 +2555,9 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["指标区间筛选", json.dumps((payload.get("filter_plan") or {}).get("post_filters", []), ensure_ascii=False)],
         ["系统规则", json.dumps((payload.get("filter_plan") or {}).get("system_rules", []), ensure_ascii=False)],
         ["未映射标签", ", ".join((payload.get("filter_plan") or {}).get("unmapped_tags", []))],
+        ["店雷达选品库筛选", json.dumps(payload.get("library_filters", {}), ensure_ascii=False)],
+        ["店雷达筛选映射结果", json.dumps((payload.get("filter_plan") or {}).get("library_filter_results", []), ensure_ascii=False)],
+        ["预留筛选字段", json.dumps((payload.get("filter_plan") or {}).get("library_reserved_fields", []), ensure_ascii=False)],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
         ["筛选执行记录", json.dumps(payload.get("filter_results", []), ensure_ascii=False)],
         ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
@@ -2101,6 +2719,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "tags": config.tags,
         "source_urls": config.source_urls,
         "exclude_tags": config.exclude_tags,
+        "library_filters": config.library_filters,
         "sample_data": config.sample_data,
         "collect_source": config.collect_source,
         "row_count": len(rows),
@@ -2130,6 +2749,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "snapshot_path": snapshot_path,
             "sample_data": config.sample_data,
             "collect_source": config.collect_source,
+            "library_filters": config.library_filters,
             "columns": [label for _, label in EXPORT_COLUMNS],
             "top_items": rows[:10],
             "filter_plan": filter_plan,

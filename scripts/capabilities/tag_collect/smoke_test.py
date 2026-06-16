@@ -23,9 +23,12 @@ from capabilities.tag_collect.service import (
     Product,
     REFERENCE_EXPORT_LABELS,
     build_filter_plan,
+    build_library_filter_plan,
     build_queries,
     build_verification_queue,
     friendly_collect_error,
+    get_library_capabilities,
+    get_library_filter_schema,
     get_numbered_export_columns,
     metric_bucket,
     product_to_export_row,
@@ -107,6 +110,58 @@ def test_filter_plan_splits_native_and_metric_tags():
     _assert("防晒" in query_text, "场景词防晒应保留为搜索词")
     _assert("一件代发" not in query_text, "原生筛选不应拼进搜索词")
     _assert("48小时发货" not in query_text, "原生筛选不应拼进搜索词")
+
+
+def test_library_filter_contract_and_mapping():
+    schema = get_library_filter_schema()
+    capabilities = get_library_capabilities()
+    section_keys = {section["key"] for section in schema}
+    _assert("selection_mode" in section_keys, "店雷达筛选契约应包含选品模式")
+    _assert("advanced" in section_keys, "店雷达筛选契约应包含高级筛选")
+    _assert("sales" in section_keys, "店雷达筛选契约应包含销售信息")
+    _assert("product" in section_keys, "店雷达筛选契约应包含商品信息")
+    _assert("seller" in section_keys, "店雷达筛选契约应包含卖家信息")
+    _assert(capabilities["implemented"], "能力清单应标记已接入项目")
+
+    library_filters = {
+        "category_paths": ["女装/女士精品>连衣裙"],
+        "search_keyword": "连衣裙",
+        "match_type": "模糊匹配",
+        "selection_modes": ["源头工厂", "无货源选品"],
+        "downstream_platforms": ["抖店", "拼多多"],
+        "cross_border_supply": True,
+        "authorized_own_brand": True,
+        "sales_orders_min": "100",
+        "wholesale_price_max": "50",
+        "repurchase_rate_min": "10",
+        "fulfillment_times": ["48小时"],
+        "waybill_support": ["抖音", "拼多多"],
+        "rights_protection": ["7天包退货", "赠运费险"],
+        "dropship_rights": ["一件代发包邮"],
+        "seller_member_types": ["实力商家", "超级工厂"],
+        "order_growth_7d_min": "20",
+    }
+    config = parse_input(sample_data=True, library_filters=library_filters)
+    plan = build_filter_plan(config)
+    native_labels = {item["label"] for item in plan["native_filters"]}
+    post_fields = {item["field"] for item in plan["post_filters"]}
+    reserved_keys = {item["field_key"] for item in plan["library_reserved_fields"]}
+    _assert(config.categories == ["女装/女士精品>连衣裙"], "library_filters 类目应进入 config.categories")
+    _assert(config.keywords == ["连衣裙"], "library_filters 关键词应进入 config.keywords")
+    _assert("工厂" in native_labels, "源头工厂应转译为工厂原生筛选")
+    _assert("超级工厂" in native_labels, "源头工厂应转译为超级工厂原生筛选")
+    _assert("一件代发包邮" in native_labels, "无货源选品应转译为代发权益")
+    _assert("48小时发货" in native_labels, "发货时间应转译为原生筛选")
+    _assert("支持抖音面单" in native_labels, "面单支持应转译为原生筛选")
+    _assert("支持拼多多面单" in native_labels, "面单支持应转译为原生筛选")
+    _assert("orders_30d" in post_fields, "销售订单数应进入后置指标筛选")
+    _assert("wholesale_price" in post_fields, "批发价应进入后置指标筛选")
+    _assert("repurchase_rate" in post_fields, "复购率应进入后置指标筛选")
+    _assert("order_growth_7d" in reserved_keys, "7日订单增长率应标记为预留字段")
+
+    direct_plan = build_library_filter_plan(library_filters)
+    _assert(direct_plan["results"], "店雷达字段映射应有结果记录")
+    _assert(direct_plan["reserved_fields"], "预留字段应进入 reserved_fields")
 
 
 def test_metric_bucket_ranges():
@@ -252,6 +307,8 @@ def test_web_token_and_sample_api():
         _assert(options["token"] == web.SERVER_TOKEN, "options 应返回本地 token")
         _assert(options["allow_real_collect"] is True, "真实采集默认应开启")
         _assert(options["limits"]["max_queries"] == 50, "服务端查询词限额应为 50")
+        _assert(options["library_filter_schema"], "options 应返回店雷达选品库筛选契约")
+        _assert(options["library_capabilities"]["implemented"], "options 应返回筛选能力清单")
 
         try:
             _post_json(f"{base_url}/api/collect", {"sample_data": True})
@@ -266,6 +323,15 @@ def test_web_token_and_sample_api():
                 "token": web.SERVER_TOKEN,
                 "categories": ["女装/女士精品"],
                 "tags": ["微信小店"],
+                "library_filters": {
+                    "search_keyword": "连衣裙",
+                    "selection_modes": ["源头工厂"],
+                    "sales_orders_min": "100",
+                    "wholesale_price_max": "80",
+                    "fulfillment_times": ["48小时"],
+                    "seller_member_types": ["实力商家"],
+                    "order_growth_7d_min": "20",
+                },
                 "sample_data": True,
                 "output_format": "xlsx",
             },
@@ -273,6 +339,10 @@ def test_web_token_and_sample_api():
         _assert(status == 200, "带 token 样例采集 HTTP 应成功")
         _assert(payload["success"], "带 token 样例采集业务应成功")
         _assert(payload["data"]["row_count"] >= 1, "样例采集应返回商品")
+        _assert(payload["data"]["library_filters"]["search_keyword"] == "连衣裙", "Web 返回应保留店雷达筛选对象")
+        native_labels = {item["label"] for item in payload["data"]["filter_plan"]["native_filters"]}
+        _assert("48小时发货" in native_labels, "Web 采集应转译发货时间原生筛选")
+        _assert(payload["data"]["filter_plan"]["library_reserved_fields"], "Web 采集应返回预留字段记录")
         run_id = payload["data"]["run_id"]
         _assert(payload["data"]["verification_queue"], "Web 样例采集应返回详情核验队列")
         for row in payload["data"]["rows"]:
@@ -377,6 +447,7 @@ def test_web_security_verification_does_not_export():
 def main():
     test_field_numbers()
     test_filter_plan_splits_native_and_metric_tags()
+    test_library_filter_contract_and_mapping()
     test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
     test_security_verification_error_message()

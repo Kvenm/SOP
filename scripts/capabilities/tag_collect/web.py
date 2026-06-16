@@ -20,6 +20,8 @@ from capabilities.tag_collect.service import (
     METRIC_FILTER_GROUPS,
     friendly_collect_error,
     get_export_path,
+    get_library_capabilities,
+    get_library_filter_schema,
     get_numbered_export_columns,
     get_run_payload,
     parse_input,
@@ -103,6 +105,8 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                     "metric_filter_groups": METRIC_FILTER_GROUPS,
                     "columns": [{"key": key, "label": label} for key, label in EXPORT_COLUMNS],
                     "numbered_columns": get_numbered_export_columns(),
+                    "library_filter_schema": get_library_filter_schema(),
+                    "library_capabilities": get_library_capabilities(),
                 },
             })
             return
@@ -189,6 +193,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 sample_data=sample_data,
                 output_format=str(payload.get("output_format") or "xlsx"),
                 collect_source=collect_source,
+                library_filters=payload.get("library_filters") or {},
             )
             result = run_tag_collect(config)
             data = dict(result["data"])
@@ -245,7 +250,7 @@ HTML_PAGE = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1688 标签选品工作台</title>
+  <title>1688选品库筛选工作台</title>
   <style>
     :root {
       --bg: #f5f5f7;
@@ -259,6 +264,9 @@ HTML_PAGE = r"""<!doctype html>
       --accent: #0071e3;
       --accent-hover: #0077ed;
       --accent-soft: #e8f2ff;
+      --accent-deep: #004a98;
+      --teal: #047481;
+      --teal-soft: #e7f7f7;
       --green: #198754;
       --amber: #a05a00;
       --danger: #b42318;
@@ -279,7 +287,7 @@ HTML_PAGE = r"""<!doctype html>
       backdrop-filter: saturate(180%) blur(18px);
       background: rgba(245, 245, 247, .82);
       border-bottom: 1px solid rgba(210, 210, 215, .7);
-      padding: 12px 24px;
+      padding: 10px 20px;
       position: sticky;
       top: 0;
       z-index: 10;
@@ -299,21 +307,21 @@ HTML_PAGE = r"""<!doctype html>
     }
     main {
       display: grid;
-      gap: 16px;
-      grid-template-columns: minmax(260px, 330px) minmax(0, 1fr);
-      padding: 18px;
+      gap: 14px;
+      grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+      padding: 14px;
     }
     section, aside {
       background: var(--panel);
       border: 1px solid rgba(210, 210, 215, .78);
       border-radius: 8px;
-      box-shadow: var(--shadow);
+      box-shadow: 0 8px 30px rgba(0, 0, 0, .045);
       min-width: 0;
     }
     aside {
       max-height: calc(100vh - 92px);
       overflow: auto;
-      padding: 16px;
+      padding: 14px;
       position: sticky;
       top: 74px;
     }
@@ -392,15 +400,15 @@ HTML_PAGE = r"""<!doctype html>
     button, .download {
       align-items: center;
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 8px;
       cursor: pointer;
       display: inline-flex;
       font: inherit;
       font-weight: 650;
       gap: 6px;
       justify-content: center;
-      min-height: 38px;
-      padding: 8px 16px;
+      min-height: 36px;
+      padding: 8px 14px;
       text-decoration: none;
       transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, color .18s ease, transform .18s ease;
       white-space: nowrap;
@@ -415,6 +423,20 @@ HTML_PAGE = r"""<!doctype html>
     button.secondary, .download {
       background: rgba(255, 255, 255, .82);
       color: var(--ink);
+    }
+    button.ghost {
+      background: #f7f7f9;
+      border-color: var(--line-soft);
+      color: var(--muted);
+    }
+    button.ghost::after {
+      background: #eef1f5;
+      border-radius: 999px;
+      color: #667085;
+      content: "预留";
+      font-size: 11px;
+      font-weight: 720;
+      padding: 2px 6px;
     }
     button.secondary:hover, .download:hover {
       background: var(--panel-solid);
@@ -440,7 +462,7 @@ HTML_PAGE = r"""<!doctype html>
       align-items: center;
       background: rgba(255, 255, 255, .76);
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 8px;
       color: var(--ink);
       display: inline-flex;
       gap: 8px;
@@ -464,7 +486,7 @@ HTML_PAGE = r"""<!doctype html>
     .tab {
       background: transparent;
       border: 0;
-      border-radius: 999px;
+      border-radius: 8px;
       color: var(--muted);
       min-height: 36px;
       padding: 8px 14px;
@@ -552,7 +574,7 @@ HTML_PAGE = r"""<!doctype html>
       align-items: center;
       background: rgba(255, 255, 255, .76);
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 8px;
       color: var(--ink);
       display: flex;
       gap: 6px;
@@ -575,6 +597,147 @@ HTML_PAGE = r"""<!doctype html>
       box-shadow: inset 0 0 0 1px rgba(0, 113, 227, .04);
       color: #064a8f;
       font-weight: 700;
+    }
+    .mode-chip {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      cursor: pointer;
+      display: grid;
+      gap: 4px;
+      min-height: 58px;
+      padding: 10px 12px;
+      position: relative;
+    }
+    .mode-chip input {
+      position: absolute;
+      opacity: 0;
+    }
+    .mode-chip strong {
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.2;
+    }
+    .mode-chip span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+    .mode-chip:has(input:checked) {
+      background: var(--teal-soft);
+      border-color: rgba(4, 116, 129, .45);
+      box-shadow: inset 4px 0 0 var(--teal);
+    }
+    .library-toolbar {
+      align-items: center;
+      border-bottom: 1px solid var(--line-soft);
+      display: flex;
+      justify-content: space-between;
+      margin: -18px -18px 16px;
+      padding: 14px 18px;
+    }
+    .toolbar-meta {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .status-pill {
+      background: #f1f5f9;
+      border: 1px solid #dbe3ec;
+      border-radius: 999px;
+      color: #475467;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 720;
+      min-height: 30px;
+      padding: 6px 10px;
+    }
+    .library-section {
+      background: rgba(255, 255, 255, .64);
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      margin-top: 12px;
+      padding: 14px;
+    }
+    .library-section-head {
+      align-items: baseline;
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .library-section-head strong {
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 780;
+    }
+    .library-section-head span {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+    }
+    .library-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .search-grid {
+      grid-template-columns: minmax(220px, 1.5fr) minmax(130px, .7fr) minmax(180px, 1fr) minmax(160px, .9fr);
+    }
+    .url-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      margin-top: 10px;
+    }
+    .run-grid {
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
+    }
+    .filter-grid-wide {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .range-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(3, minmax(160px, 1fr));
+    }
+    .range-field {
+      background: #fff;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .range-pair {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .field-status {
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 11px;
+      font-weight: 760;
+      margin-left: 6px;
+      padding: 2px 6px;
+      vertical-align: middle;
+    }
+    .field-status.supported { background: #eaf7f0; color: var(--green); }
+    .field-status.partial_supported { background: #fff3df; color: var(--amber); }
+    .field-status.detail_required { background: var(--accent-soft); color: var(--accent-deep); }
+    .field-status.reserved { background: #f1f2f4; color: var(--muted); }
+    .legacy-filter-box {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      margin-top: 12px;
+      padding: 12px;
+    }
+    .legacy-filter-box summary {
+      cursor: pointer;
+      font-weight: 760;
+    }
+    .action-row {
+      border-top: 1px solid var(--line-soft);
+      margin-top: 12px;
+      padding-top: 12px;
     }
     .filter-block {
       background: rgba(255, 255, 255, .54);
@@ -794,11 +957,16 @@ HTML_PAGE = r"""<!doctype html>
         max-height: 560px;
         position: static;
       }
-      .result-tools, .summary, .grid.two, .field-grid, .verification-strip, .record-list {
+      .result-tools, .summary, .grid.two, .field-grid, .verification-strip, .record-list,
+      .search-grid, .url-grid, .run-grid, .range-grid {
         grid-template-columns: 1fr;
       }
       .filter-block .tag-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .library-toolbar, .library-section-head {
+        align-items: flex-start;
+        flex-direction: column;
       }
     }
     @media (max-width: 620px) {
@@ -814,10 +982,14 @@ HTML_PAGE = r"""<!doctype html>
 <body>
   <header>
     <div class="header-row">
-      <h1>1688 标签选品工作台</h1>
+      <div>
+        <h1>1688选品库</h1>
+        <div class="subtle-count">对齐店雷达选品库筛选，真实数据以 1688 页面采集和详情核验为准</div>
+      </div>
       <div class="button-row">
-        <input id="sampleMode" type="checkbox" hidden />
-        <button id="runBtn" class="primary" type="button">真实采集</button>
+        <button id="runBtn" class="primary" type="button">开始查询</button>
+        <button id="resetBtn" class="secondary" type="button">重置筛选</button>
+        <button id="saveTemplateBtn" class="secondary ghost" type="button">保存筛选</button>
         <a id="downloadLink" class="download" href="#" hidden>下载表格</a>
       </div>
     </div>
@@ -845,37 +1017,104 @@ HTML_PAGE = r"""<!doctype html>
         </div>
 
         <div id="task" class="tab-view active panel">
-          <div class="grid two">
+          <div class="library-toolbar">
             <div>
-              <label for="keywords">搜索词</label>
-              <textarea id="keywords" placeholder="可输入多个搜索词，用逗号分隔"></textarea>
+              <h2>筛选条件</h2>
+              <div class="subtle-count">类目范围、精准搜索、选品模式、高级筛选、销售、商品、卖家信息</div>
             </div>
-            <div>
-              <label for="sourceUrls">1688 页面 URL</label>
-              <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
+            <div class="toolbar-meta">
+              <label class="sample-switch">
+                <input id="sampleMode" type="checkbox" />
+                开发样例
+              </label>
+              <span id="capabilityBadge" class="status-pill">能力加载中</span>
             </div>
           </div>
 
-          <div class="grid two" style="margin-top: 12px;">
-            <div>
-              <label for="excludeTags">排除标签</label>
-              <textarea id="excludeTags" placeholder="例如 品牌风险,高退货"></textarea>
+          <div class="library-section precise-section">
+            <div class="library-section-head">
+              <strong>精准搜索</strong>
+              <span>商品关键词 / 模糊匹配 / 历史搜索 / URL</span>
             </div>
-            <div>
-              <label for="outputFormat">导出格式</label>
-              <select id="outputFormat">
-                <option value="xlsx">XLSX</option>
-                <option value="csv">CSV</option>
-              </select>
+            <div class="library-grid search-grid">
+              <div>
+                <label for="keywords">商品关键词</label>
+                <input id="keywords" type="text" placeholder="例如 连衣裙, 防晒衣, 收纳盒" />
+              </div>
+              <div>
+                <label for="matchType">匹配方式</label>
+                <select id="matchType">
+                  <option value="模糊匹配">模糊匹配</option>
+                  <option value="精准匹配">精准匹配</option>
+                </select>
+              </div>
+              <div>
+                <label for="historyKeyword">历史搜索</label>
+                <input id="historyKeyword" type="text" placeholder="可输入上次搜索词" />
+              </div>
+              <div>
+                <label for="templateName">我的模板</label>
+                <input id="templateName" type="text" placeholder="模板名，接口预留" />
+              </div>
             </div>
-            <div>
-              <label for="collectSource">真实采集来源</label>
-              <select id="collectSource">
-                <option value="rpa">1688 页面 RPA</option>
-                <option value="api">1688 AK/API</option>
-              </select>
+            <div class="library-grid url-grid">
+              <div>
+                <label for="sourceUrls">1688 页面 URL</label>
+                <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
+              </div>
+              <div>
+                <label for="excludeTags">排除标签</label>
+                <textarea id="excludeTags" placeholder="例如 品牌风险, 高退货, 仿牌"></textarea>
+              </div>
             </div>
-            <div class="grid two">
+          </div>
+
+          <div id="libraryFilters"></div>
+
+          <details class="legacy-filter-box">
+            <summary>兼容旧版运营标签</summary>
+            <div id="filterGroups"></div>
+          </details>
+
+          <div class="library-section run-section">
+            <div class="library-section-head">
+              <strong>批量与导出</strong>
+              <span>当前支持导出和详情核验，关注商品/Temu 铺货为预留接口</span>
+            </div>
+            <div class="library-grid run-grid">
+              <div>
+                <label for="outputFormat">导出格式</label>
+                <select id="outputFormat">
+                  <option value="xlsx">XLSX</option>
+                  <option value="csv">CSV</option>
+                </select>
+              </div>
+              <div>
+                <label for="collectSource">真实采集来源</label>
+                <select id="collectSource">
+                  <option value="rpa">1688 页面 RPA</option>
+                  <option value="api">1688 AK/API</option>
+                </select>
+              </div>
+              <div>
+                <label for="statPeriod">统计周期</label>
+                <select id="statPeriod" data-library-select="stat_period">
+                  <option value="近30天">近30天</option>
+                  <option value="近7天">近7天</option>
+                  <option value="近90天">近90天</option>
+                </select>
+              </div>
+              <div>
+                <label for="sortBy">排序</label>
+                <select id="sortBy" data-library-select="sort_by">
+                  <option value="推荐分">推荐分</option>
+                  <option value="销售订单数">销售订单数</option>
+                  <option value="销售件数">销售件数</option>
+                  <option value="销售额">销售额</option>
+                  <option value="复购率">复购率</option>
+                  <option value="批发价">批发价</option>
+                </select>
+              </div>
               <div>
                 <label for="maxQueries">查询词上限</label>
                 <input id="maxQueries" type="number" min="1" max="200" value="20" />
@@ -885,10 +1124,12 @@ HTML_PAGE = r"""<!doctype html>
                 <input id="maxItems" type="number" min="1" max="100" value="20" />
               </div>
             </div>
+            <div class="button-row action-row">
+              <button id="followBtn" class="secondary ghost" type="button">关注商品</button>
+              <button id="temuBtn" class="secondary ghost" type="button">铺货Temu</button>
+              <button id="dryRunBtn" class="secondary ghost" type="button">铺货 dry-run</button>
+            </div>
           </div>
-
-          <h3>二级运营筛选</h3>
-          <div id="filterGroups"></div>
 
           <div id="notice" class="notice"></div>
           <div class="verification-records">
@@ -991,6 +1232,7 @@ HTML_PAGE = r"""<!doctype html>
       filterWarnings: [],
       selectedCategories: new Set(),
       selectedTags: new Set(),
+      selectedLibrary: {},
       tableColumns: [
         ["seq", "序号"],
         ["category_path", "商品类目"],
@@ -1095,6 +1337,144 @@ HTML_PAGE = r"""<!doctype html>
       `).join("");
     }
 
+    function statusLabel(status) {
+      return {
+        supported: "已接入",
+        partial_supported: "部分接入",
+        detail_required: "需核验",
+        reserved: "预留"
+      }[status] || status || "预留";
+    }
+
+    function statusBadge(status) {
+      return `<span class="field-status ${esc(status || "reserved")}">${esc(statusLabel(status))}</span>`;
+    }
+
+    function renderLibraryFilters() {
+      const schema = state.options.library_filter_schema || [];
+      const sections = schema.filter(section => !["scope", "precise_search", "batch_export"].includes(section.key));
+      $("libraryFilters").innerHTML = sections.map(section => `
+        <div class="library-section" data-library-section="${esc(section.key)}">
+          <div class="library-section-head">
+            <strong>${esc(section.title)}</strong>
+            <span>${esc(section.description || "")}</span>
+          </div>
+          ${renderLibrarySectionFields(section)}
+        </div>
+      `).join("");
+    }
+
+    function renderLibrarySectionFields(section) {
+      if (section.key === "selection_mode") {
+        const field = (section.fields || [])[0] || {};
+        const modeCopy = {
+          "新品热卖": "新品、热度、订单",
+          "无货源选品": "一件代发、包邮权益",
+          "同期热卖": "近30天表现、趋势",
+          "源头工厂": "工厂/超级工厂"
+        };
+        return `<div class="library-grid filter-grid-wide">${(field.options || []).map(option => `
+          <label class="mode-chip">
+            <input type="checkbox" data-library-list="${esc(field.key)}" value="${esc(option)}" />
+            <strong>${esc(option)} ${statusBadge(field.status)}</strong>
+            <span>${esc(modeCopy[option] || field.mapping || "")}</span>
+          </label>
+        `).join("")}</div>`;
+      }
+      const fields = section.fields || [];
+      const rangeFields = fields.filter(field => field.type === "range");
+      const otherFields = fields.filter(field => field.type !== "range");
+      const rangeHtml = rangeFields.length ? `
+        <div class="range-grid">
+          ${rangeFields.map(field => `
+            <div class="range-field">
+              <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+              <div class="range-pair">
+                <input type="number" data-library-range="${esc(field.key)}" data-bound="min" placeholder="最小" />
+                <input type="number" data-library-range="${esc(field.key)}" data-bound="max" placeholder="最大" />
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      ` : "";
+      const otherHtml = otherFields.length ? `
+        <div class="library-grid filter-grid-wide" style="${rangeFields.length ? "margin-top:10px;" : ""}">
+          ${otherFields.map(renderLibraryField).join("")}
+        </div>
+      ` : "";
+      return rangeHtml + otherHtml;
+    }
+
+    function renderLibraryField(field) {
+      if (field.type === "multi_chip") {
+        return `<div class="filter-block" style="margin-top:0;">
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span>${esc(field.mapping || "")}</span></div>
+          <div class="tag-grid">${(field.options || []).map(option => `
+            <label class="chip"><input type="checkbox" data-library-list="${esc(field.key)}" value="${esc(option)}" />${esc(option)}</label>
+          `).join("")}</div>
+        </div>`;
+      }
+      if (field.type === "radio") {
+        return `<div class="filter-block" style="margin-top:0;">
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span>${esc(field.mapping || "")}</span></div>
+          <div class="tag-grid">${(field.options || []).map((option, index) => `
+            <label class="chip"><input type="radio" name="library-${esc(field.key)}" data-library-radio="${esc(field.key)}" value="${esc(option)}" ${index === 0 ? "checked" : ""} />${esc(option)}</label>
+          `).join("")}</div>
+        </div>`;
+      }
+      if (field.type === "boolean") {
+        return `<label class="chip"><input type="checkbox" data-library-bool="${esc(field.key)}" />${esc(field.label)} ${statusBadge(field.status)}</label>`;
+      }
+      if (field.type === "select") {
+        return `<div>
+          <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+          <select data-library-select="${esc(field.key)}">
+            <option value="">不限</option>
+            ${(field.options || []).map(option => `<option value="${esc(option)}">${esc(option)}</option>`).join("")}
+          </select>
+        </div>`;
+      }
+      return `<div>
+        <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+        <input type="text" data-library-text="${esc(field.key)}" />
+      </div>`;
+    }
+
+    function collectLibraryFilters() {
+      const filters = {};
+      filters.category_paths = [...state.selectedCategories];
+      filters.search_keyword = $("keywords").value;
+      filters.match_type = $("matchType").value;
+      filters.history_keyword = $("historyKeyword").value;
+      filters.template_name = $("templateName").value;
+      filters.source_urls = $("sourceUrls").value;
+      document.querySelectorAll("[data-library-list]").forEach(input => {
+        if (!input.checked) return;
+        const key = input.dataset.libraryList;
+        filters[key] = filters[key] || [];
+        filters[key].push(input.value);
+      });
+      document.querySelectorAll("[data-library-bool]").forEach(input => {
+        if (input.checked) filters[input.dataset.libraryBool] = true;
+      });
+      document.querySelectorAll("[data-library-radio]").forEach(input => {
+        if (input.checked) filters[input.dataset.libraryRadio] = input.value;
+      });
+      document.querySelectorAll("[data-library-select]").forEach(input => {
+        if (input.value) filters[input.dataset.librarySelect] = input.value;
+      });
+      document.querySelectorAll("[data-library-text]").forEach(input => {
+        if (input.value.trim()) filters[input.dataset.libraryText] = input.value.trim();
+      });
+      document.querySelectorAll("[data-library-range]").forEach(input => {
+        if (!input.value) return;
+        const key = `${input.dataset.libraryRange}_${input.dataset.bound}`;
+        filters[key] = input.value;
+      });
+      state.selectedLibrary = filters;
+      return filters;
+    }
+
     function renderFields() {
       $("fieldGrid").innerHTML = state.options.numbered_columns.map(field => `
         <div class="field-item">
@@ -1171,7 +1551,9 @@ HTML_PAGE = r"""<!doctype html>
       const planned = [
         ...(state.filterPlan.native_filters || []).map(item => ({...item, plan_type: "1688原生筛选"})),
         ...(state.filterPlan.post_filters || []).map(item => ({...item, plan_type: "指标区间"})),
-        ...(state.filterPlan.system_rules || []).map(item => ({...item, plan_type: "系统规则"}))
+        ...(state.filterPlan.system_rules || []).map(item => ({...item, plan_type: "系统规则"})),
+        ...(state.filterPlan.library_filter_results || []).map(item => ({...item, plan_type: "店雷达字段"})),
+        ...(state.filterPlan.library_reserved_fields || []).map(item => ({...item, plan_type: "预留字段"}))
       ];
       const execution = state.filterResults || [];
       const rows = execution.length
@@ -1182,8 +1564,8 @@ HTML_PAGE = r"""<!doctype html>
           }))
         : planned.map(record => ({
             title: `${record.plan_type} · ${record.label || record.tag || record.key || "-"}`,
-            line1: `字段：${record.field || record.key || "-"} · 状态：${record.status || "planned"}`,
-            line2: record.bucket || record.value || record.type || "待执行"
+            line1: `字段：${record.field || record.field_key || record.key || "-"} · 状态：${record.status || "planned"}`,
+            line2: record.message || record.bucket || record.value || record.type || "待执行"
           }));
       $("filterRecordList").innerHTML = rows.slice(0, 20).map(record => `
         <div class="record-item">
@@ -1217,6 +1599,7 @@ HTML_PAGE = r"""<!doctype html>
           keywords: $("keywords").value,
           source_urls: $("sourceUrls").value,
           exclude_tags: $("excludeTags").value,
+          library_filters: collectLibraryFilters(),
           max_queries: Number($("maxQueries").value || 20),
           max_items_per_query: Number($("maxItems").value || 20),
           output_format: $("outputFormat").value,
@@ -1333,6 +1716,30 @@ HTML_PAGE = r"""<!doctype html>
       state.selectedCategories.clear();
       renderCategories();
     });
+    $("resetBtn").addEventListener("click", () => {
+      state.selectedCategories.clear();
+      state.selectedTags.clear();
+      state.selectedLibrary = {};
+      ["keywords", "sourceUrls", "excludeTags", "historyKeyword", "templateName", "titleFilter"].forEach(id => {
+        if ($(id)) $(id).value = "";
+      });
+      ["minScore"].forEach(id => {
+        if ($(id)) $(id).value = "0";
+      });
+      document.querySelectorAll("[data-library-list], [data-library-bool]").forEach(input => input.checked = false);
+      document.querySelectorAll("[data-library-range], [data-library-text]").forEach(input => input.value = "");
+      document.querySelectorAll("[data-library-radio]").forEach(input => {
+        input.checked = input.value === "不限";
+      });
+      renderCategories();
+      renderFilterGroups();
+      showNotice("筛选条件已重置。", true);
+    });
+    ["saveTemplateBtn", "followBtn", "temuBtn", "dryRunBtn"].forEach(id => {
+      $(id).addEventListener("click", () => {
+        showNotice("该功能接口已预留，当前版本不会伪造执行结果。", false);
+      });
+    });
     $("runBtn").addEventListener("click", runCollect);
     $("verifyBtn").addEventListener("click", runVerify);
 
@@ -1340,6 +1747,8 @@ HTML_PAGE = r"""<!doctype html>
       const response = await fetch("/api/options");
       const result = await response.json();
       state.options = result.data;
+      const caps = state.options.library_capabilities || {};
+      $("capabilityBadge").textContent = `已接入 ${((caps.implemented || []).length)} 项 / 预留 ${((caps.reserved || []).length)} 项`;
       $("maxQueries").max = state.options.limits.max_queries;
       $("maxItems").max = state.options.limits.max_items_per_query;
       $("sampleMode").checked = false;
@@ -1359,6 +1768,7 @@ HTML_PAGE = r"""<!doctype html>
         showNotice("当前为真实数据模式：将打开 1688 页面采集真实数据；如账号登录不上，可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试。", true);
       }
       renderCategories();
+      renderLibraryFilters();
       renderFilterGroups();
       renderFields();
       renderTable();
