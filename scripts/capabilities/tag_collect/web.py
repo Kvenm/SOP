@@ -1027,6 +1027,466 @@ HTML_PAGE = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.4;
     }
+    body {
+      background: #f0f2f5;
+    }
+    .dl-topbar {
+      background: #1a1a1a;
+      border-bottom: 0;
+      box-shadow: none;
+      color: #fff;
+      height: 46px;
+      padding: 0 18px;
+    }
+    .dl-topbar .header-row {
+      height: 46px;
+      min-height: 46px;
+    }
+    .dl-logo {
+      align-items: center;
+      color: #fff;
+      display: flex;
+      font-size: 18px;
+      font-weight: 780;
+      gap: 8px;
+    }
+    .dl-logo-mark {
+      background: #00c84b;
+      border-radius: 4px;
+      display: inline-block;
+      height: 18px;
+      width: 18px;
+    }
+    .dl-top-links {
+      align-items: center;
+      color: rgba(255,255,255,.78);
+      display: flex;
+      font-size: 13px;
+      gap: 24px;
+    }
+    .dl-top-actions {
+      align-items: center;
+      display: flex;
+      gap: 14px;
+    }
+    .dl-top-actions a {
+      color: rgba(255,255,255,.82);
+      text-decoration: none;
+    }
+    .dl-shell {
+      display: grid;
+      gap: 0;
+      grid-template-columns: 180px minmax(0, 1fr);
+      min-height: calc(100vh - 46px);
+      padding: 0;
+    }
+    .side-nav {
+      background: #1a1a1a;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+      color: #fff;
+      height: calc(100vh - 46px);
+      max-height: none;
+      overflow: auto;
+      padding: 10px 0 42px;
+      position: sticky;
+      top: 46px;
+    }
+    .nav-brand {
+      display: none;
+    }
+    .nav-group-title {
+      color: #909399;
+      font-size: 13px;
+      font-weight: 650;
+      margin: 14px 0 4px;
+      padding: 0 20px;
+    }
+    .nav-item {
+      border-radius: 0;
+      color: rgba(255,255,255,.86);
+      font-size: 13px;
+      font-weight: 500;
+      min-height: 32px;
+      padding: 7px 24px 7px 28px;
+    }
+    .nav-item:hover {
+      background: #262626;
+      color: #fff;
+    }
+    .nav-item.active {
+      background: #333333;
+      color: #fff;
+    }
+    .nav-item.active::before {
+      background: #00c84b;
+      border-radius: 0;
+      height: 32px;
+      left: 0;
+      top: 0;
+      width: 4px;
+    }
+    .workspace {
+      background: #f0f2f5;
+      display: block;
+      min-width: 0;
+      padding: 23px 23px 32px;
+    }
+    section.library-page {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+    }
+    .page-head {
+      align-items: end;
+      display: flex;
+      height: 48px;
+      justify-content: space-between;
+    }
+    .page-tab-title {
+      align-items: center;
+      background: #fff;
+      border-radius: 6px 6px 0 0;
+      color: #333;
+      display: inline-flex;
+      font-size: 20px;
+      font-weight: 760;
+      height: 48px;
+      padding: 0 24px;
+      position: relative;
+    }
+    .page-tab-title::after {
+      background: #00c84b;
+      bottom: 0;
+      content: "";
+      height: 3px;
+      left: 0;
+      position: absolute;
+      right: 0;
+    }
+    .help-links {
+      align-items: center;
+      color: #666;
+      display: flex;
+      font-size: 13px;
+      gap: 18px;
+      height: 44px;
+    }
+    .tabs {
+      display: none;
+    }
+    .panel {
+      padding: 0;
+    }
+    #task {
+      background: #fff;
+      border-radius: 0 0 6px 6px;
+      padding: 18px 20px 0;
+    }
+    .filter-panel {
+      background: #fff;
+    }
+    .library-toolbar {
+      display: none;
+    }
+    .filter-row,
+    .library-section {
+      align-items: flex-start;
+      background: #fff;
+      border: 0;
+      border-bottom: 1px solid #f0f0f0;
+      display: grid;
+      grid-template-columns: 104px minmax(0, 1fr);
+      margin: 0;
+      padding: 11px 0;
+    }
+    .filter-row.compact {
+      align-items: center;
+      min-height: 36px;
+    }
+    .row-label,
+    .library-section-head {
+      align-items: flex-start;
+      color: #333;
+      display: flex;
+      font-size: 14px;
+      font-weight: 700;
+      gap: 0;
+      justify-content: flex-start;
+      margin: 0;
+      min-height: 32px;
+      padding-top: 6px;
+      white-space: nowrap;
+    }
+    .row-label::after,
+    .library-section-head strong::after {
+      content: "：";
+    }
+    .library-section-head strong {
+      color: #333;
+      display: inline;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .library-section-head strong::before,
+    .library-section-head span {
+      display: none;
+    }
+    .row-control {
+      min-width: 0;
+    }
+    .section-control {
+      min-width: 0;
+    }
+    .top-filter-line {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: space-between;
+    }
+    .category-inline,
+    .template-inline {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      min-height: 32px;
+    }
+    .inline-label {
+      color: #333;
+      font-size: 14px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .category-picker {
+      background: #fafafa;
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      margin-top: 10px;
+      max-height: 340px;
+      overflow: auto;
+      padding: 10px;
+    }
+    .category-tools {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: minmax(180px, 280px) auto;
+      margin-bottom: 8px;
+    }
+    .search-grid,
+    .url-grid,
+    .run-grid,
+    .library-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .search-grid > div,
+    .run-grid > div {
+      min-width: 176px;
+    }
+    .url-grid > div {
+      min-width: 280px;
+      flex: 1 1 360px;
+    }
+    input[type="text"],
+    input[type="number"],
+    select,
+    textarea {
+      border-color: #dcdfe6;
+      border-radius: 4px;
+      min-height: 32px;
+      padding: 6px 10px;
+    }
+    textarea {
+      min-height: 58px;
+    }
+    label {
+      color: #606266;
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+    .mode-chip,
+    .chip {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      color: #333;
+      display: inline-flex;
+      font-size: 14px;
+      min-height: 28px;
+      padding: 0 6px 0 0;
+    }
+    .mode-chip {
+      border: 1px solid #dcdfe6;
+      border-radius: 4px;
+      gap: 4px;
+      min-height: 32px;
+      min-width: 96px;
+      padding: 6px 10px;
+    }
+    .mode-chip strong {
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .mode-chip span {
+      display: none;
+    }
+    .mode-chip:has(input:checked),
+    .chip:has(input:checked) {
+      background: transparent;
+      border-color: #409eff;
+      box-shadow: none;
+      color: #409eff;
+      font-weight: 500;
+    }
+    .chip input,
+    .mode-chip input {
+      accent-color: #409eff;
+      height: 14px;
+      width: 14px;
+    }
+    .filter-block {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 0;
+    }
+    .filter-block-head {
+      align-items: center;
+      display: inline-flex;
+      margin: 0 4px 0 0;
+      min-height: 30px;
+    }
+    .filter-block-head strong {
+      color: #606266;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .filter-block-head span {
+      display: none;
+    }
+    .filter-block .tag-grid,
+    .tag-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+    }
+    .range-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+    }
+    .range-field {
+      align-items: center;
+      background: transparent;
+      border: 0;
+      display: flex;
+      gap: 8px;
+      padding: 0;
+    }
+    .range-field label {
+      color: #606266;
+      font-size: 13px;
+      margin: 0;
+      white-space: nowrap;
+    }
+    .range-pair {
+      align-items: center;
+      display: flex;
+      gap: 5px;
+    }
+    .range-pair::before {
+      content: "";
+    }
+    .range-pair input {
+      width: 86px;
+    }
+    .range-pair input + input {
+      margin-left: 16px;
+      position: relative;
+    }
+    .field-status {
+      display: none;
+    }
+    .legacy-filter-box {
+      margin: 12px 0;
+    }
+    .action-strip {
+      align-items: center;
+      border-bottom: 1px solid #f0f0f0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+      padding: 14px 0 18px;
+    }
+    button.primary {
+      background: #409eff;
+      border-color: #409eff;
+      box-shadow: none;
+    }
+    button.primary:hover {
+      background: #66b1ff;
+      border-color: #66b1ff;
+    }
+    button.secondary,
+    .download {
+      background: #fff;
+      border-color: #dcdfe6;
+      color: #606266;
+    }
+    .summary {
+      margin: 14px 0 0;
+    }
+    #results {
+      background: #fff;
+      border-radius: 0 0 6px 6px;
+      margin-top: 0;
+      padding: 0 20px 20px;
+    }
+    .result-bar {
+      align-items: center;
+      border-bottom: 1px solid #ebeef5;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: space-between;
+      min-height: 54px;
+      padding: 12px 0;
+    }
+    .result-actions {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .selected-count {
+      color: #606266;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .verification-strip,
+    .result-tools {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      padding: 12px 0;
+    }
+    .table-wrap {
+      border-color: #ebeef5;
+      border-radius: 0;
+      max-height: 620px;
+    }
+    th {
+      background: #f5f7fa;
+      color: #606266;
+    }
     @media (max-width: 760px) {
       main { grid-template-columns: 1fr; }
       aside {
@@ -1076,27 +1536,357 @@ HTML_PAGE = r"""<!doctype html>
         grid-template-columns: 1fr;
       }
     }
+    .dl-topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .dl-topbar .header-row {
+      margin: 0 auto;
+      max-width: none;
+    }
+    .dl-logo-mark {
+      box-shadow: inset 0 -3px 0 rgba(0,0,0,.18);
+    }
+    .dl-shell {
+      background: #f0f2f5;
+    }
+    .workspace {
+      min-height: calc(100vh - 46px);
+      overflow: auto;
+    }
+    .library-page #task.tab-view,
+    .library-page #results.tab-view {
+      display: block;
+    }
+    .library-page #fields.tab-view {
+      display: none;
+    }
+    #task {
+      border-bottom: 1px solid #ebeef5;
+    }
+    #results {
+      border-top: 0;
+    }
+    .filter-panel {
+      border: 1px solid #ebeef5;
+      border-top: 0;
+      border-radius: 0 0 4px 4px;
+      overflow: hidden;
+    }
+    .filter-row,
+    .library-section {
+      padding-left: 0;
+      padding-right: 0;
+    }
+    .row-label,
+    .library-section-head {
+      padding-left: 4px;
+    }
+    .row-control,
+    .section-control,
+    .library-section > .library-grid,
+    .library-section > .range-grid {
+      padding-right: 6px;
+    }
+    .top-filter-line {
+      justify-content: flex-start;
+      gap: 34px;
+    }
+    .template-inline input {
+      width: 160px;
+    }
+    .category-summary {
+      color: #606266;
+      display: inline-flex;
+      font-size: 13px;
+      margin-left: 4px;
+      max-width: 520px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .category-picker {
+      display: none;
+    }
+    .category-picker.is-open {
+      display: block;
+    }
+    .category-group {
+      box-shadow: none;
+      margin-top: 6px;
+    }
+    .category-primary {
+      min-height: 38px;
+      padding: 6px 8px;
+    }
+    .category-title strong {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .category-children {
+      padding: 6px 8px 8px;
+    }
+    .category-secondary {
+      background: #fff;
+      margin-top: 4px;
+      padding: 6px;
+    }
+    .library-grid.search-grid,
+    .library-grid.url-grid,
+    .library-grid.run-grid {
+      align-items: end;
+    }
+    .search-grid > div,
+    .run-grid > div {
+      flex: 0 0 176px;
+    }
+    .search-grid > div:first-child {
+      flex-basis: 280px;
+    }
+    .search-grid > div:nth-child(3) {
+      flex-basis: 220px;
+    }
+    .mode-chip {
+      background: #fff;
+      color: #606266;
+      justify-content: center;
+      line-height: 1;
+    }
+    .mode-chip:has(input:checked) {
+      background: #ecf5ff;
+      border-color: #409eff;
+      color: #409eff;
+    }
+    .mode-chip input {
+      pointer-events: none;
+    }
+    .filter-block {
+      align-items: center;
+    }
+    .filter-block-head {
+      flex: 0 0 auto;
+    }
+    .filter-block + .filter-block {
+      margin-left: 8px;
+    }
+    .range-pair {
+      grid-template-columns: none;
+    }
+    .range-sep {
+      color: #909399;
+      font-size: 12px;
+      line-height: 32px;
+      padding: 0 1px;
+    }
+    .action-strip {
+      justify-content: flex-start;
+    }
+    button.ghost::after {
+      display: none;
+    }
+    .notice {
+      border-radius: 4px;
+      margin: 12px 0 0;
+    }
+    #results {
+      border: 1px solid #ebeef5;
+      border-top: 0;
+    }
+    .result-bar {
+      background: #fff;
+      margin: 0;
+    }
+    .result-actions select {
+      min-width: 112px;
+      width: auto;
+    }
+    .verification-strip {
+      grid-template-columns: repeat(3, minmax(110px, 160px)) auto;
+      justify-content: start;
+    }
+    th.col-_select,
+    td.col-_select {
+      text-align: center;
+      width: 48px;
+    }
+    .row-select {
+      accent-color: #409eff;
+      height: 14px;
+      width: 14px;
+    }
+    @media (max-width: 900px) {
+      .page-head {
+        height: auto;
+      }
+      .category-summary {
+        max-width: 100%;
+      }
+    }
+    header.dl-topbar {
+      height: 46px;
+      padding: 0 18px;
+    }
+    .dl-topbar .header-row {
+      align-items: center;
+      flex-direction: row;
+      height: 46px;
+      min-height: 46px;
+    }
+    .dl-top-links {
+      display: flex;
+    }
+    main.dl-shell {
+      display: grid;
+      grid-template-columns: 180px minmax(1060px, 1fr);
+      padding: 0;
+    }
+    .dl-shell .side-nav {
+      display: block;
+      height: calc(100vh - 46px);
+      max-height: none;
+      overflow: auto;
+      padding: 10px 0 42px;
+      position: sticky;
+      top: 46px;
+    }
+    .side-nav .nav-group-title {
+      display: block;
+    }
+    .side-nav .nav-item {
+      border: 0;
+      border-radius: 0;
+      flex: initial;
+      min-height: 32px;
+      padding: 7px 24px 7px 28px;
+      white-space: normal;
+    }
+    .side-nav .nav-item.active::before {
+      display: block;
+    }
+    .library-section-head {
+      align-items: flex-start;
+      flex-direction: row;
+    }
+    html,
+    body {
+      min-width: 0;
+      overflow-x: hidden;
+    }
+    header.dl-topbar {
+      min-width: 0;
+      width: 100%;
+    }
+    main.dl-shell {
+      grid-template-columns: 180px minmax(0, 1fr);
+      min-width: 0;
+      width: 100%;
+    }
+    .dl-shell .workspace {
+      overflow: auto;
+    }
+    .library-page {
+      min-width: 0;
+    }
+    @media (max-width: 900px) {
+      .dl-top-links {
+        display: none;
+      }
+      .dl-top-actions {
+        margin-left: auto;
+      }
+    }
+    @media (max-width: 700px) {
+      main.dl-shell {
+        grid-template-columns: 150px minmax(0, 1fr);
+      }
+      .dl-shell .side-nav {
+        width: 150px;
+      }
+      .side-nav .nav-group-title {
+        padding: 0 16px;
+      }
+      .side-nav .nav-item {
+        padding: 7px 16px 7px 22px;
+      }
+      .workspace {
+        padding: 14px 10px 24px;
+      }
+      .page-tab-title {
+        font-size: 18px;
+        padding: 0 18px;
+      }
+      .help-links {
+        display: none;
+      }
+      #task,
+      #results {
+        padding-left: 12px;
+        padding-right: 12px;
+      }
+      .filter-row,
+      .library-section {
+        grid-template-columns: 92px minmax(0, 1fr);
+      }
+      .row-label,
+      .library-section-head strong {
+        font-size: 13px;
+      }
+      .top-filter-line {
+        gap: 8px;
+      }
+      .category-inline,
+      .template-inline,
+      .search-grid,
+      .url-grid,
+      .run-grid,
+      .library-grid,
+      .range-grid,
+      .filter-block .tag-grid,
+      .tag-grid {
+        gap: 8px;
+      }
+      .search-grid > div,
+      .run-grid > div,
+      .url-grid > div,
+      .search-grid > div:first-child,
+      .search-grid > div:nth-child(3) {
+        flex: 1 1 170px;
+        min-width: 0;
+      }
+      .range-field {
+        flex-wrap: wrap;
+      }
+      .range-pair input {
+        width: 72px;
+      }
+    }
   </style>
 </head>
 <body>
-  <header>
+  <header class="dl-topbar">
     <div class="header-row">
-      <div>
-        <h1>1688选品库</h1>
-        <div class="subtle-count">类目筛选 · 真实采集 · 详情核验 · 表格导出</div>
+      <div class="dl-logo">
+        <span class="dl-logo-mark"></span>
+        <span>店雷达</span>
       </div>
-      <div class="button-row">
-        <button id="runBtn" class="primary" type="button">开始查询</button>
-        <button id="resetBtn" class="secondary" type="button">重置筛选</button>
-        <button id="saveTemplateBtn" class="secondary ghost" type="button">保存筛选</button>
-        <a id="downloadLink" class="download" href="#" hidden>下载表格</a>
+      <div class="dl-top-links">
+        <span>首页</span>
+        <span>图搜</span>
+        <span>产品</span>
+        <span>1688选品</span>
+        <span>跨境选品</span>
+        <span>选品监控</span>
+      </div>
+      <div class="dl-top-actions">
+        <a href="#">购买续费</a>
+        <a href="#">登录/注册</a>
       </div>
     </div>
   </header>
 
-  <main>
+  <main class="dl-shell">
     <nav class="side-nav" aria-label="功能导航">
-      <div class="nav-brand">SOP 工作台</div>
       <div class="nav-group-title">常用</div>
       <a class="nav-item" href="#">工作台</a>
       <a class="nav-item" href="#">铺货分销</a>
@@ -1111,21 +1901,26 @@ HTML_PAGE = r"""<!doctype html>
       <div class="nav-group-title">我的选品</div>
       <a class="nav-item" href="#">监控搜索词</a>
       <a class="nav-item" href="#">黑名单</a>
+      <div class="nav-group-title">监控</div>
+      <a class="nav-item" href="#">我的监控</a>
+      <a class="nav-item" href="#">店铺分析</a>
+      <a class="nav-item" href="#">商品分析</a>
+      <div class="nav-group-title">系统</div>
+      <a class="nav-item" href="#">会员</a>
+      <a class="nav-item" href="#">子账号</a>
+      <a class="nav-item" href="#">反馈</a>
     </nav>
-    <aside>
-      <div class="panel-title">
-        <div>
-          <h2>一级类目</h2>
-          <div class="subtle-count">按一级 / 二级 / 三级路径圈定采集范围</div>
-        </div>
-        <button id="clearCategories" class="secondary" type="button">清空</button>
-      </div>
-      <input id="categorySearch" type="text" placeholder="搜索类目" />
-      <div id="categoryTree"></div>
-    </aside>
 
     <div class="workspace">
-      <section>
+      <section class="library-page">
+        <div class="page-head">
+          <div class="page-tab-title">1688选品库</div>
+          <div class="help-links">
+            <span>使用帮助</span>
+            <span>新手教程</span>
+            <span>在线翻译</span>
+          </div>
+        </div>
         <div class="tabs">
           <button class="tab active" type="button" data-tab="task">筛选任务</button>
           <button class="tab" type="button" data-tab="results">结果表格</button>
@@ -1133,17 +1928,39 @@ HTML_PAGE = r"""<!doctype html>
         </div>
 
         <div id="task" class="tab-view active panel">
+          <div class="filter-panel">
           <div class="library-toolbar">
             <div>
               <h2>筛选条件</h2>
               <div class="subtle-count">类目范围、精准搜索、选品模式、高级筛选、销售、商品、卖家信息</div>
             </div>
             <div class="toolbar-meta">
-              <label class="sample-switch">
-                <input id="sampleMode" type="checkbox" />
-                开发样例
-              </label>
               <span id="capabilityBadge" class="status-pill">能力加载中</span>
+            </div>
+          </div>
+
+          <div class="filter-row compact">
+            <div class="row-label">类目范围</div>
+            <div class="row-control">
+              <div class="top-filter-line">
+                <div class="category-inline">
+                  <button id="toggleCategoryPanel" class="secondary" type="button">选择类目</button>
+                  <button id="clearCategories" class="secondary" type="button">清空</button>
+                  <span id="categorySummary" class="category-summary">全部类目</span>
+                </div>
+                <div class="template-inline">
+                  <span class="inline-label">我的模板：</span>
+                  <input id="templateName" type="text" placeholder="无数据" />
+                  <button id="saveTemplateBtn" class="secondary ghost" type="button">管理</button>
+                </div>
+              </div>
+              <div id="categoryPanel" class="category-picker">
+                <div class="category-tools">
+                  <input id="categorySearch" type="text" placeholder="搜索类目" />
+                  <span class="status-pill">可复选一级 / 二级 / 三级</span>
+                </div>
+                <div id="categoryTree"></div>
+              </div>
             </div>
           </div>
 
@@ -1152,35 +1969,40 @@ HTML_PAGE = r"""<!doctype html>
               <strong>精准搜索</strong>
               <span>商品关键词 / 模糊匹配 / 历史搜索 / URL</span>
             </div>
-            <div class="library-grid search-grid">
-              <div>
-                <label for="keywords">商品关键词</label>
-                <input id="keywords" type="text" placeholder="例如 连衣裙, 防晒衣, 收纳盒" />
+            <div class="section-control">
+              <div class="library-grid search-grid">
+                <div>
+                  <label for="keywords">商品关键词</label>
+                  <input id="keywords" type="text" placeholder="例如 连衣裙, 防晒衣, 收纳盒" />
+                </div>
+                <div>
+                  <label for="matchType">匹配方式</label>
+                  <select id="matchType">
+                    <option value="模糊匹配">模糊匹配</option>
+                    <option value="精准匹配">精准匹配</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="historyKeyword">历史搜索</label>
+                  <input id="historyKeyword" type="text" placeholder="请输入历史关键词" />
+                </div>
+                <div>
+                  <label for="sampleMode">数据模式</label>
+                  <label class="sample-switch">
+                    <input id="sampleMode" type="checkbox" />
+                    开发样例
+                  </label>
+                </div>
               </div>
-              <div>
-                <label for="matchType">匹配方式</label>
-                <select id="matchType">
-                  <option value="模糊匹配">模糊匹配</option>
-                  <option value="精准匹配">精准匹配</option>
-                </select>
-              </div>
-              <div>
-                <label for="historyKeyword">历史搜索</label>
-                <input id="historyKeyword" type="text" placeholder="可输入上次搜索词" />
-              </div>
-              <div>
-                <label for="templateName">我的模板</label>
-                <input id="templateName" type="text" placeholder="模板名，接口预留" />
-              </div>
-            </div>
-            <div class="library-grid url-grid">
-              <div>
-                <label for="sourceUrls">1688 页面 URL</label>
-                <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
-              </div>
-              <div>
-                <label for="excludeTags">排除标签</label>
-                <textarea id="excludeTags" placeholder="例如 品牌风险, 高退货, 仿牌"></textarea>
+              <div class="library-grid url-grid">
+                <div>
+                  <label for="sourceUrls">1688 页面 URL</label>
+                  <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
+                </div>
+                <div>
+                  <label for="excludeTags">排除标签</label>
+                  <textarea id="excludeTags" placeholder="屏蔽多个商品关键词，顿号隔开"></textarea>
+                </div>
               </div>
             </div>
           </div>
@@ -1240,11 +2062,12 @@ HTML_PAGE = r"""<!doctype html>
                 <input id="maxItems" type="number" min="1" max="100" value="20" />
               </div>
             </div>
-            <div class="button-row action-row">
-              <button id="followBtn" class="secondary ghost" type="button">关注商品</button>
-              <button id="temuBtn" class="secondary ghost" type="button">铺货Temu</button>
-              <button id="dryRunBtn" class="secondary ghost" type="button">铺货 dry-run</button>
-            </div>
+          </div>
+
+          <div class="action-strip">
+            <button id="runBtn" class="primary" type="button">开始查询</button>
+            <button id="resetBtn" class="secondary" type="button">重置筛选</button>
+            <button id="saveFilterBtn" class="secondary ghost" type="button">保存筛选</button>
           </div>
 
           <div id="notice" class="notice"></div>
@@ -1263,9 +2086,28 @@ HTML_PAGE = r"""<!doctype html>
             <div class="metric"><span>P0/P1</span><strong id="highCount">0</strong></div>
             <div class="metric"><span>可铺/谨慎</span><strong id="suggestCount">0</strong></div>
           </div>
+          </div>
         </div>
 
         <div id="results" class="tab-view panel">
+          <div class="result-bar">
+            <div class="result-actions">
+              <label class="chip"><input id="selectAllRows" type="checkbox" />全选</label>
+              <span id="selectedCount" class="selected-count">已选: 0</span>
+              <button id="followBtn" class="secondary ghost" type="button">关注商品</button>
+              <a id="downloadLink" class="download" href="#" hidden>导出</a>
+              <button id="temuBtn" class="secondary ghost" type="button">铺货Temu</button>
+              <button id="dryRunBtn" class="secondary ghost" type="button">铺货 dry-run</button>
+            </div>
+            <div class="result-actions">
+              <span class="selected-count">统计周期</span>
+              <select id="periodView">
+                <option>近30天</option>
+                <option>近7天</option>
+                <option>近90天</option>
+              </select>
+            </div>
+          </div>
           <div class="verification-strip">
             <div><span>待核验高潜</span><strong id="queueCount">0</strong></div>
             <div><span>已核验商品</span><strong id="verifiedCount">0</strong></div>
@@ -1349,7 +2191,9 @@ HTML_PAGE = r"""<!doctype html>
       selectedCategories: new Set(),
       selectedTags: new Set(),
       selectedLibrary: {},
+      selectedRows: new Set(),
       tableColumns: [
+        ["_select", ""],
         ["seq", "序号"],
         ["category_path", "商品类目"],
         ["title", "商品标题"],
@@ -1385,6 +2229,28 @@ HTML_PAGE = r"""<!doctype html>
       const node = $("notice");
       node.textContent = text;
       node.className = `notice show ${ok ? "ok" : "fail"}`;
+    }
+
+    function updateCategorySummary() {
+      const selected = [...state.selectedCategories];
+      const summary = $("categorySummary");
+      if (!summary) return;
+      summary.textContent = selected.length ? `已选 ${selected.length} 个：${selected.slice(0, 4).join("、")}${selected.length > 4 ? "..." : ""}` : "全部类目";
+    }
+
+    function rowKey(row, index) {
+      return String(row.item_id || row.url || `${row.title || "row"}-${index}`);
+    }
+
+    function updateSelectedCount() {
+      const node = $("selectedCount");
+      if (node) node.textContent = `已选: ${state.selectedRows.size}`;
+      const selectAll = $("selectAllRows");
+      if (!selectAll) return;
+      const visibleKeys = filteredRows().map((row, index) => rowKey(row, index));
+      const checked = visibleKeys.length > 0 && visibleKeys.every(key => state.selectedRows.has(key));
+      selectAll.checked = checked;
+      selectAll.indeterminate = !checked && visibleKeys.some(key => state.selectedRows.has(key));
     }
 
     function renderCategories() {
@@ -1434,6 +2300,7 @@ HTML_PAGE = r"""<!doctype html>
           </div>
         `;
       }).join("");
+      updateCategorySummary();
     }
 
     function chipHtml(value, label, kind) {
@@ -1475,7 +2342,9 @@ HTML_PAGE = r"""<!doctype html>
             <strong>${esc(section.title)}</strong>
             <span>${esc(section.description || "")}</span>
           </div>
-          ${renderLibrarySectionFields(section)}
+          <div class="section-control">
+            ${renderLibrarySectionFields(section)}
+          </div>
         </div>
       `).join("");
     }
@@ -1507,6 +2376,7 @@ HTML_PAGE = r"""<!doctype html>
               <label>${esc(field.label)} ${statusBadge(field.status)}</label>
               <div class="range-pair">
                 <input type="number" data-library-range="${esc(field.key)}" data-bound="min" placeholder="最小" />
+                <span class="range-sep">至</span>
                 <input type="number" data-library-range="${esc(field.key)}" data-bound="max" placeholder="最大" />
               </div>
             </div>
@@ -1604,18 +2474,23 @@ HTML_PAGE = r"""<!doctype html>
     function renderTable() {
       $("resultHead").innerHTML = `<tr>${state.tableColumns.map(([key, label]) => `<th class="${tableCellClass(key)}">${esc(label)}</th>`).join("")}</tr>`;
       const rows = filteredRows();
-      $("resultBody").innerHTML = rows.map(row => `
+      $("resultBody").innerHTML = rows.map((row, index) => `
         <tr>
-          ${state.tableColumns.map(([key]) => `<td class="${tableCellClass(key)}">${formatCell(key, row[key])}</td>`).join("")}
+          ${state.tableColumns.map(([key]) => `<td class="${tableCellClass(key)}">${formatCell(key, row[key], row, index)}</td>`).join("")}
         </tr>
       `).join("") || `<tr><td colspan="${state.tableColumns.length}">暂无数据</td></tr>`;
+      updateSelectedCount();
     }
 
     function tableCellClass(key) {
       return `col-${String(key).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
     }
 
-    function formatCell(key, value) {
+    function formatCell(key, value, row, index) {
+      if (key === "_select") {
+        const keyValue = rowKey(row, index);
+        return `<input class="row-select" type="checkbox" data-row-key="${esc(keyValue)}" ${state.selectedRows.has(keyValue) ? "checked" : ""} />`;
+      }
       if (key === "url" && value) return `<a href="${esc(value)}" target="_blank" rel="noreferrer">打开</a>`;
       if (key === "recommendation_level") {
         const cls = value === "P0" ? "p0" : value === "P1" ? "p1" : value === "P2" ? "p2" : "no";
@@ -1644,6 +2519,21 @@ HTML_PAGE = r"""<!doctype html>
       });
     }
 
+    function clearRunState() {
+      state.rows = [];
+      state.runId = "";
+      state.verificationQueue = [];
+      state.verificationRecords = [];
+      state.filterPlan = {};
+      state.filterResults = [];
+      state.filterWarnings = [];
+      state.selectedRows.clear();
+      $("downloadLink").hidden = true;
+      $("downloadLink").removeAttribute("href");
+      renderTable();
+      updateSummary({run_id: "", verification_queue: [], verification_records: []});
+    }
+
     function updateSummary(data) {
       state.runId = data.run_id || state.runId || "";
       state.verificationQueue = data.verification_queue || state.verificationQueue || [];
@@ -1659,6 +2549,7 @@ HTML_PAGE = r"""<!doctype html>
       $("verifiedCount").textContent = String(state.rows.filter(row => ["sample_verified", "verified", "partial_verified"].includes(row.verification_status)).length);
       $("recordCount").textContent = String(state.verificationRecords.length);
       $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
+      updateSelectedCount();
       renderRecords();
       renderFilterRecords();
     }
@@ -1730,12 +2621,11 @@ HTML_PAGE = r"""<!doctype html>
         });
         const result = await response.json();
         if (!result.success) {
-          state.rows = [];
-          renderTable();
-          updateSummary({});
+          clearRunState();
           showNotice(result.markdown || "采集失败", false);
           return;
         }
+        state.selectedRows.clear();
         state.rows = result.data.rows || [];
         state.runId = result.data.run_id || "";
         state.verificationQueue = result.data.verification_queue || [];
@@ -1752,12 +2642,11 @@ HTML_PAGE = r"""<!doctype html>
         const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
         const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
         showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}运费、品退率、发货率等关键字段仍需详情页核验。`, (state.filterWarnings || []).length === 0);
-        setTab("results");
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
       } finally {
         $("runBtn").disabled = false;
-        $("runBtn").textContent = "运行采集";
+        $("runBtn").textContent = "开始查询";
       }
     }
 
@@ -1813,6 +2702,13 @@ HTML_PAGE = r"""<!doctype html>
       target.dataset.kind === "category" ? renderCategories() : renderFilterGroups();
     });
 
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!target.matches(".row-select")) return;
+      target.checked ? state.selectedRows.add(target.dataset.rowKey) : state.selectedRows.delete(target.dataset.rowKey);
+      updateSelectedCount();
+    });
+
     document.addEventListener("click", (event) => {
       const tab = event.target.closest(".tab");
       if (tab) setTab(tab.dataset.tab);
@@ -1828,6 +2724,11 @@ HTML_PAGE = r"""<!doctype html>
     });
 
     $("categorySearch").addEventListener("input", renderCategories);
+    $("toggleCategoryPanel").addEventListener("click", () => {
+      const panel = $("categoryPanel");
+      panel.classList.toggle("is-open");
+      $("toggleCategoryPanel").textContent = panel.classList.contains("is-open") ? "收起类目" : "选择类目";
+    });
     $("clearCategories").addEventListener("click", () => {
       state.selectedCategories.clear();
       renderCategories();
@@ -1836,6 +2737,7 @@ HTML_PAGE = r"""<!doctype html>
       state.selectedCategories.clear();
       state.selectedTags.clear();
       state.selectedLibrary = {};
+      state.selectedRows.clear();
       ["keywords", "sourceUrls", "excludeTags", "historyKeyword", "templateName", "titleFilter"].forEach(id => {
         if ($(id)) $(id).value = "";
       });
@@ -1849,9 +2751,24 @@ HTML_PAGE = r"""<!doctype html>
       });
       renderCategories();
       renderFilterGroups();
+      renderTable();
       showNotice("筛选条件已重置。", true);
     });
-    ["saveTemplateBtn", "followBtn", "temuBtn", "dryRunBtn"].forEach(id => {
+    $("selectAllRows").addEventListener("change", (event) => {
+      filteredRows().forEach((row, index) => {
+        const key = rowKey(row, index);
+        event.target.checked ? state.selectedRows.add(key) : state.selectedRows.delete(key);
+      });
+      renderTable();
+    });
+    $("periodView").addEventListener("change", (event) => {
+      $("statPeriod").value = event.target.value;
+      showNotice(`统计周期已切换为 ${event.target.value}。当前版本会记录到筛选参数，真实采集仍以 1688 页面可获取字段为准。`, true);
+    });
+    $("statPeriod").addEventListener("change", (event) => {
+      $("periodView").value = event.target.value;
+    });
+    ["saveTemplateBtn", "saveFilterBtn", "followBtn", "temuBtn", "dryRunBtn"].forEach(id => {
       $(id).addEventListener("click", () => {
         showNotice("该功能接口已预留，当前版本不会伪造执行结果。", false);
       });
