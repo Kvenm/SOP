@@ -28,6 +28,7 @@ from capabilities.tag_collect.service import (
     build_verification_queue,
     friendly_collect_error,
     get_library_capabilities,
+    get_library_filter_coverage,
     get_library_filter_schema,
     get_numbered_export_columns,
     metric_bucket,
@@ -115,6 +116,7 @@ def test_filter_plan_splits_native_and_metric_tags():
 def test_library_filter_contract_and_mapping():
     schema = get_library_filter_schema()
     capabilities = get_library_capabilities()
+    coverage = get_library_filter_coverage()
     section_keys = {section["key"] for section in schema}
     _assert("selection_mode" in section_keys, "店雷达筛选契约应包含选品模式")
     _assert("advanced" in section_keys, "店雷达筛选契约应包含高级筛选")
@@ -122,6 +124,15 @@ def test_library_filter_contract_and_mapping():
     _assert("product" in section_keys, "店雷达筛选契约应包含商品信息")
     _assert("seller" in section_keys, "店雷达筛选契约应包含卖家信息")
     _assert(capabilities["implemented"], "能力清单应标记已接入项目")
+    schema_field_keys = {
+        field["key"]
+        for section in schema
+        for field in section.get("fields", [])
+    }
+    coverage_keys = {item["field_key"] for item in coverage}
+    _assert(schema_field_keys == coverage_keys, "筛选覆盖状态应覆盖 schema 中每一个字段")
+    _assert(any(item["status"] == "detail_required" for item in coverage), "覆盖状态应包含详情核验字段")
+    _assert(any(item["status"] == "reserved" for item in coverage), "覆盖状态应包含预留字段")
 
     library_filters = {
         "category_paths": ["女装/女士精品>连衣裙"],
@@ -237,6 +248,7 @@ def test_sample_detail_verification():
     config = parse_input(
         categories="女装/女士精品,家用电器",
         tags="微信小店,一件代发,48小时发货",
+        library_filters={"min_order_min": "1"},
         sample_data=True,
         output_format="xlsx",
     )
@@ -248,6 +260,7 @@ def test_sample_detail_verification():
     _assert(verify_result["success"], "样例详情核验应成功")
     _assert(verify_data["verified_count"] >= 1, "样例详情核验应至少核验 1 个商品")
     _assert(verify_data["verification_records"], "应生成字段级核验记录")
+    _assert(verify_data["filter_reevaluation_records"], "详情核验后应生成筛选重评估记录")
     verified_rows = [
         row for row in verify_data["rows"]
         if row.get("verification_status") == "sample_verified"
@@ -308,6 +321,7 @@ def test_web_token_and_sample_api():
         _assert(options["allow_real_collect"] is True, "真实采集默认应开启")
         _assert(options["limits"]["max_queries"] == 50, "服务端查询词限额应为 50")
         _assert(options["library_filter_schema"], "options 应返回店雷达选品库筛选契约")
+        _assert(options["library_filter_coverage"], "options 应返回筛选覆盖状态")
         _assert(options["library_capabilities"]["implemented"], "options 应返回筛选能力清单")
 
         try:
@@ -326,6 +340,7 @@ def test_web_token_and_sample_api():
                 "library_filters": {
                     "search_keyword": "连衣裙",
                     "selection_modes": ["源头工厂"],
+                    "min_order_min": "1",
                     "sales_orders_min": "100",
                     "wholesale_price_max": "80",
                     "fulfillment_times": ["48小时"],
@@ -343,6 +358,7 @@ def test_web_token_and_sample_api():
         native_labels = {item["label"] for item in payload["data"]["filter_plan"]["native_filters"]}
         _assert("48小时发货" in native_labels, "Web 采集应转译发货时间原生筛选")
         _assert(payload["data"]["filter_plan"]["library_reserved_fields"], "Web 采集应返回预留字段记录")
+        _assert(payload["data"]["library_filter_coverage"], "Web 采集应返回筛选覆盖状态")
         run_id = payload["data"]["run_id"]
         _assert(payload["data"]["verification_queue"], "Web 样例采集应返回详情核验队列")
         for row in payload["data"]["rows"]:
@@ -376,6 +392,7 @@ def test_web_token_and_sample_api():
         _assert(payload["success"], "Web 样例详情核验业务应成功")
         _assert(payload["data"]["verified_count"] >= 1, "Web 样例详情核验应补充商品")
         _assert(payload["data"]["verification_records"], "Web 样例详情核验应返回字段记录")
+        _assert(payload["data"]["filter_reevaluation_records"], "Web 样例详情核验应返回详情筛选重评估记录")
 
         web.ALLOW_REAL_COLLECT = False
         status, payload = _post_json(

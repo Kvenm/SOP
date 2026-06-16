@@ -906,6 +906,52 @@ def get_library_filter_schema() -> List[Dict[str, Any]]:
     return json.loads(json.dumps(LIBRARY_FILTER_SCHEMA, ensure_ascii=False))
 
 
+def _filter_status_label(status: str) -> str:
+    return {
+        "supported": "已接入",
+        "partial_supported": "部分接入",
+        "detail_required": "详情核验",
+        "reserved": "预留",
+    }.get(status, status or "预留")
+
+
+def _filter_status_message(field: Dict[str, Any]) -> str:
+    status = str(field.get("status") or "reserved")
+    mapping = str(field.get("mapping") or "")
+    if status == "supported":
+        if mapping in ("native_filter", "tags_and_system_rules"):
+            return "运行采集时会转成 1688 原生筛选或系统规则；RPA 会记录点击结果。"
+        if mapping in ("post_filter", "platform_tags", "categories", "keywords", "source_urls"):
+            return "运行采集时进入搜索词、列表初筛或后置指标筛选。"
+        return "当前采集链路已接入。"
+    if status == "partial_supported":
+        return "当前可转译为部分原生筛选或规则；缺失能力会进入执行记录，不伪造结果。"
+    if status == "detail_required":
+        return "列表页不可信，采集后进入详情页/商家页核验，再重新判断筛选结果。"
+    return "接口已预留，当前只记录筛选意图，不参与真实过滤。"
+
+
+def get_library_filter_coverage() -> List[Dict[str, Any]]:
+    """返回前端筛选项到采集链路的覆盖状态，用于验收每个筛选是否真的接入。"""
+    coverage: List[Dict[str, Any]] = []
+    for section in LIBRARY_FILTER_SCHEMA:
+        for field in section.get("fields", []):
+            status = str(field.get("status") or "reserved")
+            coverage.append({
+                "section_key": section.get("key", ""),
+                "section_title": section.get("title", ""),
+                "field_key": field.get("key", ""),
+                "label": field.get("label", ""),
+                "type": field.get("type", ""),
+                "status": status,
+                "status_label": _filter_status_label(status),
+                "mapping": field.get("mapping", ""),
+                "options": field.get("options", []),
+                "message": _filter_status_message(field),
+            })
+    return coverage
+
+
 def get_library_capabilities() -> Dict[str, Any]:
     return {
         "source": "dianleida_1688_category_library_reference",
@@ -1905,6 +1951,32 @@ def _evaluate_post_filters(row: Dict[str, Any], post_filters: List[Dict[str, Any
     return should_keep, records
 
 
+def reevaluate_row_filters_after_verification(row: Dict[str, Any], filter_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """详情页核验后，重新判断依赖详情字段的筛选命中状态。"""
+    if not isinstance(filter_plan, dict):
+        return []
+    post_filters = filter_plan.get("post_filters") or []
+    if not isinstance(post_filters, list):
+        return []
+    _, records = _evaluate_post_filters(row, post_filters)
+    row["filter_match_records"] = records
+    blocking = [
+        record for record in records
+        if record.get("status") == "filtered_out"
+        or record.get("status") in ("pending_detail", "manual_review_required")
+    ]
+    if blocking:
+        row["filter_verification_status"] = "needs_review"
+        row["filter_verification_note"] = "；".join(
+            f"{record.get('field_label') or record.get('field_key')}={record.get('status')}"
+            for record in blocking
+        )
+    else:
+        row["filter_verification_status"] = "matched"
+        row["filter_verification_note"] = "详情相关筛选已重新评估并命中"
+    return records
+
+
 def _refresh_metric_buckets(row: Dict[str, Any]) -> None:
     row["good_rate_bucket"] = metric_bucket("good_rate", row.get("good_rate", ""))
     row["product_refund_rate_bucket"] = metric_bucket("product_refund_rate", row.get("product_refund_rate", ""))
@@ -2388,6 +2460,8 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
         payload["rows"] = rows
     queue = build_verification_queue(rows, max_items=max_items)
     evidence: List[Dict[str, Any]] = list(payload.get("verification_records") or [])
+    filter_plan = payload.get("filter_plan") or {}
+    filter_reevaluation_records: List[Dict[str, Any]] = []
     verified_count = 0
     failed_count = 0
     row_by_id = {str(row.get("item_id", "")): row for row in rows if isinstance(row, dict)}
@@ -2399,6 +2473,13 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             continue
         records = _sample_verify_row(row) if sample_data else _real_verify_row(row)
         evidence.extend(records)
+        filter_records = reevaluate_row_filters_after_verification(row, filter_plan)
+        for record in filter_records:
+            filter_reevaluation_records.append({
+                "item_id": item_id,
+                "title": row.get("title", ""),
+                **record,
+            })
         if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
             verified_count += 1
         else:
@@ -2406,6 +2487,10 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
 
     payload["verification_queue"] = build_verification_queue(rows, max_items=max_items)
     payload["verification_records"] = evidence
+    payload["filter_reevaluation_records"] = [
+        *(payload.get("filter_reevaluation_records") or []),
+        *filter_reevaluation_records,
+    ]
     payload["verified_count"] = len([
         row for row in rows
         if isinstance(row, dict) and row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL)
@@ -2436,6 +2521,7 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             "rows": rows,
             "verification_queue": payload["verification_queue"],
             "verification_records": evidence,
+            "filter_reevaluation_records": payload["filter_reevaluation_records"],
             "download_url": f"/download?run_id={run_id}",
             "output_path": payload.get("output_path", ""),
         },
@@ -2558,6 +2644,8 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["店雷达选品库筛选", json.dumps(payload.get("library_filters", {}), ensure_ascii=False)],
         ["店雷达筛选映射结果", json.dumps((payload.get("filter_plan") or {}).get("library_filter_results", []), ensure_ascii=False)],
         ["预留筛选字段", json.dumps((payload.get("filter_plan") or {}).get("library_reserved_fields", []), ensure_ascii=False)],
+        ["筛选覆盖状态", json.dumps(payload.get("library_filter_coverage", get_library_filter_coverage()), ensure_ascii=False)],
+        ["详情核验后筛选重评估", json.dumps(payload.get("filter_reevaluation_records", []), ensure_ascii=False)],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
         ["筛选执行记录", json.dumps(payload.get("filter_results", []), ensure_ascii=False)],
         ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
@@ -2709,6 +2797,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "filter_plan": filter_plan,
         "filter_results": filter_plan.get("filter_results", []),
         "filter_warnings": filter_plan.get("filter_warnings", []),
+        "library_filter_coverage": get_library_filter_coverage(),
         "category_dictionary": {
             "version": CATEGORY_DICTIONARY.get("version", ""),
             "source": CATEGORY_DICTIONARY.get("source", ""),
@@ -2727,6 +2816,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "rows": rows,
         "verification_queue": build_verification_queue(rows),
         "verification_records": [],
+        "filter_reevaluation_records": [],
         "verified_count": 0,
         "verification_failed_count": 0,
         "last_verified_at": "",
@@ -2755,9 +2845,11 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "filter_plan": filter_plan,
             "filter_results": payload["filter_results"],
             "filter_warnings": payload["filter_warnings"],
+            "library_filter_coverage": payload["library_filter_coverage"],
             "category_dictionary": payload["category_dictionary"],
             "verification_queue": payload["verification_queue"],
             "verification_records": payload["verification_records"],
+            "filter_reevaluation_records": payload["filter_reevaluation_records"],
             "verified_count": 0,
         },
     }

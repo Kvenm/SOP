@@ -42,3 +42,35 @@
 
 - 店雷达的增长率、采购集中率、关注商品、Temu 铺货等能力当前仅预留接口。
 - 真实采集需要用户登录 1688，遇到安全校验必须人工处理。
+
+## 2026-06-16 追加：筛选可用性闭环
+
+### 触发
+
+用户确认当前店雷达式筛选前端就是目标基线，要求继续按该筛选开发，并确认是否仍按 Loop 执行。
+
+### 本轮目标
+
+- 不再改变当前筛选页面主视觉和分区结构。
+- 为每个前端筛选字段生成覆盖状态：已接入、部分接入、需详情核验、预留。
+- 将覆盖状态返回给 Web 工作台和采集 payload，便于需求评审和导出追踪。
+- 详情页核验后，重新评估依赖详情字段的筛选条件，生成筛选重评估记录。
+
+### 本轮结果
+
+- `/api/options` 新增 `library_filter_coverage`。
+- Web 工作台新增“筛选覆盖状态”模块，当前统计：已接入 17、部分接入 3、需详情核验 5、预留 11。
+- `verify_run_details` 在详情核验后会刷新 `filter_match_records`，并返回 `filter_reevaluation_records`。
+- 导出配置 sheet 追加“筛选覆盖状态”和“详情核验后筛选重评估”记录。
+
+### 验收
+
+- 通过：`python3 -m py_compile scripts/capabilities/tag_collect/service.py scripts/capabilities/tag_collect/web.py scripts/capabilities/tag_collect/smoke_test.py`
+- 通过：`python3 scripts/capabilities/tag_collect/smoke_test.py`
+- 通过：`git diff --check`
+- 通过：浏览器刷新 `http://127.0.0.1:8765/`，覆盖状态显示 36 个筛选字段。
+
+### 后续
+
+- 下一轮应使用真实登录 1688 账号逐项跑筛选验收表，记录每个原生筛选是否可点击、是否 not_found、是否需要详情页核验。
+- 对预留字段逐项决定：继续预留、接商家页采集、接外部数据源，或从前端隐藏。

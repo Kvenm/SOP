@@ -21,6 +21,7 @@ from capabilities.tag_collect.service import (
     friendly_collect_error,
     get_export_path,
     get_library_capabilities,
+    get_library_filter_coverage,
     get_library_filter_schema,
     get_numbered_export_columns,
     get_run_payload,
@@ -106,6 +107,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                     "columns": [{"key": key, "label": label} for key, label in EXPORT_COLUMNS],
                     "numbered_columns": get_numbered_export_columns(),
                     "library_filter_schema": get_library_filter_schema(),
+                    "library_filter_coverage": get_library_filter_coverage(),
                     "library_capabilities": get_library_capabilities(),
                 },
             })
@@ -1027,6 +1029,76 @@ HTML_PAGE = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.4;
     }
+    .coverage-strip {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin: 10px 0 12px;
+    }
+    .coverage-pill {
+      background: #f8fafc;
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      display: grid;
+      gap: 2px;
+      min-height: 48px;
+      padding: 8px 10px;
+    }
+    .coverage-pill strong {
+      color: #303133;
+      font-size: 16px;
+      font-weight: 760;
+    }
+    .coverage-pill span {
+      color: #606266;
+      font-size: 12px;
+    }
+    .coverage-list {
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      max-height: 180px;
+      overflow: auto;
+    }
+    .coverage-row {
+      align-items: center;
+      border-bottom: 1px solid #f0f0f0;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 112px 130px 92px minmax(0, 1fr);
+      min-height: 34px;
+      padding: 6px 10px;
+    }
+    .coverage-row:last-child {
+      border-bottom: 0;
+    }
+    .coverage-row span {
+      color: #606266;
+      font-size: 12px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .coverage-row strong {
+      color: #303133;
+      font-size: 12px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .coverage-status {
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 11px;
+      font-weight: 720;
+      justify-content: center;
+      padding: 2px 7px;
+    }
+    .coverage-status.supported { background: #eaf7f0; color: #16a34a; }
+    .coverage-status.partial_supported { background: #fff2e8; color: #ff7a1a; }
+    .coverage-status.detail_required { background: #eaf3ff; color: #0958d9; }
+    .coverage-status.reserved { background: #f1f2f4; color: #606266; }
     body {
       background: #f0f2f5;
     }
@@ -2078,6 +2150,8 @@ HTML_PAGE = r"""<!doctype html>
                 <div class="subtle-count">原生筛选必须在 1688 页面点击；找不到会显示 not_found</div>
               </div>
             </div>
+            <div id="coverageSummary" class="coverage-strip"></div>
+            <div id="coverageList" class="coverage-list"></div>
             <div id="filterRecordList" class="record-list"></div>
           </div>
           <div class="summary">
@@ -2185,6 +2259,7 @@ HTML_PAGE = r"""<!doctype html>
       runId: "",
       verificationQueue: [],
       verificationRecords: [],
+      filterReevaluationRecords: [],
       filterPlan: {},
       filterResults: [],
       filterWarnings: [],
@@ -2471,6 +2546,34 @@ HTML_PAGE = r"""<!doctype html>
       `).join("");
     }
 
+    function renderFilterCoverage() {
+      const coverage = state.options.library_filter_coverage || [];
+      const order = [
+        ["supported", "已接入"],
+        ["partial_supported", "部分接入"],
+        ["detail_required", "需详情核验"],
+        ["reserved", "预留"]
+      ];
+      const counts = coverage.reduce((acc, item) => {
+        acc[item.status] = (acc[item.status] || 0) + 1;
+        return acc;
+      }, {});
+      $("coverageSummary").innerHTML = order.map(([key, label]) => `
+        <div class="coverage-pill">
+          <strong>${counts[key] || 0}</strong>
+          <span>${label}</span>
+        </div>
+      `).join("");
+      $("coverageList").innerHTML = coverage.map(item => `
+        <div class="coverage-row">
+          <span>${esc(item.section_title)}</span>
+          <strong>${esc(item.label)}</strong>
+          <span class="coverage-status ${esc(item.status)}">${esc(item.status_label)}</span>
+          <span title="${esc(item.message || "")}">${esc(item.mapping || "-")} · ${esc(item.message || "")}</span>
+        </div>
+      `).join("");
+    }
+
     function renderTable() {
       $("resultHead").innerHTML = `<tr>${state.tableColumns.map(([key, label]) => `<th class="${tableCellClass(key)}">${esc(label)}</th>`).join("")}</tr>`;
       const rows = filteredRows();
@@ -2524,6 +2627,7 @@ HTML_PAGE = r"""<!doctype html>
       state.runId = "";
       state.verificationQueue = [];
       state.verificationRecords = [];
+      state.filterReevaluationRecords = [];
       state.filterPlan = {};
       state.filterResults = [];
       state.filterWarnings = [];
@@ -2538,6 +2642,7 @@ HTML_PAGE = r"""<!doctype html>
       state.runId = data.run_id || state.runId || "";
       state.verificationQueue = data.verification_queue || state.verificationQueue || [];
       state.verificationRecords = data.verification_records || state.verificationRecords || [];
+      state.filterReevaluationRecords = data.filter_reevaluation_records || state.filterReevaluationRecords || [];
       state.filterPlan = data.filter_plan || state.filterPlan || {};
       state.filterResults = data.filter_results || state.filterResults || [];
       state.filterWarnings = data.filter_warnings || state.filterWarnings || [];
@@ -2563,6 +2668,11 @@ HTML_PAGE = r"""<!doctype html>
         ...(state.filterPlan.library_reserved_fields || []).map(item => ({...item, plan_type: "预留字段"}))
       ];
       const execution = state.filterResults || [];
+      const reevaluated = (state.filterReevaluationRecords || []).map(record => ({
+        title: `详情重评估 · ${record.field_label || record.field_key || "-"}`,
+        line1: `商品：${record.item_id || "-"} · 状态：${record.status || "-"}`,
+        line2: `期望：${record.expected || "-"} · 实际：${record.raw || "-"} · ${record.message || ""}`
+      }));
       const rows = execution.length
         ? execution.map(record => ({
             title: `${record.label || record.tag || record.filter_key || "-"} · ${record.status || "-"}`,
@@ -2574,7 +2684,7 @@ HTML_PAGE = r"""<!doctype html>
             line1: `字段：${record.field || record.field_key || record.key || "-"} · 状态：${record.status || "planned"}`,
             line2: record.message || record.bucket || record.value || record.type || "待执行"
           }));
-      $("filterRecordList").innerHTML = rows.slice(0, 20).map(record => `
+      $("filterRecordList").innerHTML = [...reevaluated, ...rows].slice(0, 24).map(record => `
         <div class="record-item">
           <strong>${esc(record.title)}</strong>
           <span>${esc(record.line1)}</span>
@@ -2803,6 +2913,7 @@ HTML_PAGE = r"""<!doctype html>
       renderCategories();
       renderLibraryFilters();
       renderFilterGroups();
+      renderFilterCoverage();
       renderFields();
       renderTable();
       updateSummary({});
