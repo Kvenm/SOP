@@ -36,6 +36,7 @@ from capabilities.tag_collect.service import (
     parse_input,
     run_tag_collect,
     verify_run_details,
+    collect_error_state,
 )
 from _errors import ServiceError
 
@@ -241,6 +242,10 @@ def test_security_verification_error_message():
         )
     )
     _assert("安全验证" in message or "滑块" in message, "滑块验证应给出明确人工处理提示")
+    state = collect_error_state(ServiceError(message))
+    _assert(state["code"] == "security_verification_required", "滑块验证应返回结构化风控状态")
+    _assert(state["action"] == "manual_handoff", "滑块验证应进入人工接管")
+    _assert(state["retryable"] is False, "滑块验证不应提示自动重试")
     _assert("不会绕过" in message or "不会继续采集" in message, "提示应明确不会绕过验证码")
 
 
@@ -450,6 +455,10 @@ def test_web_security_verification_does_not_export():
         _assert(payload["data"].get("row_count", 0) == 0, "安全验证阻断不应生成商品")
         _assert(payload["data"].get("rows", []) == [], "安全验证阻断不应返回 rows")
         _assert("download_url" not in payload["data"], "安全验证阻断不应返回下载链接")
+        _assert(payload["data"].get("error_code") == "security_verification_required", "安全验证阻断应返回 error_code")
+        _assert(payload["data"].get("action") == "manual_handoff", "安全验证阻断应要求人工接管")
+        _assert(payload["data"].get("retryable") is False, "安全验证阻断不应自动重试")
+        _assert("停止反复刷新" in payload["data"].get("suggestion", ""), "安全验证阻断应提示停止反复刷新")
         _assert("不会绕过" in payload["markdown"], "安全验证提示应明确不会绕过验证码")
     finally:
         server.shutdown()

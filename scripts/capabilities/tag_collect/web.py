@@ -18,12 +18,12 @@ from capabilities.tag_collect.service import (
     TAG_CATEGORY_TREE,
     TAG_FILTER_GROUPS,
     METRIC_FILTER_GROUPS,
-    friendly_collect_error,
     get_export_path,
     get_library_capabilities,
     get_library_filter_coverage,
     get_library_filter_schema,
     get_numbered_export_columns,
+    collect_error_state,
     get_run_payload,
     parse_input,
     run_tag_collect,
@@ -203,10 +203,19 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             data["download_url"] = f"/download?run_id={data['run_id']}"
             self._send_json(200, {"success": result["success"], "markdown": result["markdown"], "data": data})
         except Exception as exc:
+            error_state = collect_error_state(exc)
             self._send_json(200, {
                 "success": False,
-                "markdown": f"采集失败：{friendly_collect_error(exc)}",
-                "data": {"run_id": "", "row_count": 0, "rows": []},
+                "markdown": f"采集失败：{error_state['message']}",
+                "data": {
+                    "run_id": "",
+                    "row_count": 0,
+                    "rows": [],
+                    "error_code": error_state["code"],
+                    "action": error_state["action"],
+                    "retryable": error_state["retryable"],
+                    "suggestion": error_state["suggestion"],
+                },
             })
 
     def _download(self, query: str) -> None:
@@ -362,6 +371,22 @@ HTML_PAGE = r"""<!doctype html>
       background: var(--accent-soft);
       color: var(--accent-deep);
     }
+    .nav-item.is-disabled {
+      color: #98a2b3;
+      cursor: not-allowed;
+      opacity: .62;
+      pointer-events: none;
+    }
+    .nav-item.is-disabled::after {
+      background: #eef1f5;
+      border-radius: 999px;
+      color: #667085;
+      content: "预留";
+      font-size: 11px;
+      font-weight: 720;
+      margin-left: auto;
+      padding: 2px 6px;
+    }
     .nav-item.active::before {
       background: var(--accent);
       border-radius: 999px;
@@ -499,7 +524,7 @@ HTML_PAGE = r"""<!doctype html>
     }
     button:active, .download:active { transform: translateY(1px); }
     button:disabled {
-      cursor: wait;
+      cursor: not-allowed;
       opacity: .65;
     }
     button:focus-visible, .download:focus-visible, .chip:focus-within, .category-primary:focus-within {
@@ -555,72 +580,208 @@ HTML_PAGE = r"""<!doctype html>
     }
     .tab-view { display: none; }
     .tab-view.active { display: block; }
-    .category-group {
-      background: #ffffff;
-      border: 1px solid var(--line-soft);
-      border-radius: 4px;
-      margin-top: 8px;
-      overflow: hidden;
-    }
-    .category-group.is-active {
-      border-color: rgba(0, 113, 227, .34);
-      box-shadow: inset 3px 0 0 var(--accent);
-    }
-    .category-primary {
-      align-items: center;
-      display: flex;
-      gap: 10px;
-      justify-content: space-between;
-      margin: 0;
-      min-height: 48px;
-      padding: 9px 10px;
-      width: 100%;
-    }
-    .category-primary input {
-      accent-color: var(--accent);
-      height: 16px;
-      width: 16px;
-    }
-    .category-title {
-      color: var(--ink);
+    .category-cascade {
       display: grid;
-      flex: 1;
-      gap: 3px;
-      margin: 0;
-      min-width: 0;
+      gap: 10px;
     }
-    .category-title strong {
+    .category-dict-card {
+      background: #ffffff;
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      display: grid;
+      gap: 6px;
+      padding: 12px 16px;
+    }
+    .category-dict-card strong {
+      color: #1f2937;
       font-size: 14px;
       font-weight: 760;
-      line-height: 1.2;
+    }
+    .category-dict-card span {
+      color: #667085;
+      font-size: 12px;
+    }
+    .category-cascade-grid {
+      background: #ffffff;
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      display: grid;
+      grid-template-columns: minmax(190px, .9fr) minmax(220px, 1fr) minmax(260px, 1.25fr);
+      min-height: 300px;
+      overflow: hidden;
+    }
+    .category-column {
+      background: #ffffff;
+      border-right: 1px solid #ebeef5;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-width: 0;
+    }
+    .category-column:last-child {
+      border-right: 0;
+    }
+    .category-column-head {
+      align-items: center;
+      background: #f5f7fa;
+      border-bottom: 1px solid #ebeef5;
+      color: #303133;
+      display: flex;
+      justify-content: space-between;
+      min-height: 38px;
+      padding: 9px 12px;
+    }
+    .category-column-head strong {
+      font-size: 13px;
+      font-weight: 760;
+    }
+    .category-column-head span {
+      color: #909399;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .category-column-list {
+      max-height: 360px;
+      overflow: auto;
+      padding: 6px;
+    }
+    .category-row {
+      align-items: stretch;
+      border: 1px solid transparent;
+      border-radius: 3px;
+      display: grid;
+      gap: 4px;
+      grid-template-columns: 28px minmax(0, 1fr);
+      margin-bottom: 4px;
+      min-height: 36px;
+      transition: background .16s ease, border-color .16s ease;
+    }
+    .category-row:hover {
+      background: #f5f7fa;
+    }
+    .category-row.is-current {
+      background: #ecf5ff;
+      border-color: #c6e2ff;
+    }
+    .category-row.is-selected {
+      border-color: rgba(64, 158, 255, .45);
+    }
+    .category-check {
+      align-items: center;
+      display: flex;
+      justify-content: center;
+      margin: 0;
+      padding: 0;
+    }
+    .category-check input {
+      accent-color: #409eff;
+      height: 14px;
+      width: 14px;
+    }
+    .category-row-button {
+      align-items: center;
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+      color: #303133;
+      cursor: pointer;
+      display: grid;
+      gap: 4px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 34px;
+      min-width: 0;
+      padding: 6px 8px 6px 0;
+      text-align: left;
+      width: 100%;
+    }
+    .category-row-button:hover,
+    .category-row-button:focus-visible {
+      background: transparent;
+      box-shadow: none;
+      color: #409eff;
+      outline: none;
+    }
+    .category-row-title {
+      font-size: 13px;
+      font-weight: 650;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .category-row-meta {
+      color: #909399;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .category-row.is-current .category-row-title,
+    .category-row.is-selected .category-row-title {
+      color: #409eff;
+    }
+    .category-empty {
+      align-items: center;
+      color: #909399;
+      display: flex;
+      font-size: 13px;
+      justify-content: center;
+      min-height: 160px;
+      padding: 18px;
+      text-align: center;
+    }
+    .category-selected-bar {
+      align-items: flex-start;
+      background: #ffffff;
+      border: 1px solid #ebeef5;
+      border-radius: 4px;
+      display: flex;
+      gap: 8px;
+      padding: 8px 10px;
+    }
+    .category-selected-title {
+      color: #606266;
+      flex: 0 0 auto;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 24px;
+    }
+    .category-selected-list {
+      display: flex;
+      flex: 1;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-width: 0;
+    }
+    .category-selected-chip {
+      align-items: center;
+      background: #ecf5ff;
+      border: 1px solid #c6e2ff;
+      border-radius: 3px;
+      color: #409eff;
+      display: inline-flex;
+      font-size: 12px;
+      gap: 5px;
+      min-height: 24px;
+      padding: 3px 7px;
+    }
+    .category-selected-chip button {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      color: #409eff;
+      font-size: 14px;
+      min-height: 18px;
+      min-width: 18px;
+      padding: 0;
+    }
+    .category-empty-selection {
+      color: #909399;
+      font-size: 12px;
+      line-height: 24px;
     }
     .tier-label {
       color: var(--muted-2);
       font-size: 11px;
       font-weight: 700;
-    }
-    .category-count {
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .category-children {
-      border-top: 1px solid var(--line-soft);
-      padding: 8px 10px 10px;
-    }
-    .category-children .tier-label {
-      margin-bottom: 8px;
-    }
-    .category-secondary {
-      background: #f8fafc;
-      border: 1px solid var(--line-soft);
-      border-radius: 4px;
-      margin-top: 6px;
-      padding: 7px;
-    }
-    .category-secondary .tag-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      margin-bottom: 6px;
     }
     .tag-grid {
       display: grid;
@@ -877,6 +1038,11 @@ HTML_PAGE = r"""<!doctype html>
     .notice.fail {
       background: #fff0f0;
       color: var(--danger);
+    }
+    .notice.paused {
+      background: #fff7e6;
+      border: 1px solid #ffd591;
+      color: #ad6800;
     }
     .result-tools {
       align-items: end;
@@ -1136,6 +1302,30 @@ HTML_PAGE = r"""<!doctype html>
       font-size: 13px;
       gap: 24px;
     }
+    .dl-top-links .is-current {
+      color: #fff;
+      font-weight: 700;
+    }
+    .dl-top-links .is-reserved,
+    .dl-top-actions .is-reserved,
+    .help-links .is-reserved {
+      color: rgba(255,255,255,.34);
+      cursor: not-allowed;
+      display: inline-flex;
+      gap: 5px;
+      pointer-events: none;
+    }
+    .dl-top-links .is-reserved::after,
+    .dl-top-actions .is-reserved::after,
+    .help-links .is-reserved::after {
+      background: rgba(255,255,255,.1);
+      border-radius: 999px;
+      color: rgba(255,255,255,.5);
+      content: "预留";
+      font-size: 11px;
+      font-weight: 720;
+      padding: 1px 5px;
+    }
     .dl-top-actions {
       align-items: center;
       display: flex;
@@ -1143,6 +1333,9 @@ HTML_PAGE = r"""<!doctype html>
     }
     .dl-top-actions a {
       color: rgba(255,255,255,.82);
+      text-decoration: none;
+    }
+    .dl-top-actions span {
       text-decoration: none;
     }
     .dl-shell {
@@ -1190,6 +1383,16 @@ HTML_PAGE = r"""<!doctype html>
     .nav-item.active {
       background: #333333;
       color: #fff;
+    }
+    .nav-item.is-disabled {
+      color: rgba(255,255,255,.34);
+      cursor: not-allowed;
+      opacity: 1;
+      pointer-events: none;
+    }
+    .nav-item.is-disabled::after {
+      background: rgba(255,255,255,.1);
+      color: rgba(255,255,255,.48);
     }
     .nav-item.active::before {
       background: #00c84b;
@@ -1245,6 +1448,13 @@ HTML_PAGE = r"""<!doctype html>
       font-size: 13px;
       gap: 18px;
       height: 44px;
+    }
+    .help-links .is-reserved {
+      color: #b0b4bc;
+    }
+    .help-links .is-reserved::after {
+      background: #eef1f5;
+      color: #909399;
     }
     .tabs {
       display: none;
@@ -1589,6 +1799,19 @@ HTML_PAGE = r"""<!doctype html>
       .search-grid, .url-grid, .run-grid, .range-grid {
         grid-template-columns: 1fr;
       }
+      .category-cascade-grid {
+        grid-template-columns: 1fr;
+      }
+      .category-column {
+        border-bottom: 1px solid #ebeef5;
+        border-right: 0;
+      }
+      .category-column:last-child {
+        border-bottom: 0;
+      }
+      .category-column-list {
+        max-height: 240px;
+      }
       .filter-block .tag-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -1684,25 +1907,59 @@ HTML_PAGE = r"""<!doctype html>
     .category-picker.is-open {
       display: block;
     }
-    .category-group {
-      box-shadow: none;
-      margin-top: 6px;
+    .category-cascade {
+      gap: 10px;
     }
-    .category-primary {
-      min-height: 38px;
-      padding: 6px 8px;
+    .category-dict-card {
+      background: #fff;
+      border-color: #ebeef5;
+      border-radius: 4px;
+      padding: 12px 16px;
     }
-    .category-title strong {
+    .category-dict-card strong {
+      color: #303133;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .category-dict-card span {
+      color: #606266;
       font-size: 13px;
+    }
+    .category-cascade-grid {
+      border-color: #ebeef5;
+      grid-template-columns: minmax(200px, .9fr) minmax(240px, 1fr) minmax(300px, 1.25fr);
+      min-height: 318px;
+    }
+    .category-column-head {
+      background: #f5f7fa;
+      min-height: 38px;
+    }
+    .category-column-head strong {
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .category-column-list {
+      max-height: 380px;
+    }
+    .category-row {
+      grid-template-columns: 30px minmax(0, 1fr);
+      margin-bottom: 5px;
+      min-height: 38px;
+    }
+    .category-row-title {
+      font-size: 14px;
       font-weight: 600;
     }
-    .category-children {
-      padding: 6px 8px 8px;
+    .category-row-meta {
+      font-size: 12px;
     }
-    .category-secondary {
+    .category-row-button {
+      min-height: 36px;
+      padding: 6px 8px 6px 0;
+    }
+    .category-selected-bar {
       background: #fff;
-      margin-top: 4px;
-      padding: 6px;
+      border-color: #ebeef5;
     }
     .library-grid.search-grid,
     .library-grid.url-grid,
@@ -1943,16 +2200,16 @@ HTML_PAGE = r"""<!doctype html>
         <span>店雷达</span>
       </div>
       <div class="dl-top-links">
-        <span>首页</span>
-        <span>图搜</span>
-        <span>产品</span>
-        <span>1688选品</span>
-        <span>跨境选品</span>
-        <span>选品监控</span>
+        <span class="is-reserved" aria-disabled="true">首页</span>
+        <span class="is-reserved" aria-disabled="true">图搜</span>
+        <span class="is-reserved" aria-disabled="true">产品</span>
+        <span class="is-current" aria-current="page">1688选品</span>
+        <span class="is-reserved" aria-disabled="true">跨境选品</span>
+        <span class="is-reserved" aria-disabled="true">选品监控</span>
       </div>
       <div class="dl-top-actions">
-        <a href="#">购买续费</a>
-        <a href="#">登录/注册</a>
+        <span class="is-reserved" aria-disabled="true">购买续费</span>
+        <span class="is-reserved" aria-disabled="true">登录/注册</span>
       </div>
     </div>
   </header>
@@ -1960,27 +2217,27 @@ HTML_PAGE = r"""<!doctype html>
   <main class="dl-shell">
     <nav class="side-nav" aria-label="功能导航">
       <div class="nav-group-title">常用</div>
-      <a class="nav-item" href="#">工作台</a>
-      <a class="nav-item" href="#">铺货分销</a>
-      <a class="nav-item" href="#">图搜</a>
+      <span class="nav-item is-disabled" aria-disabled="true">工作台</span>
+      <span class="nav-item is-disabled" aria-disabled="true">铺货分销</span>
+      <span class="nav-item is-disabled" aria-disabled="true">图搜</span>
       <div class="nav-group-title">1688</div>
       <a class="nav-item active" href="#">1688选品库</a>
-      <a class="nav-item" href="#">1688AI新品</a>
-      <a class="nav-item" href="#">1688商品榜</a>
-      <a class="nav-item" href="#">个人选品池</a>
-      <a class="nav-item" href="#">供应商货源库</a>
-      <a class="nav-item" href="#">一手源头厂家</a>
+      <span class="nav-item is-disabled" aria-disabled="true">1688AI新品</span>
+      <span class="nav-item is-disabled" aria-disabled="true">1688商品榜</span>
+      <span class="nav-item is-disabled" aria-disabled="true">个人选品池</span>
+      <span class="nav-item is-disabled" aria-disabled="true">供应商货源库</span>
+      <span class="nav-item is-disabled" aria-disabled="true">一手源头厂家</span>
       <div class="nav-group-title">我的选品</div>
-      <a class="nav-item" href="#">监控搜索词</a>
-      <a class="nav-item" href="#">黑名单</a>
+      <span class="nav-item is-disabled" aria-disabled="true">监控搜索词</span>
+      <span class="nav-item is-disabled" aria-disabled="true">黑名单</span>
       <div class="nav-group-title">监控</div>
-      <a class="nav-item" href="#">我的监控</a>
-      <a class="nav-item" href="#">店铺分析</a>
-      <a class="nav-item" href="#">商品分析</a>
+      <span class="nav-item is-disabled" aria-disabled="true">我的监控</span>
+      <span class="nav-item is-disabled" aria-disabled="true">店铺分析</span>
+      <span class="nav-item is-disabled" aria-disabled="true">商品分析</span>
       <div class="nav-group-title">系统</div>
-      <a class="nav-item" href="#">会员</a>
-      <a class="nav-item" href="#">子账号</a>
-      <a class="nav-item" href="#">反馈</a>
+      <span class="nav-item is-disabled" aria-disabled="true">会员</span>
+      <span class="nav-item is-disabled" aria-disabled="true">子账号</span>
+      <span class="nav-item is-disabled" aria-disabled="true">反馈</span>
     </nav>
 
     <div class="workspace">
@@ -1988,9 +2245,9 @@ HTML_PAGE = r"""<!doctype html>
         <div class="page-head">
           <div class="page-tab-title">1688选品库</div>
           <div class="help-links">
-            <span>使用帮助</span>
-            <span>新手教程</span>
-            <span>在线翻译</span>
+            <span class="is-reserved" aria-disabled="true">使用帮助</span>
+            <span class="is-reserved" aria-disabled="true">新手教程</span>
+            <span class="is-reserved" aria-disabled="true">在线翻译</span>
           </div>
         </div>
         <div class="tabs">
@@ -2023,7 +2280,7 @@ HTML_PAGE = r"""<!doctype html>
                 <div class="template-inline">
                   <span class="inline-label">我的模板：</span>
                   <input id="templateName" type="text" placeholder="无数据" />
-                  <button id="saveTemplateBtn" class="secondary ghost" type="button">管理</button>
+                  <button id="saveTemplateBtn" class="secondary ghost" type="button" disabled title="模板管理接口预留">管理</button>
                 </div>
               </div>
               <div id="categoryPanel" class="category-picker">
@@ -2139,7 +2396,7 @@ HTML_PAGE = r"""<!doctype html>
           <div class="action-strip">
             <button id="runBtn" class="primary" type="button">开始查询</button>
             <button id="resetBtn" class="secondary" type="button">重置筛选</button>
-            <button id="saveFilterBtn" class="secondary ghost" type="button">保存筛选</button>
+            <button id="saveFilterBtn" class="secondary ghost" type="button" disabled title="筛选模板接口预留">保存筛选</button>
           </div>
 
           <div id="notice" class="notice"></div>
@@ -2168,10 +2425,10 @@ HTML_PAGE = r"""<!doctype html>
             <div class="result-actions">
               <label class="chip"><input id="selectAllRows" type="checkbox" />全选</label>
               <span id="selectedCount" class="selected-count">已选: 0</span>
-              <button id="followBtn" class="secondary ghost" type="button">关注商品</button>
+              <button id="followBtn" class="secondary ghost" type="button" disabled>关注商品</button>
               <a id="downloadLink" class="download" href="#" hidden>导出</a>
-              <button id="temuBtn" class="secondary ghost" type="button">铺货Temu</button>
-              <button id="dryRunBtn" class="secondary ghost" type="button">铺货 dry-run</button>
+              <button id="temuBtn" class="secondary ghost" type="button" disabled>铺货Temu</button>
+              <button id="dryRunBtn" class="secondary ghost" type="button" disabled>铺货 dry-run</button>
             </div>
             <div class="result-actions">
               <span class="selected-count">统计周期</span>
@@ -2264,6 +2521,8 @@ HTML_PAGE = r"""<!doctype html>
       filterResults: [],
       filterWarnings: [],
       selectedCategories: new Set(),
+      activeCategoryParent: "",
+      activeCategoryChild: "",
       selectedTags: new Set(),
       selectedLibrary: {},
       selectedRows: new Set(),
@@ -2300,10 +2559,10 @@ HTML_PAGE = r"""<!doctype html>
       }[char]));
     }
 
-    function showNotice(text, ok) {
+    function showNotice(text, ok, mode = "") {
       const node = $("notice");
       node.textContent = text;
-      node.className = `notice show ${ok ? "ok" : "fail"}`;
+      node.className = `notice show ${mode || (ok ? "ok" : "fail")}`;
     }
 
     function updateCategorySummary() {
@@ -2328,53 +2587,171 @@ HTML_PAGE = r"""<!doctype html>
       selectAll.indeterminate = !checked && visibleKeys.some(key => state.selectedRows.has(key));
     }
 
+    function categoryEntries(parent) {
+      const children = (state.options.category_tree || {})[parent];
+      return Array.isArray(children)
+        ? children.map(child => [child, []])
+        : Object.entries(children || {}).map(([child, grandchildren]) => [child, Array.isArray(grandchildren) ? grandchildren : []]);
+    }
+
+    function categorySelectedCount(parent, child = "") {
+      const prefix = child ? `${parent}>${child}` : parent;
+      return [...state.selectedCategories].filter(value => value === prefix || value.startsWith(`${prefix}>`)).length;
+    }
+
+    function ensureActiveCategory() {
+      const tree = state.options.category_tree || {};
+      const parents = Object.keys(tree);
+      if (!parents.length) {
+        state.activeCategoryParent = "";
+        state.activeCategoryChild = "";
+        return;
+      }
+      if (!state.activeCategoryParent || !tree[state.activeCategoryParent]) {
+        const firstSelected = [...state.selectedCategories][0] || "";
+        const selectedParent = firstSelected.split(">")[0];
+        state.activeCategoryParent = tree[selectedParent] ? selectedParent : parents[0];
+      }
+      const children = categoryEntries(state.activeCategoryParent);
+      const childNames = children.map(([child]) => child);
+      if (!state.activeCategoryChild || !childNames.includes(state.activeCategoryChild)) {
+        const firstSelectedChild = [...state.selectedCategories]
+          .map(value => value.split(">"))
+          .find(parts => parts[0] === state.activeCategoryParent && parts[1]);
+        state.activeCategoryChild = firstSelectedChild && childNames.includes(firstSelectedChild[1])
+          ? firstSelectedChild[1]
+          : (childNames[0] || "");
+      }
+    }
+
+    function categoryRowHtml({value, label, kind, meta = "", current = false, selected = false, checked = false, path = ""}) {
+      return `
+        <div class="category-row ${current ? "is-current" : ""} ${selected ? "is-selected" : ""}">
+          <label class="category-check" title="复选${esc(label)}">
+            <input type="checkbox" data-kind="category" value="${esc(value)}" ${checked ? "checked" : ""} />
+          </label>
+          <button class="category-row-button" type="button" data-category-nav="${esc(kind)}" data-category-path="${esc(path || value)}" title="${esc(path || value)}">
+            <span class="category-row-title">${esc(label)}</span>
+            ${meta ? `<span class="category-row-meta">${esc(meta)}</span>` : ""}
+          </button>
+        </div>
+      `;
+    }
+
     function renderCategories() {
       const wrap = $("categoryTree");
       const q = $("categorySearch").value.trim().toLowerCase();
-      const tree = state.options.category_tree;
+      const tree = state.options.category_tree || {};
       const dict = state.options.category_dictionary || {};
-      wrap.innerHTML = `<div class="record-item"><strong>类目字典 ${esc(dict.version || "-")}</strong><span>${esc(dict.source || "-")} · ${esc(dict.status || "-")}</span></div>` + Object.entries(tree).map(([parent, children]) => {
-        const entries = Array.isArray(children)
-          ? children.map(child => [child, []])
-          : Object.entries(children || {});
-        const filteredEntries = entries.map(([child, grandchildren]) => {
-          const grandList = Array.isArray(grandchildren) ? grandchildren : [];
-          const matchedGrandchildren = grandList.filter(grand => (`${parent} ${child} ${grand}`).toLowerCase().includes(q));
-          const childMatches = (`${parent} ${child}`).toLowerCase().includes(q);
-          if (q && !childMatches && matchedGrandchildren.length === 0) return null;
-          return [child, q && !childMatches ? matchedGrandchildren : grandList];
-        }).filter(Boolean);
-        if (q && !parent.toLowerCase().includes(q) && filteredEntries.length === 0) return "";
-        const childHtml = filteredEntries.map(([child, grandchildren]) => {
-          const childValue = `${parent}>${child}`;
-          const grandHtml = (grandchildren || []).map(grand => chipHtml(`${parent}>${child}>${grand}`, grand, "category")).join("");
-          return `
-            <div class="category-secondary">
-              ${chipHtml(childValue, child, "category")}
-              ${grandchildren && grandchildren.length ? `<div class="tier-label">三级筛选</div><div class="tag-grid">${grandHtml}</div>` : ""}
+      ensureActiveCategory();
+
+      const parents = Object.keys(tree);
+      const allMatches = [];
+      for (const parent of parents) {
+        const entries = categoryEntries(parent);
+        const parentMatches = !q || parent.toLowerCase().includes(q);
+        const matchedChildren = [];
+        for (const [child, grandchildren] of entries) {
+          const childMatches = !q || `${parent} ${child}`.toLowerCase().includes(q);
+          const matchedGrandchildren = grandchildren.filter(grand => !q || `${parent} ${child} ${grand}`.toLowerCase().includes(q));
+          if (parentMatches || childMatches || matchedGrandchildren.length) {
+            matchedChildren.push([child, q && !parentMatches && !childMatches ? matchedGrandchildren : grandchildren]);
+          }
+        }
+        if (parentMatches || matchedChildren.length) {
+          allMatches.push([parent, matchedChildren.length ? matchedChildren : entries]);
+        }
+      }
+
+      const visibleParents = q ? allMatches.map(([parent]) => parent) : parents;
+      if (q && visibleParents.length && !visibleParents.includes(state.activeCategoryParent)) {
+        state.activeCategoryParent = visibleParents[0];
+        state.activeCategoryChild = "";
+      }
+      const activeEntries = q
+        ? (allMatches.find(([parent]) => parent === state.activeCategoryParent)?.[1] || [])
+        : categoryEntries(state.activeCategoryParent);
+      if (!state.activeCategoryChild || !activeEntries.some(([child]) => child === state.activeCategoryChild)) {
+        state.activeCategoryChild = activeEntries[0]?.[0] || "";
+      }
+      const activeGrandchildren = activeEntries.find(([child]) => child === state.activeCategoryChild)?.[1] || [];
+
+      const parentHtml = visibleParents.map(parent => {
+        const entries = categoryEntries(parent);
+        const selectedCount = categorySelectedCount(parent);
+        return categoryRowHtml({
+          value: parent,
+          label: parent,
+          kind: "parent",
+          path: parent,
+          meta: selectedCount ? `已选 ${selectedCount}` : `${entries.length} 个二级`,
+          current: parent === state.activeCategoryParent,
+          selected: state.selectedCategories.has(parent) || selectedCount > 0,
+          checked: state.selectedCategories.has(parent)
+        });
+      }).join("");
+
+      const childHtml = activeEntries.map(([child, grandchildren]) => {
+        const value = `${state.activeCategoryParent}>${child}`;
+        const selectedCount = categorySelectedCount(state.activeCategoryParent, child);
+        return categoryRowHtml({
+          value,
+          label: child,
+          kind: "child",
+          path: value,
+          meta: selectedCount ? `已选 ${selectedCount}` : `${grandchildren.length} 个三级`,
+          current: child === state.activeCategoryChild,
+          selected: state.selectedCategories.has(value) || selectedCount > 0,
+          checked: state.selectedCategories.has(value)
+        });
+      }).join("");
+
+      const grandHtml = activeGrandchildren.map(grand => {
+        const value = `${state.activeCategoryParent}>${state.activeCategoryChild}>${grand}`;
+        return categoryRowHtml({
+          value,
+          label: grand,
+          kind: "grand",
+          path: value,
+          meta: "完整路径",
+          selected: state.selectedCategories.has(value),
+          checked: state.selectedCategories.has(value)
+        });
+      }).join("");
+
+      const selectedHtml = [...state.selectedCategories].map(value => `
+        <span class="category-selected-chip" title="${esc(value)}">
+          ${esc(value)}
+          <button type="button" data-category-remove="${esc(value)}" aria-label="移除 ${esc(value)}">×</button>
+        </span>
+      `).join("");
+
+      wrap.innerHTML = `
+        <div class="category-cascade">
+          <div class="category-dict-card">
+            <strong>类目字典 ${esc(dict.version || "-")}</strong>
+            <span>${esc(dict.source || "-")} · ${esc(dict.status || "-")}</span>
+          </div>
+          <div class="category-cascade-grid">
+            <div class="category-column">
+              <div class="category-column-head"><strong>一级类目</strong><span>${visibleParents.length}/${parents.length}</span></div>
+              <div class="category-column-list">${parentHtml || `<div class="category-empty">没有匹配的一级类目</div>`}</div>
             </div>
-          `;
-        }).join("");
-        const selectedChildren = entries.filter(([child]) => state.selectedCategories.has(`${parent}>${child}`)).length
-          + entries.reduce((sum, [child, grandchildren]) => sum + (grandchildren || []).filter(grand => state.selectedCategories.has(`${parent}>${child}>${grand}`)).length, 0);
-        const active = state.selectedCategories.has(parent) || selectedChildren > 0;
-        return `
-          <div class="category-group ${active ? "is-active" : ""}">
-            <label class="category-primary">
-              <input type="checkbox" data-kind="category" value="${esc(parent)}" ${state.selectedCategories.has(parent) ? "checked" : ""} />
-              <span class="category-title">
-                <span class="tier-label">一级筛选</span>
-                <strong>${esc(parent)}</strong>
-              </span>
-              <span class="category-count">${selectedChildren ? `${selectedChildren}/` : ""}${entries.length} 个二级</span>
-            </label>
-            <div class="category-children">
-              <div class="tier-label">二级筛选</div>
-              ${childHtml}
+            <div class="category-column">
+              <div class="category-column-head"><strong>二级类目</strong><span>${esc(state.activeCategoryParent || "请选择一级")}</span></div>
+              <div class="category-column-list">${childHtml || `<div class="category-empty">先选择左侧一级类目</div>`}</div>
+            </div>
+            <div class="category-column">
+              <div class="category-column-head"><strong>三级类目</strong><span>${esc(state.activeCategoryChild || "请选择二级")}</span></div>
+              <div class="category-column-list">${grandHtml || `<div class="category-empty">当前二级暂无三级类目</div>`}</div>
             </div>
           </div>
-        `;
-      }).join("");
+          <div class="category-selected-bar">
+            <div class="category-selected-title">已选类目</div>
+            <div class="category-selected-list">${selectedHtml || `<span class="category-empty-selection">未选择时默认全部类目</span>`}</div>
+          </div>
+        </div>
+      `;
       updateCategorySummary();
     }
 
@@ -2732,7 +3109,11 @@ HTML_PAGE = r"""<!doctype html>
         const result = await response.json();
         if (!result.success) {
           clearRunState();
-          showNotice(result.markdown || "采集失败", false);
+          if (result.data && result.data.error_code === "security_verification_required") {
+            showNotice(`${result.markdown || "1688 风控已暂停采集"} ${result.data.suggestion || "请人工处理后再继续。"}`, false, "paused");
+          } else {
+            showNotice(result.markdown || "采集失败", false);
+          }
           return;
         }
         state.selectedRows.clear();
@@ -2809,6 +3190,11 @@ HTML_PAGE = r"""<!doctype html>
       if (!target.matches("input[type='checkbox'][data-kind]")) return;
       const set = target.dataset.kind === "category" ? state.selectedCategories : state.selectedTags;
       target.checked ? set.add(target.value) : set.delete(target.value);
+      if (target.dataset.kind === "category") {
+        const parts = target.value.split(">");
+        if (parts[0]) state.activeCategoryParent = parts[0];
+        if (parts[1]) state.activeCategoryChild = parts[1];
+      }
       target.dataset.kind === "category" ? renderCategories() : renderFilterGroups();
     });
 
@@ -2822,6 +3208,27 @@ HTML_PAGE = r"""<!doctype html>
     document.addEventListener("click", (event) => {
       const tab = event.target.closest(".tab");
       if (tab) setTab(tab.dataset.tab);
+    });
+
+    document.addEventListener("click", (event) => {
+      const remove = event.target.closest("[data-category-remove]");
+      if (remove) {
+        state.selectedCategories.delete(remove.dataset.categoryRemove);
+        renderCategories();
+        return;
+      }
+      const nav = event.target.closest("[data-category-nav]");
+      if (!nav) return;
+      const parts = (nav.dataset.categoryPath || "").split(">");
+      if (nav.dataset.categoryNav === "parent" && parts[0]) {
+        state.activeCategoryParent = parts[0];
+        state.activeCategoryChild = "";
+      }
+      if ((nav.dataset.categoryNav === "child" || nav.dataset.categoryNav === "grand") && parts[0]) {
+        state.activeCategoryParent = parts[0];
+        state.activeCategoryChild = parts[1] || "";
+      }
+      renderCategories();
     });
 
     ["titleFilter", "minScore", "levelFilter", "verificationFilter", "suggestFilter"].forEach(id => {
@@ -2841,10 +3248,14 @@ HTML_PAGE = r"""<!doctype html>
     });
     $("clearCategories").addEventListener("click", () => {
       state.selectedCategories.clear();
+      state.activeCategoryParent = "";
+      state.activeCategoryChild = "";
       renderCategories();
     });
     $("resetBtn").addEventListener("click", () => {
       state.selectedCategories.clear();
+      state.activeCategoryParent = "";
+      state.activeCategoryChild = "";
       state.selectedTags.clear();
       state.selectedLibrary = {};
       state.selectedRows.clear();
@@ -2878,7 +3289,7 @@ HTML_PAGE = r"""<!doctype html>
     $("statPeriod").addEventListener("change", (event) => {
       $("periodView").value = event.target.value;
     });
-    ["saveTemplateBtn", "saveFilterBtn", "followBtn", "temuBtn", "dryRunBtn"].forEach(id => {
+    ["saveTemplateBtn", "saveFilterBtn"].forEach(id => {
       $(id).addEventListener("click", () => {
         showNotice("该功能接口已预留，当前版本不会伪造执行结果。", false);
       });

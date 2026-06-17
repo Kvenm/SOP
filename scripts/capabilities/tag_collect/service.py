@@ -51,6 +51,8 @@ VERIFICATION_STATUS_SAMPLE = "sample_verified"
 VERIFICATION_STATUS_VERIFIED = "verified"
 VERIFICATION_STATUS_PARTIAL = "partial_verified"
 VERIFICATION_STATUS_FAILED = "failed"
+SECURITY_BLOCK_CODE = "security_verification_required"
+LOGIN_REQUIRED_CODE = "login_required"
 
 REFERENCE_EXPORT_LABELS = [
     "序号",
@@ -1751,10 +1753,10 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
 def friendly_collect_error(error: Exception) -> str:
     """把 RPA/真实采集底层异常转成运营可理解的提示。"""
     message = str(error)
-    if "security_verification_required:" in message:
-        return message.split("security_verification_required:", 1)[1].strip()
-    if "login_required:" in message:
-        return message.split("login_required:", 1)[1].strip()
+    if f"{SECURITY_BLOCK_CODE}:" in message:
+        return message.split(f"{SECURITY_BLOCK_CODE}:", 1)[1].strip()
+    if f"{LOGIN_REQUIRED_CODE}:" in message:
+        return message.split(f"{LOGIN_REQUIRED_CODE}:", 1)[1].strip()
     if "browser_closed:" in message:
         return message.split("browser_closed:", 1)[1].strip()
     if any(term in message for term in ("拖动下方滑块", "验证失败", "点击框体重试", "error:2eDumg", "安全滑块", "验证码")):
@@ -1771,6 +1773,41 @@ def friendly_collect_error(error: Exception) -> str:
     if "真实页面 RPA 返回格式异常" in message:
         return "真实页面 RPA 返回异常，未生成任何数据。请重试一次；如果仍失败，优先使用 1688 页面 URL 模式测试真实页面解析。"
     return message
+
+
+def collect_error_state(error: Exception) -> Dict[str, Any]:
+    """返回 Web 可识别的采集阻断状态，风控/登录场景不进入普通失败重试。"""
+    message = str(error)
+    friendly = friendly_collect_error(error)
+    if f"{SECURITY_BLOCK_CODE}:" in message or any(
+        term in message
+        for term in ("拖动下方滑块", "验证失败", "点击框体重试", "error:", "安全滑块", "验证码", "访问被拒绝", "访问受限")
+    ):
+        return {
+            "code": SECURITY_BLOCK_CODE,
+            "action": "manual_handoff",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "已暂停真实采集。请停止反复刷新 1688，由人工在正常浏览器中完成登录/验证；"
+                "验证恢复后，可粘贴已打开的搜索页/商品详情页 URL，或使用已登录 Chrome CDP 会话继续。"
+            ),
+        }
+    if f"{LOGIN_REQUIRED_CODE}:" in message:
+        return {
+            "code": LOGIN_REQUIRED_CODE,
+            "action": "manual_login",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": "请人工扫码登录并确认页面能正常访问后，再从 URL 或已登录浏览器会话继续采集。",
+        }
+    return {
+        "code": "collect_failed",
+        "action": "review_error",
+        "retryable": True,
+        "message": friendly,
+        "suggestion": "请检查筛选条件、URL 或采集来源后再重试。",
+    }
 
 
 def _excluded_by_tags(row: Dict[str, Any], exclude_tags: List[str]) -> bool:
