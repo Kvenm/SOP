@@ -33,6 +33,48 @@ const profileDir = process.env.TAG_COLLECT_RPA_PROFILE
 const headless = process.env.TAG_COLLECT_RPA_HEADLESS === "1";
 const loginWaitMs = Number(process.env.TAG_COLLECT_RPA_LOGIN_WAIT_MS || 90000);
 const cdpUrl = process.env.TAG_COLLECT_CDP_URL || "";
+const pacingMode = String(process.env.TAG_COLLECT_RPA_PACING || "human").toLowerCase();
+const pacingProfiles = {
+  fast: {
+    afterGoto: [1800, 3200],
+    beforeFilterClick: [500, 1200],
+    afterFilterClick: [1600, 2800],
+    beforeScroll: [1400, 2600],
+    scrollStep: [650, 1500],
+    beforeExtract: [1800, 3200],
+  },
+  human: {
+    afterGoto: [4500, 8500],
+    beforeFilterClick: [1400, 3600],
+    afterFilterClick: [3000, 6500],
+    beforeScroll: [2500, 5200],
+    scrollStep: [1200, 3200],
+    beforeExtract: [3500, 7000],
+  },
+};
+const pacing = pacingProfiles[pacingMode] || pacingProfiles.human;
+
+function jitter([min, max]) {
+  const low = Math.max(0, Number(min) || 0);
+  const high = Math.max(low, Number(max) || low);
+  return Math.round(low + Math.random() * (high - low));
+}
+
+async function humanPause(page, range) {
+  await page.waitForTimeout(jitter(range));
+}
+
+async function humanScroll(page) {
+  await humanPause(page, pacing.beforeScroll);
+  const steps = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < steps; i += 1) {
+    await page.evaluate(() => {
+      const distance = Math.floor(window.innerHeight * (0.45 + Math.random() * 0.45));
+      window.scrollBy({ top: distance, left: 0, behavior: "smooth" });
+    }).catch(() => {});
+    await humanPause(page, pacing.scrollStep);
+  }
+}
 
 function looksLikeBlockedPage(text, url) {
   const compact = String(text || "").replace(/\s+/g, "");
@@ -123,6 +165,9 @@ async function applyNativeFilters(page, filters, query) {
   for (const filter of filters) {
     const label = String(filter.label || filter.tag || filter.key || "").trim();
     const texts = Array.isArray(filter.texts) && filter.texts.length ? filter.texts : [label];
+    const mode = String(filter.mode || "").trim();
+    const groupLabel = String(filter.group_label || "").trim();
+    const optionValue = String(filter.value || filter.tag || "").trim();
     const base = {
       filter_key: String(filter.key || label),
       tag: String(filter.tag || label),
@@ -140,7 +185,8 @@ async function applyNativeFilters(page, filters, query) {
       });
       continue;
     }
-    const applied = await page.evaluate((candidateTexts) => {
+    await humanPause(page, pacing.beforeFilterClick);
+    const applied = await page.evaluate(({ candidateTexts, mode, groupLabel, optionValue }) => {
       const compact = (value) => String(value || "").replace(/\s+/g, "").trim();
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -148,6 +194,46 @@ async function applyNativeFilters(page, filters, query) {
         return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
       };
       const nodes = Array.from(document.querySelectorAll("a, button, label, span, div, li"));
+      if (mode === "dropdown_option" && groupLabel && optionValue) {
+        const groupNeedle = compact(groupLabel);
+        const optionNeedle = compact(optionValue);
+        const filterRootFor = (node) => {
+          let current = node;
+          for (let depth = 0; current && depth < 6; depth += 1) {
+            const text = compact(current.innerText || current.textContent || "");
+            const className = String(current.className || "");
+            const role = String(current.getAttribute && current.getAttribute("role") || "");
+            if (
+              /filter|筛选|condition|dropdown|search|offer/.test(className)
+              || role === "listbox"
+              || (text.includes(groupNeedle) && text.length < 600)
+            ) {
+              return current;
+            }
+            current = current.parentElement;
+          }
+          return node.parentElement || document.body;
+        };
+        const groupNode = nodes.find((node) => {
+          if (!visible(node)) return false;
+          const text = compact(node.innerText || node.textContent || "");
+          return text.includes(groupNeedle) && text.length < 120;
+        });
+        if (groupNode) {
+          const groupClickable = groupNode.closest("a, button, label, li, [role='button'], [class*='filter'], [class*='dropdown']") || groupNode;
+          groupClickable.scrollIntoView({ block: "center", inline: "center" });
+          groupClickable.click();
+        }
+        const searchRoot = groupNode ? filterRootFor(groupNode) : document.body;
+        const optionNodes = Array.from(searchRoot.querySelectorAll("a, button, label, span, div, li"));
+        const optionNode = optionNodes.find((node) => visible(node) && compact(node.innerText || node.textContent || "").includes(optionNeedle));
+        if (optionNode) {
+          const optionClickable = optionNode.closest("a, button, label, li, [role='button'], [class*='filter'], [class*='checkbox'], [class*='dropdown']") || optionNode;
+          optionClickable.scrollIntoView({ block: "center", inline: "center" });
+          optionClickable.click();
+          return { ok: true, matched_text: compact(optionNode.innerText || optionNode.textContent || "").slice(0, 80) };
+        }
+      }
       for (const text of candidateTexts) {
         const needle = compact(text);
         if (!needle) continue;
@@ -163,10 +249,10 @@ async function applyNativeFilters(page, filters, query) {
         }
       }
       return { ok: false, matched_text: "" };
-    }, texts).catch((error) => ({ ok: false, error: error.message || String(error), matched_text: "" }));
+    }, { candidateTexts: texts, mode, groupLabel, optionValue }).catch((error) => ({ ok: false, error: error.message || String(error), matched_text: "" }));
 
     if (applied.ok) {
-      await page.waitForTimeout(1200);
+      await humanPause(page, pacing.afterFilterClick);
       results.push({
         ...base,
         page_url: page.url(),
@@ -192,7 +278,7 @@ page.setDefaultTimeout(45000);
 try {
   const url = sourceUrl || `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(query)}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(3000);
+  await humanPause(page, pacing.afterGoto);
 
   const pageText = await readBodyText(page);
   const needsManualGate = looksLikeSecurityPage(pageText, page.url()) || looksLikeLoginPage(pageText, page.url());
@@ -201,11 +287,11 @@ try {
   }
   await failIfStillBlocked(page, query, sourceUrl, needsManualGate && loginWaitMs > 0 && !headless);
 
-  await page.waitForTimeout(2500);
+  await humanPause(page, pacing.beforeExtract);
   const filterResults = await applyNativeFilters(page, nativeFilters, query);
   await failIfStillBlocked(page, query, sourceUrl, false);
-  await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))).catch(() => {});
-  await page.waitForTimeout(1500);
+  await humanScroll(page);
+  await humanPause(page, pacing.beforeExtract);
   const products = await page.evaluate((maxItems) => {
     const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
     const pageUrl = location.href;

@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--max-items-per-query", type=int, default=20, help="每个查询词最多采集商品数")
     parser.add_argument("--output-format", choices=["xlsx", "csv"], default="xlsx", help="导出格式")
     parser.add_argument("--collect-source", choices=["rpa", "api"], default="rpa", help="真实采集来源：rpa=打开真实1688页面；api=AK接口")
+    parser.add_argument("--auto-verify-details", action="store_true", help="采集后自动进入详情页核验高潜商品关键字段")
+    parser.add_argument("--auto-verify-max-items", type=int, default=3, help="自动详情核验商品上限，默认 3")
     parser.add_argument("--sample-data", action="store_true", help="使用内置样例数据，不调用 1688 接口")
     parser.add_argument("--serve", action="store_true", help="启动本地 Web 筛选测试工作台")
     parser.add_argument("--host", default="127.0.0.1", help="Web 工作台监听地址")
@@ -61,6 +63,8 @@ def main():
             sample_data=args.sample_data,
             output_format=args.output_format,
             collect_source=args.collect_source,
+            auto_verify_details=args.auto_verify_details,
+            auto_verify_max_items=args.auto_verify_max_items,
         )
         result = run_tag_collect(config)
         print_output(result["success"], result["markdown"], result["data"])

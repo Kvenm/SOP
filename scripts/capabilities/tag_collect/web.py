@@ -165,12 +165,15 @@ class TagCollectHandler(BaseHTTPRequestHandler):
         if isinstance(payload.get("sample_data"), str):
             sample_data = payload.get("sample_data", "").lower() in ("1", "true", "yes", "on")
         collect_source = str(payload.get("collect_source") or "rpa").lower()
+        auto_verify_details = bool(payload.get("auto_verify_details", False))
+        if isinstance(payload.get("auto_verify_details"), str):
+            auto_verify_details = payload.get("auto_verify_details", "").lower() in ("1", "true", "yes", "on")
 
         if not sample_data:
             if not ALLOW_REAL_COLLECT:
                 self._send_json(200, {
                     "success": False,
-                    "markdown": "当前 Web 工作台未开启真实采集。请重新用默认真实模式启动，或仅在开发时切回样例数据模式。",
+                    "markdown": "当前 Web 工作台未开启真实采集。正式测试请在运行服务的本机打开 127.0.0.1 后再执行真实采集。",
                     "data": {"run_id": "", "row_count": 0, "rows": []},
                 })
                 return
@@ -196,6 +199,8 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 output_format=str(payload.get("output_format") or "xlsx"),
                 collect_source=collect_source,
                 library_filters=payload.get("library_filters") or {},
+                auto_verify_details=auto_verify_details,
+                auto_verify_max_items=int(payload.get("auto_verify_max_items") or 3),
             )
             result = run_tag_collect(config)
             data = dict(result["data"])
@@ -246,7 +251,7 @@ def serve_tag_collect_workbench(host: str = "127.0.0.1", port: int = 8765, allow
     if ALLOW_REAL_COLLECT:
         print("真实页面采集已开启；默认通过 Playwright/RPA 打开 1688 页面采集真实数据。")
     else:
-        print("真实采集未开启；仅用于开发样例模式。")
+        print("真实采集未开启；当前环境只允许查看页面，不执行真实采集。")
     print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()
@@ -928,7 +933,7 @@ HTML_PAGE = r"""<!doctype html>
       margin-top: 10px;
     }
     .run-grid {
-      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      grid-template-columns: repeat(8, minmax(110px, 1fr));
     }
     .filter-grid-wide {
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1058,7 +1063,7 @@ HTML_PAGE = r"""<!doctype html>
       border-radius: 4px;
       display: grid;
       gap: 10px;
-      grid-template-columns: repeat(3, minmax(110px, 1fr)) auto;
+      grid-template-columns: repeat(4, minmax(110px, 1fr)) auto;
       margin-bottom: 12px;
       padding: 10px;
     }
@@ -1071,6 +1076,33 @@ HTML_PAGE = r"""<!doctype html>
     .verification-strip strong {
       font-size: 17px;
       font-weight: 760;
+    }
+    .automation-message {
+      background: #f8fafc;
+      border: 1px solid var(--line-soft);
+      border-radius: 4px;
+      color: var(--muted);
+      display: none;
+      font-size: 13px;
+      line-height: 1.5;
+      margin: -4px 0 12px;
+      padding: 9px 10px;
+    }
+    .automation-message.show { display: block; }
+    .automation-message.paused {
+      background: #fff7e6;
+      border-color: #ffd591;
+      color: #ad6800;
+    }
+    .automation-message.partial {
+      background: #fff2e8;
+      border-color: #ffd6ba;
+      color: #b45309;
+    }
+    .automation-message.failed {
+      background: #fff0f0;
+      border-color: #ffc9c9;
+      color: var(--danger);
     }
     .table-wrap {
       border: 1px solid var(--line);
@@ -2190,6 +2222,491 @@ HTML_PAGE = r"""<!doctype html>
         width: 72px;
       }
     }
+    /* Workbench acceptance overrides: clearer flow, denser filters, safer defaults. */
+    body {
+      padding-bottom: 82px;
+    }
+    .task-flow-card {
+      background: #ffffff;
+      border: 1px solid #dfe6ef;
+      border-radius: 6px;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, .06);
+      margin: 0 0 12px;
+      padding: 12px 14px;
+      position: sticky;
+      top: 58px;
+      z-index: 35;
+    }
+    .task-steps {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      margin-bottom: 10px;
+    }
+    .task-step {
+      align-items: center;
+      background: #f7f9fc;
+      border: 1px solid #e5ebf3;
+      border-radius: 4px;
+      color: #606266;
+      display: flex;
+      font-size: 12px;
+      font-weight: 700;
+      justify-content: center;
+      min-height: 30px;
+      padding: 0 8px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .task-step.is-active {
+      background: #ecfdf3;
+      border-color: #95d9b0;
+      color: #087b35;
+    }
+    .selected-summary {
+      background: #f8fafc;
+      border: 1px solid #e7edf5;
+      border-radius: 4px;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      padding: 10px;
+    }
+    .selected-summary-item {
+      border-right: 1px solid #e2e8f0;
+      min-width: 0;
+      padding-right: 10px;
+    }
+    .selected-summary-item:last-child {
+      border-right: 0;
+    }
+    .selected-summary-item span {
+      color: #7a8491;
+      display: block;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+    .selected-summary-item strong {
+      color: #1f2937;
+      display: block;
+      font-size: 16px;
+      line-height: 1.25;
+      margin-top: 2px;
+    }
+    .selected-summary-item em {
+      color: #606266;
+      display: block;
+      font-size: 12px;
+      font-style: normal;
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .filter-anchor-bar {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: space-between;
+      margin-top: 10px;
+    }
+    .filter-anchor-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .filter-anchor-actions button {
+      background: #ffffff;
+      border: 1px solid #dcdfe6;
+      border-radius: 4px;
+      color: #3f4854;
+      font-size: 12px;
+      min-height: 28px;
+      padding: 0 10px;
+    }
+    .filter-anchor-actions button:hover {
+      border-color: #409eff;
+      color: #1677d2;
+    }
+    .review-mode-toggle {
+      align-items: center;
+      background: #ffffff;
+      border: 1px solid #e4e7ed;
+      border-radius: 4px;
+      color: #303133;
+      display: inline-flex;
+      font-size: 12px;
+      gap: 7px;
+      margin: 0;
+      min-height: 28px;
+      padding: 0 10px;
+      white-space: nowrap;
+    }
+    .review-mode-toggle {
+      display: none;
+    }
+    body.review-mode .review-mode-toggle {
+      display: inline-flex;
+    }
+    .review-mode-toggle input {
+      accent-color: #409eff;
+      margin: 0;
+    }
+    .review-mode-toggle span {
+      color: #909399;
+    }
+    .detail-warning {
+      background: #fff7ed;
+      border: 1px solid #fed7aa;
+      border-radius: 4px;
+      color: #9a3412;
+      font-size: 13px;
+      line-height: 1.5;
+      margin-top: 10px;
+      padding: 8px 10px;
+    }
+    .detail-warning[hidden] {
+      display: none;
+    }
+    #task {
+      padding-top: 14px;
+    }
+    .filter-panel {
+      border-radius: 6px;
+    }
+    .filter-row,
+    .library-section {
+      grid-template-columns: 132px minmax(0, 1fr);
+      padding: 14px 0;
+    }
+    .row-label,
+    .library-section-head {
+      border-left: 3px solid transparent;
+      color: #1f2937;
+      font-size: 14px;
+      min-height: 34px;
+      padding-left: 10px;
+      padding-top: 7px;
+    }
+    .filter-row:hover .row-label,
+    .library-section:hover .library-section-head {
+      border-left-color: #00c84b;
+    }
+    .section-control,
+    .row-control {
+      padding-right: 12px;
+    }
+    .library-filter-card {
+      background: #fbfcfe;
+      border: 1px solid #e7edf5;
+      border-radius: 4px;
+      min-height: 36px;
+      padding: 8px 10px;
+    }
+    .filter-block.library-filter-card {
+      align-items: flex-start;
+      gap: 8px 12px;
+    }
+    .range-field.library-filter-card {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .range-field.library-filter-card label {
+      align-items: center;
+      color: #303133;
+      display: flex;
+      font-weight: 700;
+      gap: 6px;
+    }
+    .boolean-field.library-filter-card,
+    .text-field.library-filter-card,
+    .select-field.library-filter-card {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .boolean-field .chip {
+      padding-right: 0;
+    }
+    .filter-block-head strong {
+      align-items: center;
+      color: #303133;
+      display: flex;
+      font-weight: 700;
+      gap: 6px;
+    }
+    .filter-block-head .mapping-label {
+      background: #edf2f7;
+      border-radius: 999px;
+      color: #64748b;
+      display: none;
+      font-size: 11px;
+      margin-left: 4px;
+      padding: 2px 7px;
+    }
+    body.review-mode .filter-block-head .mapping-label {
+      display: inline-flex;
+    }
+    .field-hint {
+      color: #7a8491;
+      display: none;
+      flex: 1 0 100%;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    body.review-mode .field-hint {
+      display: block;
+    }
+    .is-detail-filter {
+      background: #fffaf0;
+      border-color: #f6c56f;
+    }
+    .is-partial-filter {
+      background: #f7fbff;
+      border-color: #b7dcff;
+    }
+    .is-reserved-filter {
+      display: none !important;
+    }
+    body.review-mode .is-reserved-filter {
+      display: flex !important;
+      opacity: .72;
+    }
+    body.review-mode .field-status,
+    .field-status.detail_required,
+    .field-status.partial_supported {
+      align-items: center;
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 4px 7px;
+    }
+    body.review-mode .field-status.supported {
+      display: inline-flex;
+    }
+    body.review-mode .field-status.reserved {
+      display: inline-flex;
+    }
+    .developer-only {
+      display: none !important;
+    }
+    body.review-mode .developer-only {
+      display: block !important;
+    }
+    body.review-mode .developer-only.coverage-strip {
+      display: grid !important;
+    }
+    body.review-mode .developer-only.record-list {
+      display: grid !important;
+    }
+    .chip {
+      border: 1px solid transparent;
+      border-radius: 4px;
+      min-height: 30px;
+      padding: 4px 9px;
+    }
+    .chip:hover {
+      background: #f4f8ff;
+      border-color: #b9d8ff;
+    }
+    .chip:has(input:checked) {
+      background: #ecf5ff;
+      border-color: #409eff;
+      color: #1677d2;
+      font-weight: 700;
+    }
+    .action-strip {
+      background: #fff;
+      position: sticky;
+      bottom: 72px;
+      z-index: 20;
+    }
+    .sticky-action-bar {
+      align-items: center;
+      background: rgba(255, 255, 255, .97);
+      border: 1px solid #d8e2ef;
+      border-radius: 6px;
+      bottom: 12px;
+      box-shadow: 0 12px 34px rgba(15, 23, 42, .16);
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(180px, 1fr) auto auto auto;
+      left: 205px;
+      padding: 10px 12px;
+      position: fixed;
+      right: 18px;
+      z-index: 80;
+    }
+    .sticky-action-meta {
+      min-width: 0;
+    }
+    .sticky-action-meta strong {
+      color: #1f2937;
+      display: block;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+    .sticky-action-meta span {
+      color: #7a8491;
+      display: block;
+      font-size: 12px;
+      margin-top: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .sticky-action-bar .download[hidden] {
+      display: none;
+    }
+    .empty-result-card {
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 6px;
+      color: #64748b;
+      font-size: 13px;
+      line-height: 1.6;
+      margin: 12px 0;
+      padding: 14px;
+    }
+    .empty-result-card[hidden] {
+      display: none;
+    }
+    .reserved-inline {
+      opacity: .62;
+    }
+    .reserved-inline label::after {
+      color: #909399;
+      content: " · 仅记录";
+      font-size: 12px;
+      font-weight: 400;
+    }
+    @media (max-width: 900px) {
+      .task-flow-card {
+        position: static;
+      }
+      .task-steps,
+      .selected-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .selected-summary-item:nth-child(2) {
+        border-right: 0;
+      }
+      .sticky-action-bar {
+        left: 12px;
+        right: 12px;
+      }
+    }
+    @media (max-width: 700px) {
+      body {
+        padding-bottom: 128px;
+      }
+      header.dl-topbar {
+        height: auto;
+        min-height: 46px;
+      }
+      main.dl-shell {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+      .dl-shell .side-nav {
+        display: flex;
+        gap: 4px;
+        height: auto;
+        max-height: none;
+        overflow-x: auto;
+        padding: 8px;
+        position: static;
+        top: auto;
+        width: auto;
+      }
+      .side-nav .nav-group-title {
+        display: none;
+      }
+      .side-nav .nav-item {
+        border-radius: 4px;
+        flex: 0 0 auto;
+        min-height: 30px;
+        padding: 6px 10px;
+        white-space: nowrap;
+      }
+      .side-nav .nav-item.active::before {
+        display: none;
+      }
+      .workspace {
+        padding: 10px 8px 22px;
+      }
+      #task,
+      #results {
+        padding-left: 10px;
+        padding-right: 10px;
+      }
+      .task-steps,
+      .selected-summary {
+        grid-template-columns: 1fr;
+      }
+      .selected-summary-item {
+        border-bottom: 1px solid #e2e8f0;
+        border-right: 0;
+        padding-bottom: 8px;
+      }
+      .selected-summary-item:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+      .filter-anchor-bar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .filter-row,
+      .library-section {
+        gap: 6px;
+        grid-template-columns: 1fr;
+      }
+      .row-label,
+      .library-section-head {
+        border-left-color: #00c84b;
+        padding-left: 8px;
+        white-space: normal;
+      }
+      .section-control,
+      .row-control {
+        padding-left: 8px;
+        padding-right: 8px;
+      }
+      .category-tools,
+      .category-cascade-grid {
+        grid-template-columns: 1fr;
+      }
+      .category-cascade-grid {
+        min-height: 0;
+      }
+      .category-column-list {
+        max-height: 220px;
+      }
+      .search-grid > div,
+      .run-grid > div,
+      .url-grid > div,
+      .search-grid > div:first-child,
+      .search-grid > div:nth-child(3) {
+        flex: 1 1 100%;
+      }
+      .sticky-action-bar {
+        bottom: 8px;
+        grid-template-columns: 1fr 1fr;
+      }
+      .sticky-action-meta {
+        grid-column: 1 / -1;
+      }
+      .sticky-action-bar button,
+      .sticky-action-bar .download {
+        justify-content: center;
+        width: 100%;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2253,22 +2770,68 @@ HTML_PAGE = r"""<!doctype html>
         <div class="tabs">
           <button class="tab active" type="button" data-tab="task">筛选任务</button>
           <button class="tab" type="button" data-tab="results">结果表格</button>
-          <button class="tab" type="button" data-tab="fields">字段编号</button>
+          <button class="tab developer-only" type="button" data-tab="fields">字段编号</button>
         </div>
 
         <div id="task" class="tab-view active panel">
+          <div class="task-flow-card" id="taskFlowCard">
+            <div class="task-steps" aria-label="采集任务流程">
+              <div class="task-step is-active">1 类目</div>
+              <div class="task-step">2 搜索 / URL</div>
+              <div class="task-step">3 筛选</div>
+              <div class="task-step">4 查询</div>
+              <div class="task-step">5 导出复核</div>
+            </div>
+            <div class="selected-summary" id="selectedSummary">
+              <div class="selected-summary-item">
+                <span>类目范围</span>
+                <strong id="selectedCategoryCount">全部</strong>
+                <em id="selectedCategoryText">全部类目</em>
+              </div>
+              <div class="selected-summary-item">
+                <span>已选筛选</span>
+                <strong id="selectedFilterCount">0 项</strong>
+                <em id="selectedFilterText">未选择高级筛选</em>
+              </div>
+              <div class="selected-summary-item">
+                <span>搜索入口</span>
+                <strong id="selectedSearchMode">关键词</strong>
+                <em id="selectedKeywordText">未填写关键词或 URL</em>
+              </div>
+              <div class="selected-summary-item">
+                <span>结果与导出</span>
+                <strong id="selectedResultText">0 条</strong>
+                <em id="selectedExportText">运行后生成导出文件</em>
+              </div>
+            </div>
+            <div class="filter-anchor-bar">
+              <div class="filter-anchor-actions">
+                <button type="button" data-scroll-target="categoryFilterSection">类目</button>
+                <button type="button" data-scroll-target="searchFilterSection">搜索</button>
+                <button type="button" data-scroll-target="advancedFilterSection">高级筛选</button>
+                <button type="button" data-scroll-target="runFilterSection">查询设置</button>
+                <button type="button" data-scroll-target="resultSection">结果导出</button>
+              </div>
+              <label class="review-mode-toggle">
+                <input id="reviewModeToggle" type="checkbox" />
+                调试视图
+                <span>显示字段映射</span>
+              </label>
+            </div>
+            <div id="detailWarning" class="detail-warning" hidden></div>
+          </div>
           <div class="filter-panel">
           <div class="library-toolbar">
             <div>
               <h2>筛选条件</h2>
-              <div class="subtle-count">类目范围、精准搜索、选品模式、高级筛选、销售、商品、卖家信息</div>
+              <div class="subtle-count">类目范围、精准搜索、高级筛选、销售、商品、卖家信息</div>
             </div>
             <div class="toolbar-meta">
               <span id="capabilityBadge" class="status-pill">能力加载中</span>
             </div>
           </div>
 
-          <div class="filter-row compact">
+          <div id="categoryFilterSection" class="filter-row compact">
             <div class="row-label">类目范围</div>
             <div class="row-control">
               <div class="top-filter-line">
@@ -2293,7 +2856,7 @@ HTML_PAGE = r"""<!doctype html>
             </div>
           </div>
 
-          <div class="library-section precise-section">
+          <div id="searchFilterSection" class="library-section precise-section">
             <div class="library-section-head">
               <strong>精准搜索</strong>
               <span>商品关键词 / 模糊匹配 / 历史搜索 / URL</span>
@@ -2315,13 +2878,8 @@ HTML_PAGE = r"""<!doctype html>
                   <label for="historyKeyword">历史搜索</label>
                   <input id="historyKeyword" type="text" placeholder="请输入历史关键词" />
                 </div>
-                <div>
-                  <label for="sampleMode">数据模式</label>
-                  <label class="sample-switch">
-                    <input id="sampleMode" type="checkbox" />
-                    开发样例
-                  </label>
-                </div>
+                <input id="sampleMode" type="checkbox" hidden aria-hidden="true" />
+                <div id="realModeHint" class="subtle-count" hidden>默认真实采集；可粘贴 1688 搜索页或详情页 URL 测试真实页面</div>
               </div>
               <div class="library-grid url-grid">
                 <div>
@@ -2336,14 +2894,16 @@ HTML_PAGE = r"""<!doctype html>
             </div>
           </div>
 
-          <div id="libraryFilters"></div>
+          <div id="advancedFilterSection">
+            <div id="libraryFilters"></div>
+          </div>
 
           <details class="legacy-filter-box">
             <summary>兼容旧版运营标签</summary>
             <div id="filterGroups"></div>
           </details>
 
-          <div class="library-section run-section">
+          <div id="runFilterSection" class="library-section run-section">
             <div class="library-section-head">
               <strong>批量与导出</strong>
               <span>当前支持导出和详情核验，关注商品/Temu 铺货为预留接口</span>
@@ -2365,7 +2925,7 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div>
                 <label for="statPeriod">统计周期</label>
-                <select id="statPeriod" data-library-select="stat_period">
+                <select id="statPeriod" class="reserved-inline" data-library-select="stat_period" data-default-value="近30天" data-reserved-filter="true">
                   <option value="近30天">近30天</option>
                   <option value="近7天">近7天</option>
                   <option value="近90天">近90天</option>
@@ -2373,7 +2933,7 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div>
                 <label for="sortBy">排序</label>
-                <select id="sortBy" data-library-select="sort_by">
+                <select id="sortBy" class="reserved-inline" data-library-select="sort_by" data-default-value="推荐分" data-reserved-filter="true">
                   <option value="推荐分">推荐分</option>
                   <option value="销售订单数">销售订单数</option>
                   <option value="销售件数">销售件数</option>
@@ -2388,7 +2948,18 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div>
                 <label for="maxItems">每词商品上限</label>
-                <input id="maxItems" type="number" min="1" max="100" value="20" />
+                <input id="maxItems" type="number" min="1" max="100" value="5" />
+              </div>
+              <div>
+                <label for="autoVerifyDetails">详情补字段</label>
+                <label class="sample-switch">
+                  <input id="autoVerifyDetails" type="checkbox" checked />
+                  自动核验
+                </label>
+              </div>
+              <div>
+                <label for="autoVerifyMax">自动核验上限</label>
+                <input id="autoVerifyMax" type="number" min="1" max="20" value="3" />
               </div>
             </div>
           </div>
@@ -2400,16 +2971,25 @@ HTML_PAGE = r"""<!doctype html>
           </div>
 
           <div id="notice" class="notice"></div>
-          <div class="verification-records">
+          <div class="sticky-action-bar" aria-label="筛选任务操作">
+            <div class="sticky-action-meta">
+              <strong id="stickyActionTitle">准备筛选 1688 商品</strong>
+              <span id="stickyActionText">选择类目、关键词或筛选项后开始查询；导出后再人工复核。</span>
+            </div>
+            <button id="stickyRunBtn" class="primary" type="button">开始查询</button>
+            <button id="stickyResetBtn" class="secondary" type="button">重置</button>
+            <a id="stickyDownloadLink" class="download" href="#" hidden>导出</a>
+          </div>
+          <div class="verification-records developer-only">
             <div class="panel-title">
               <div>
-                <h2>筛选计划与执行记录</h2>
-                <div class="subtle-count">原生筛选必须在 1688 页面点击；找不到会显示 not_found</div>
+                <h2>调试记录</h2>
+                <div class="subtle-count">仅用于排查字段映射、原生筛选点击和后筛规则</div>
               </div>
             </div>
-            <div id="coverageSummary" class="coverage-strip"></div>
-            <div id="coverageList" class="coverage-list"></div>
-            <div id="filterRecordList" class="record-list"></div>
+            <div id="coverageSummary" class="coverage-strip developer-only"></div>
+            <div id="coverageList" class="coverage-list developer-only"></div>
+            <div id="filterRecordList" class="record-list developer-only"></div>
           </div>
           <div class="summary">
             <div class="metric"><span>采集批次</span><strong id="runId">-</strong></div>
@@ -2421,6 +3001,7 @@ HTML_PAGE = r"""<!doctype html>
         </div>
 
         <div id="results" class="tab-view panel">
+          <span id="resultSection" aria-hidden="true"></span>
           <div class="result-bar">
             <div class="result-actions">
               <label class="chip"><input id="selectAllRows" type="checkbox" />全选</label>
@@ -2440,11 +3021,14 @@ HTML_PAGE = r"""<!doctype html>
             </div>
           </div>
           <div class="verification-strip">
+            <div><span>任务状态</span><strong id="automationStatus">-</strong></div>
             <div><span>待核验高潜</span><strong id="queueCount">0</strong></div>
             <div><span>已核验商品</span><strong id="verifiedCount">0</strong></div>
             <div><span>核验记录</span><strong id="recordCount">0</strong></div>
             <button id="verifyBtn" class="secondary" type="button" disabled>真实详情核验</button>
           </div>
+          <div id="automationMessage" class="automation-message"></div>
+          <div id="resultEmptyHint" class="empty-result-card">还没有查询结果。先完成类目、搜索词或筛选条件，再点击“开始查询”；生成结果后可导出 Excel/CSV，导出后再人工复核。</div>
           <div class="result-tools">
             <div>
               <label for="titleFilter">商品/类目</label>
@@ -2468,11 +3052,11 @@ HTML_PAGE = r"""<!doctype html>
               <label for="verificationFilter">核验状态</label>
               <select id="verificationFilter">
                 <option value="">全部</option>
-                <option value="unverified">unverified</option>
-                <option value="sample_verified">sample_verified</option>
-                <option value="partial_verified">partial_verified</option>
-                <option value="verified">verified</option>
-                <option value="failed">failed</option>
+                <option value="unverified">待核验</option>
+                <option value="sample_verified">调试已核验</option>
+                <option value="partial_verified">部分核验</option>
+                <option value="verified">已核验</option>
+                <option value="failed">核验失败</option>
               </select>
             </div>
             <div>
@@ -2491,7 +3075,7 @@ HTML_PAGE = r"""<!doctype html>
               <tbody id="resultBody"></tbody>
             </table>
           </div>
-          <div class="verification-records">
+          <div class="verification-records developer-only">
             <div class="panel-title">
               <div>
                 <h2>字段核验记录</h2>
@@ -2502,7 +3086,7 @@ HTML_PAGE = r"""<!doctype html>
           </div>
         </div>
 
-        <div id="fields" class="tab-view panel">
+        <div id="fields" class="tab-view panel developer-only">
           <div id="fieldGrid" class="field-grid"></div>
         </div>
       </section>
@@ -2517,9 +3101,13 @@ HTML_PAGE = r"""<!doctype html>
       verificationQueue: [],
       verificationRecords: [],
       filterReevaluationRecords: [],
+      automationState: {},
       filterPlan: {},
       filterResults: [],
       filterWarnings: [],
+      reviewMode: false,
+      debugSampleMode: false,
+      debugViewMode: false,
       selectedCategories: new Set(),
       activeCategoryParent: "",
       activeCategoryChild: "",
@@ -2553,6 +3141,18 @@ HTML_PAGE = r"""<!doctype html>
 
     const $ = (id) => document.getElementById(id);
 
+    function readDebugParams() {
+      const params = new URLSearchParams(window.location.search);
+      const flags = {
+        sample: params.get("codex_sample") === "1" || params.get("sample") === "1",
+        view: params.get("codex_debug") === "1" || params.get("debug") === "1"
+      };
+      if ((flags.sample || flags.view) && window.history.replaceState) {
+        window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.hash || ""}`);
+      }
+      return flags;
+    }
+
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, char => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -2570,6 +3170,7 @@ HTML_PAGE = r"""<!doctype html>
       const summary = $("categorySummary");
       if (!summary) return;
       summary.textContent = selected.length ? `已选 ${selected.length} 个：${selected.slice(0, 4).join("、")}${selected.length > 4 ? "..." : ""}` : "全部类目";
+      updateSelectedSummary();
     }
 
     function rowKey(row, index) {
@@ -2770,19 +3371,49 @@ HTML_PAGE = r"""<!doctype html>
           <div class="tag-grid">${tags.map(tag => chipHtml(tag, tag, "tag")).join("")}</div>
         </div>
       `).join("");
+      updateSelectedSummary();
     }
 
     function statusLabel(status) {
       return {
-        supported: "已接入",
-        partial_supported: "部分接入",
-        detail_required: "需核验",
+        supported: "可筛选",
+        partial_supported: "需复核",
+        detail_required: "需详情核验",
         reserved: "预留"
       }[status] || status || "预留";
     }
 
+    function verificationStatusLabel(value) {
+      return {
+        unverified: "待核验",
+        sample_verified: "调试已核验",
+        partial_verified: "部分核验",
+        verified: "已核验",
+        failed: "核验失败"
+      }[value] || value || "-";
+    }
+
     function statusBadge(status) {
       return `<span class="field-status ${esc(status || "reserved")}">${esc(statusLabel(status))}</span>`;
+    }
+
+    function fieldStatusHint(field) {
+      const mapping = field.mapping ? `映射：${field.mapping}` : "";
+      const statusHint = {
+        supported: "可参与当前真实采集计划。",
+        partial_supported: "可尝试执行，但命中情况以页面返回和详情核验为准。",
+        detail_required: "列表页无法完全确认，需进入商品详情页核验后再判断。",
+        reserved: "接口或数据源预留，默认不参与本次真实过滤。"
+      }[field.status] || "需评审确认字段状态。";
+      return [statusHint, mapping].filter(Boolean).join(" ");
+    }
+
+    function fieldClass(field) {
+      const classes = ["library-filter-card"];
+      if (field.status === "reserved") classes.push("is-reserved-filter");
+      if (field.status === "detail_required") classes.push("is-detail-filter");
+      if (field.status === "partial_supported") classes.push("is-partial-filter");
+      return classes.join(" ");
     }
 
     function renderLibraryFilters() {
@@ -2802,35 +3433,20 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     function renderLibrarySectionFields(section) {
-      if (section.key === "selection_mode") {
-        const field = (section.fields || [])[0] || {};
-        const modeCopy = {
-          "新品热卖": "新品、热度、订单",
-          "无货源选品": "一件代发、包邮权益",
-          "同期热卖": "近30天表现、趋势",
-          "源头工厂": "工厂/超级工厂"
-        };
-        return `<div class="library-grid filter-grid-wide">${(field.options || []).map(option => `
-          <label class="mode-chip">
-            <input type="checkbox" data-library-list="${esc(field.key)}" value="${esc(option)}" />
-            <strong>${esc(option)} ${statusBadge(field.status)}</strong>
-            <span>${esc(modeCopy[option] || field.mapping || "")}</span>
-          </label>
-        `).join("")}</div>`;
-      }
       const fields = section.fields || [];
       const rangeFields = fields.filter(field => field.type === "range");
       const otherFields = fields.filter(field => field.type !== "range");
       const rangeHtml = rangeFields.length ? `
         <div class="range-grid">
           ${rangeFields.map(field => `
-            <div class="range-field">
+            <div class="range-field ${fieldClass(field)}">
               <label>${esc(field.label)} ${statusBadge(field.status)}</label>
               <div class="range-pair">
                 <input type="number" data-library-range="${esc(field.key)}" data-bound="min" placeholder="最小" />
                 <span class="range-sep">至</span>
                 <input type="number" data-library-range="${esc(field.key)}" data-bound="max" placeholder="最大" />
               </div>
+              <div class="field-hint">${esc(fieldStatusHint(field))}</div>
             </div>
           `).join("")}
         </div>
@@ -2845,47 +3461,60 @@ HTML_PAGE = r"""<!doctype html>
 
     function renderLibraryField(field) {
       if (field.type === "multi_chip") {
-        return `<div class="filter-block" style="margin-top:0;">
-          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span>${esc(field.mapping || "")}</span></div>
+        return `<div class="filter-block ${fieldClass(field)}" style="margin-top:0;">
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
           <div class="tag-grid">${(field.options || []).map(option => `
             <label class="chip"><input type="checkbox" data-library-list="${esc(field.key)}" value="${esc(option)}" />${esc(option)}</label>
           `).join("")}</div>
+          <div class="field-hint">${esc(fieldStatusHint(field))}</div>
         </div>`;
       }
       if (field.type === "radio") {
-        return `<div class="filter-block" style="margin-top:0;">
-          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span>${esc(field.mapping || "")}</span></div>
+        return `<div class="filter-block ${fieldClass(field)}" style="margin-top:0;">
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
           <div class="tag-grid">${(field.options || []).map((option, index) => `
             <label class="chip"><input type="radio" name="library-${esc(field.key)}" data-library-radio="${esc(field.key)}" value="${esc(option)}" ${index === 0 ? "checked" : ""} />${esc(option)}</label>
           `).join("")}</div>
+          <div class="field-hint">${esc(fieldStatusHint(field))}</div>
         </div>`;
       }
       if (field.type === "boolean") {
-        return `<label class="chip"><input type="checkbox" data-library-bool="${esc(field.key)}" />${esc(field.label)} ${statusBadge(field.status)}</label>`;
+        return `<div class="boolean-field ${fieldClass(field)}">
+          <label class="chip"><input type="checkbox" data-library-bool="${esc(field.key)}" />${esc(field.label)} ${statusBadge(field.status)}</label>
+          <div class="field-hint">${esc(fieldStatusHint(field))}</div>
+        </div>`;
       }
       if (field.type === "select") {
-        return `<div>
+        return `<div class="select-field ${fieldClass(field)}">
           <label>${esc(field.label)} ${statusBadge(field.status)}</label>
           <select data-library-select="${esc(field.key)}">
             <option value="">不限</option>
             ${(field.options || []).map(option => `<option value="${esc(option)}">${esc(option)}</option>`).join("")}
           </select>
+          <div class="field-hint">${esc(fieldStatusHint(field))}</div>
         </div>`;
       }
-      return `<div>
+      return `<div class="text-field ${fieldClass(field)}">
         <label>${esc(field.label)} ${statusBadge(field.status)}</label>
         <input type="text" data-library-text="${esc(field.key)}" />
+        <div class="field-hint">${esc(fieldStatusHint(field))}</div>
       </div>`;
     }
 
     function collectLibraryFilters() {
       const filters = {};
-      filters.category_paths = [...state.selectedCategories];
-      filters.search_keyword = $("keywords").value;
-      filters.match_type = $("matchType").value;
-      filters.history_keyword = $("historyKeyword").value;
-      filters.template_name = $("templateName").value;
-      filters.source_urls = $("sourceUrls").value;
+      const categoryPaths = [...state.selectedCategories];
+      const keyword = $("keywords").value.trim();
+      const matchType = $("matchType").value;
+      const historyKeyword = $("historyKeyword").value.trim();
+      const templateName = $("templateName").value.trim();
+      const sourceUrls = $("sourceUrls").value.trim();
+      if (categoryPaths.length) filters.category_paths = categoryPaths;
+      if (keyword) filters.search_keyword = keyword;
+      if (matchType && matchType !== "模糊匹配") filters.match_type = matchType;
+      if (historyKeyword) filters.history_keyword = historyKeyword;
+      if (templateName) filters.template_name = templateName;
+      if (sourceUrls) filters.source_urls = sourceUrls;
       document.querySelectorAll("[data-library-list]").forEach(input => {
         if (!input.checked) return;
         const key = input.dataset.libraryList;
@@ -2896,10 +3525,13 @@ HTML_PAGE = r"""<!doctype html>
         if (input.checked) filters[input.dataset.libraryBool] = true;
       });
       document.querySelectorAll("[data-library-radio]").forEach(input => {
-        if (input.checked) filters[input.dataset.libraryRadio] = input.value;
+        if (input.checked && input.value && input.value !== "不限") filters[input.dataset.libraryRadio] = input.value;
       });
       document.querySelectorAll("[data-library-select]").forEach(input => {
-        if (input.value) filters[input.dataset.librarySelect] = input.value;
+        const value = input.value;
+        if (!value || value === "不限") return;
+        if (input.dataset.reservedFilter === "true" && value === input.dataset.defaultValue) return;
+        filters[input.dataset.librarySelect] = value;
       });
       document.querySelectorAll("[data-library-text]").forEach(input => {
         if (input.value.trim()) filters[input.dataset.libraryText] = input.value.trim();
@@ -2911,6 +3543,86 @@ HTML_PAGE = r"""<!doctype html>
       });
       state.selectedLibrary = filters;
       return filters;
+    }
+
+    function libraryFieldIndex() {
+      const index = {};
+      (state.options?.library_filter_schema || []).forEach(section => {
+        (section.fields || []).forEach(field => {
+          index[field.key] = field;
+        });
+      });
+      return index;
+    }
+
+    function activeLibraryLabels(filters) {
+      const fieldIndex = libraryFieldIndex();
+      const ignore = new Set(["category_paths", "search_keyword", "source_urls", "history_keyword", "template_name", "match_type"]);
+      const seen = new Set();
+      const labels = [];
+      Object.entries(filters || {}).forEach(([key, value]) => {
+        if (ignore.has(key)) return;
+        const baseKey = key.replace(/_(min|max)$/, "");
+        if (seen.has(baseKey)) return;
+        const isRange = key.endsWith("_min") || key.endsWith("_max");
+        const field = fieldIndex[baseKey] || fieldIndex[key];
+        if (!field) return;
+        if (Array.isArray(value) && !value.length) return;
+        if (value === false || value === "" || value == null) return;
+        seen.add(baseKey);
+        labels.push(field.label || baseKey);
+        if (isRange) seen.add(baseKey);
+      });
+      state.selectedTags.forEach(tag => labels.push(tag));
+      return labels;
+    }
+
+    function selectedDetailLabels(filters) {
+      const fieldIndex = libraryFieldIndex();
+      const labels = [];
+      Object.entries(filters || {}).forEach(([key, value]) => {
+        const baseKey = key.replace(/_(min|max)$/, "");
+        const field = fieldIndex[baseKey] || fieldIndex[key];
+        if (!field || field.status !== "detail_required") return;
+        if (value === false || value === "" || value == null) return;
+        if (Array.isArray(value) && !value.length) return;
+        if (!labels.includes(field.label)) labels.push(field.label);
+      });
+      return labels;
+    }
+
+    function updateSelectedSummary() {
+      if (!$("selectedCategoryCount")) return;
+      const filters = collectLibraryFilters();
+      const categoryPaths = filters.category_paths || [];
+      const activeLabels = activeLibraryLabels(filters);
+      const keyword = $("keywords")?.value.trim() || "";
+      const sourceUrls = $("sourceUrls")?.value.trim() || "";
+      const historyKeyword = $("historyKeyword")?.value.trim() || "";
+      const searchParts = [keyword, historyKeyword].filter(Boolean);
+      $("selectedCategoryCount").textContent = categoryPaths.length ? `${categoryPaths.length} 个` : "全部";
+      $("selectedCategoryText").textContent = categoryPaths.length ? categoryPaths.slice(0, 3).join("、") : "全部类目";
+      $("selectedFilterCount").textContent = `${activeLabels.length} 项`;
+      $("selectedFilterText").textContent = activeLabels.length ? activeLabels.slice(0, 5).join("、") : "未选择高级筛选";
+      $("selectedSearchMode").textContent = sourceUrls ? "URL" : "关键词";
+      $("selectedKeywordText").textContent = sourceUrls || searchParts.join("、") || "未填写关键词或 URL";
+      $("selectedResultText").textContent = `${state.rows.length} 条`;
+      $("selectedExportText").textContent = state.runId ? `批次 ${state.runId}` : "运行后生成导出文件";
+      if ($("stickyActionTitle")) {
+        $("stickyActionTitle").textContent = state.runId ? `已生成 ${state.rows.length} 条结果` : "准备筛选 1688 商品";
+        $("stickyActionText").textContent = `${categoryPaths.length ? `类目 ${categoryPaths.length} 个` : "全部类目"} · ${activeLabels.length} 个筛选 · ${sourceUrls ? "URL 采集" : (keyword ? `关键词 ${keyword}` : "待填写搜索入口")}`;
+      }
+      const detailLabels = selectedDetailLabels(filters);
+      const warning = $("detailWarning");
+      if (warning) {
+        const autoVerifyOff = $("autoVerifyDetails") && !$("autoVerifyDetails").checked;
+        warning.hidden = !(detailLabels.length && autoVerifyOff);
+        warning.textContent = detailLabels.length && autoVerifyOff
+          ? `已选择 ${detailLabels.join("、")}，这些字段需要进入商品详情页核验；当前关闭自动核验时，导出结果只会标记为待核验。`
+          : "";
+      }
+      const emptyHint = $("resultEmptyHint");
+      if (emptyHint) emptyHint.hidden = state.rows.length > 0;
     }
 
     function renderFields() {
@@ -2978,7 +3690,7 @@ HTML_PAGE = r"""<!doctype html>
       }
       if (key === "verification_status") {
         const cls = value === "sample_verified" || value === "verified" ? "p0" : value === "partial_verified" ? "p1" : value === "failed" ? "no" : "p2";
-        return `<span class="badge ${cls}">${esc(value || "-")}</span>`;
+        return `<span class="badge ${cls}">${esc(verificationStatusLabel(value))}</span>`;
       }
       return esc(value);
     }
@@ -3005,14 +3717,41 @@ HTML_PAGE = r"""<!doctype html>
       state.verificationQueue = [];
       state.verificationRecords = [];
       state.filterReevaluationRecords = [];
+      state.automationState = {};
       state.filterPlan = {};
       state.filterResults = [];
       state.filterWarnings = [];
       state.selectedRows.clear();
       $("downloadLink").hidden = true;
       $("downloadLink").removeAttribute("href");
+      if ($("stickyDownloadLink")) {
+        $("stickyDownloadLink").hidden = true;
+        $("stickyDownloadLink").removeAttribute("href");
+      }
       renderTable();
       updateSummary({run_id: "", verification_queue: [], verification_records: []});
+    }
+
+    function automationNoticeMode(automationState) {
+      const status = automationState.status || "";
+      if (status === "paused") return "paused";
+      if (status === "failed") return "fail";
+      if (status === "partial" || status === "pending_detail") return "paused";
+      return "ok";
+    }
+
+    function applyAutomationState(automationState) {
+      state.automationState = automationState || {};
+      const node = $("automationMessage");
+      $("automationStatus").textContent = state.automationState.status_label || "-";
+      const message = state.automationState.message || "";
+      if (!message) {
+        node.textContent = "";
+        node.className = "automation-message";
+        return;
+      }
+      node.textContent = message;
+      node.className = `automation-message show ${state.automationState.status || ""}`;
     }
 
     function updateSummary(data) {
@@ -3020,6 +3759,7 @@ HTML_PAGE = r"""<!doctype html>
       state.verificationQueue = data.verification_queue || state.verificationQueue || [];
       state.verificationRecords = data.verification_records || state.verificationRecords || [];
       state.filterReevaluationRecords = data.filter_reevaluation_records || state.filterReevaluationRecords || [];
+      applyAutomationState(data.automation_state || state.automationState || {});
       state.filterPlan = data.filter_plan || state.filterPlan || {};
       state.filterResults = data.filter_results || state.filterResults || [];
       state.filterWarnings = data.filter_warnings || state.filterWarnings || [];
@@ -3032,6 +3772,7 @@ HTML_PAGE = r"""<!doctype html>
       $("recordCount").textContent = String(state.verificationRecords.length);
       $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
       updateSelectedCount();
+      updateSelectedSummary();
       renderRecords();
       renderFilterRecords();
     }
@@ -3095,10 +3836,12 @@ HTML_PAGE = r"""<!doctype html>
           exclude_tags: $("excludeTags").value,
           library_filters: collectLibraryFilters(),
           max_queries: Number($("maxQueries").value || 20),
-          max_items_per_query: Number($("maxItems").value || 20),
+          max_items_per_query: Number($("maxItems").value || 5),
+          auto_verify_details: $("autoVerifyDetails").checked,
+          auto_verify_max_items: Number($("autoVerifyMax").value || 3),
           output_format: $("outputFormat").value,
           collect_source: $("collectSource").value,
-          sample_data: $("sampleMode").checked,
+          sample_data: state.debugSampleMode,
           token: state.options.token
         };
         const response = await fetch("/api/collect", {
@@ -3128,11 +3871,19 @@ HTML_PAGE = r"""<!doctype html>
         updateSummary(result.data);
         $("downloadLink").href = result.data.download_url;
         $("downloadLink").hidden = false;
-        const modeText = $("sampleMode").checked ? "开发样例" : `真实数据/${$("collectSource").value === "rpa" ? "1688页面RPA" : "AK/API"}`;
+        $("stickyDownloadLink").href = result.data.download_url;
+        $("stickyDownloadLink").hidden = false;
+        const modeText = state.debugSampleMode ? "调试样例" : `真实数据/${$("collectSource").value === "rpa" ? "1688页面RPA" : "AK/API"}`;
         const queryLabel = $("sourceUrls").value.trim() ? "采集页面" : "查询词";
         const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
         const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
-        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}运费、品退率、发货率等关键字段仍需详情页核验。`, (state.filterWarnings || []).length === 0);
+        const autoVerifyText = result.data.auto_verify_details
+          ? `已自动详情核验 ${result.data.verified_count || 0} 个，剩余待核验 ${state.verificationQueue.length} 个。`
+          : "运费、品退率、发货率等关键字段仍需详情页核验。";
+        const automation = result.data.automation_state || {};
+        const stateText = automation.message ? `状态：${automation.message}` : autoVerifyText;
+        const ok = (state.filterWarnings || []).length === 0 && !["paused", "failed", "partial"].includes(automation.status || "");
+        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}${autoVerifyText}${stateText ? ` ${stateText}` : ""}`, ok, automationNoticeMode(automation));
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
       } finally {
@@ -3155,8 +3906,8 @@ HTML_PAGE = r"""<!doctype html>
           body: JSON.stringify({
             token: state.options.token,
             run_id: state.runId,
-            sample_data: $("sampleMode").checked,
-            max_items: 20
+            sample_data: state.debugSampleMode,
+            max_items: 5
           })
         });
         const result = await response.json();
@@ -3171,11 +3922,19 @@ HTML_PAGE = r"""<!doctype html>
         updateSummary(result.data);
         $("downloadLink").href = result.data.download_url;
         $("downloadLink").hidden = false;
-        showNotice(`已核验 ${result.data.verified_count} 个高潜商品，导出表已刷新；partial_verified 表示真实页面只提取到部分字段。`, true);
+        $("stickyDownloadLink").href = result.data.download_url;
+        $("stickyDownloadLink").hidden = false;
+        const automation = result.data.automation_state || {};
+        const stopped = result.data.verification_stopped_reason || automation.stopped_reason || "";
+        if (stopped || automation.status === "paused") {
+          showNotice(`详情核验已暂停：${stopped || automation.message}。导出表已刷新为暂停/失败状态，请人工接管后再继续。`, false, "paused");
+        } else {
+          showNotice(`已核验 ${result.data.verified_count} 个高潜商品，导出表已刷新；partial_verified 表示真实页面只提取到部分字段。`, !["failed", "partial"].includes(automation.status || ""), automationNoticeMode(automation));
+        }
       } catch (err) {
         showNotice(`核验失败：${err.message}`, false);
       } finally {
-        $("verifyBtn").textContent = $("sampleMode").checked ? "样例核验高潜" : "真实详情核验";
+        $("verifyBtn").textContent = state.debugSampleMode ? "调试核验高潜" : "真实详情核验";
         $("verifyBtn").disabled = !state.runId || state.verificationQueue.length === 0;
       }
     }
@@ -3196,6 +3955,7 @@ HTML_PAGE = r"""<!doctype html>
         if (parts[1]) state.activeCategoryChild = parts[1];
       }
       target.dataset.kind === "category" ? renderCategories() : renderFilterGroups();
+      updateSelectedSummary();
     });
 
     document.addEventListener("change", (event) => {
@@ -3203,11 +3963,20 @@ HTML_PAGE = r"""<!doctype html>
       if (!target.matches(".row-select")) return;
       target.checked ? state.selectedRows.add(target.dataset.rowKey) : state.selectedRows.delete(target.dataset.rowKey);
       updateSelectedCount();
+      updateSelectedSummary();
     });
 
     document.addEventListener("click", (event) => {
       const tab = event.target.closest(".tab");
       if (tab) setTab(tab.dataset.tab);
+    });
+
+    document.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-scroll-target]");
+      if (!action) return;
+      const target = $(action.dataset.scrollTarget);
+      if (!target) return;
+      target.scrollIntoView({behavior: "smooth", block: "start"});
     });
 
     document.addEventListener("click", (event) => {
@@ -3229,6 +3998,18 @@ HTML_PAGE = r"""<!doctype html>
         state.activeCategoryChild = parts[1] || "";
       }
       renderCategories();
+    });
+
+    document.addEventListener("input", (event) => {
+      const target = event.target;
+      if (!target.matches("#keywords, #sourceUrls, #historyKeyword, #templateName, [data-library-range], [data-library-text]")) return;
+      updateSelectedSummary();
+    });
+
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!target.matches("#matchType, #autoVerifyDetails, #statPeriod, #sortBy, [data-library-list], [data-library-bool], [data-library-radio], [data-library-select]")) return;
+      updateSelectedSummary();
     });
 
     ["titleFilter", "minScore", "levelFilter", "verificationFilter", "suggestFilter"].forEach(id => {
@@ -3265,14 +4046,23 @@ HTML_PAGE = r"""<!doctype html>
       ["minScore"].forEach(id => {
         if ($(id)) $(id).value = "0";
       });
+      if ($("autoVerifyDetails")) $("autoVerifyDetails").checked = true;
+      if ($("autoVerifyMax")) $("autoVerifyMax").value = "3";
+      if ($("matchType")) $("matchType").value = "模糊匹配";
+      if ($("statPeriod")) $("statPeriod").value = "近30天";
+      if ($("sortBy")) $("sortBy").value = "推荐分";
       document.querySelectorAll("[data-library-list], [data-library-bool]").forEach(input => input.checked = false);
       document.querySelectorAll("[data-library-range], [data-library-text]").forEach(input => input.value = "");
       document.querySelectorAll("[data-library-radio]").forEach(input => {
         input.checked = input.value === "不限";
       });
+      document.querySelectorAll("[data-library-select]").forEach(input => {
+        input.value = input.dataset.defaultValue || "";
+      });
       renderCategories();
       renderFilterGroups();
       renderTable();
+      updateSelectedSummary();
       showNotice("筛选条件已重置。", true);
     });
     $("selectAllRows").addEventListener("change", (event) => {
@@ -3295,9 +4085,17 @@ HTML_PAGE = r"""<!doctype html>
       });
     });
     $("runBtn").addEventListener("click", runCollect);
+    $("stickyRunBtn").addEventListener("click", runCollect);
+    $("stickyResetBtn").addEventListener("click", () => $("resetBtn").click());
     $("verifyBtn").addEventListener("click", runVerify);
+    $("reviewModeToggle").addEventListener("change", (event) => {
+      state.reviewMode = event.target.checked;
+      document.body.classList.toggle("review-mode", state.reviewMode);
+      showNotice(state.reviewMode ? "调试视图已开启：会显示字段映射、预留字段和执行记录。" : "调试视图已关闭：仅显示业务筛选和结果。", true);
+    });
 
     async function init() {
+      const debugFlags = readDebugParams();
       const response = await fetch("/api/options");
       const result = await response.json();
       state.options = result.data;
@@ -3305,21 +4103,22 @@ HTML_PAGE = r"""<!doctype html>
       $("capabilityBadge").textContent = `已接入 ${((caps.implemented || []).length)} 项 / 预留 ${((caps.reserved || []).length)} 项`;
       $("maxQueries").max = state.options.limits.max_queries;
       $("maxItems").max = state.options.limits.max_items_per_query;
-      $("sampleMode").checked = false;
-      $("sampleMode").addEventListener("change", () => {
-        $("verifyBtn").textContent = $("sampleMode").checked ? "样例核验高潜" : "真实详情核验";
-        showNotice(
-          $("sampleMode").checked
-            ? "当前切换到开发样例模式，不会采集真实 1688 数据。正式测试请关闭开发样例。"
-            : "当前为真实数据模式：默认通过 1688 页面 RPA 采集；如果账号登录不上，可粘贴 1688 搜索页/商品详情页 URL 先做公开页面真实数据测试。",
-          true
-        );
-      });
+      state.debugSampleMode = debugFlags.sample;
+      state.debugViewMode = debugFlags.view || debugFlags.sample;
+      state.reviewMode = state.debugViewMode;
+      document.body.classList.toggle("review-mode", state.reviewMode);
+      $("reviewModeToggle").checked = state.reviewMode;
+      $("sampleMode").checked = state.debugSampleMode;
+      $("verifyBtn").textContent = state.debugSampleMode ? "调试核验高潜" : "真实详情核验";
       if (!state.options.allow_real_collect) {
-        $("sampleMode").checked = true;
-        showNotice("当前真实采集被关闭，仅可用于开发样例模式。正式测试请用默认真实模式启动本地服务。", false);
+        $("realModeHint").textContent = "当前环境未开启真实采集；请在运行服务的本机打开 127.0.0.1 后测试真实数据";
+        showNotice("当前环境未开启真实采集：不会打开真实 1688 页面。正式测试请在运行服务的本机打开 127.0.0.1。", false, "paused");
+      } else if (state.debugSampleMode) {
+        $("realModeHint").textContent = "调试样例入口已开启；此模式仅用于 Codex 自测，不用于人工验收";
+        showNotice("调试样例入口已开启：本轮不会采集真实 1688 数据。人工验收请直接打开普通地址，不带调试参数。", false, "paused");
       } else {
-        showNotice("当前为真实数据模式：将打开 1688 页面采集真实数据；如账号登录不上，可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试。", true);
+        $("realModeHint").textContent = "默认真实采集；可粘贴 1688 搜索页或详情页 URL 测试真实页面";
+        showNotice("当前将执行真实采集：会打开 1688 页面采集真实数据；如账号登录不上，可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试。", true);
       }
       renderCategories();
       renderLibraryFilters();
@@ -3328,6 +4127,7 @@ HTML_PAGE = r"""<!doctype html>
       renderFields();
       renderTable();
       updateSummary({});
+      updateSelectedSummary();
     }
 
     init();

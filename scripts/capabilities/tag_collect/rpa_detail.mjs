@@ -31,6 +31,41 @@ const profileDir = process.env.TAG_COLLECT_RPA_PROFILE
 const headless = process.env.TAG_COLLECT_RPA_HEADLESS === "1";
 const loginWaitMs = Number(process.env.TAG_COLLECT_RPA_LOGIN_WAIT_MS || 90000);
 const cdpUrl = process.env.TAG_COLLECT_CDP_URL || "";
+const pacingMode = String(process.env.TAG_COLLECT_RPA_PACING || "human").toLowerCase();
+const pacingProfiles = {
+  fast: {
+    afterGoto: [1800, 3200],
+    beforeRead: [1800, 3200],
+    scrollStep: [650, 1500],
+  },
+  human: {
+    afterGoto: [4500, 8500],
+    beforeRead: [3500, 7000],
+    scrollStep: [1200, 3200],
+  },
+};
+const pacing = pacingProfiles[pacingMode] || pacingProfiles.human;
+
+function jitter([min, max]) {
+  const low = Math.max(0, Number(min) || 0);
+  const high = Math.max(low, Number(max) || low);
+  return Math.round(low + Math.random() * (high - low));
+}
+
+async function humanPause(page, range) {
+  await page.waitForTimeout(jitter(range));
+}
+
+async function humanScroll(page) {
+  const steps = 1 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < steps; i += 1) {
+    await page.evaluate(() => {
+      const distance = Math.floor(window.innerHeight * (0.35 + Math.random() * 0.45));
+      window.scrollBy({ top: distance, left: 0, behavior: "smooth" });
+    }).catch(() => {});
+    await humanPause(page, pacing.scrollStep);
+  }
+}
 
 function looksLikeBlockedPage(text, currentUrl) {
   const compact = String(text || "").replace(/\s+/g, "");
@@ -94,7 +129,7 @@ function firstMatch(text, patterns) {
 
 try {
   await page.goto(url, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(3000);
+  await humanPause(page, pacing.afterGoto);
   let pageText = await page.locator("body").innerText({ timeout: 10000 }).catch(() => "");
   const needsManualGate = looksLikeSecurityPage(pageText, page.url()) || looksLikeLoginPage(pageText, page.url());
   if (needsManualGate && loginWaitMs > 0 && !headless) {
@@ -118,8 +153,52 @@ try {
     process.exit(0);
   }
 
+  await humanScroll(page);
+  await humanPause(page, pacing.beforeRead);
+  pageText = await page.locator("body").innerText({ timeout: 10000 }).catch(() => pageText);
+  if (looksLikeBlockedPage(pageText, page.url())) {
+    await runtime.close();
+    console.log(JSON.stringify({
+      success: false,
+      code: looksLikeSecurityPage(pageText, page.url()) ? "security_verification_required" : "login_required",
+      source: "1688_detail_page",
+      cdp: Boolean(cdpUrl),
+      item_id: itemId,
+      url,
+      page_url: page.url(),
+      message: looksLikeSecurityPage(pageText, page.url())
+        ? securityMessage(page.url(), false)
+        : blockedMessage(page.url(), false),
+    }));
+    process.exit(0);
+  }
   const text = String(pageText || "").replace(/\s+/g, " ").trim();
   const fields = {};
+  fields.product_rating = firstMatch(text, [
+    /商品评价[^0-9]{0,20}([0-5](?:\.[0-9])?)(?:\s*\(|\s*好评率|\s*$)/,
+    /([0-5](?:\.[0-9])?)\s*(?:分)?\s*\(?\s*[0-9万+]*条?评价/,
+    /([0-5](?:\.[0-9])?)\s*好评率/,
+  ]);
+  fields.good_rate = firstMatch(text, [
+    /好评率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /([0-9]+(?:\.[0-9]+)?%)\s*好评/,
+  ]);
+  fields.comment_count = firstMatch(text, [
+    /[\(（]\s*([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价\s*[\)）]/,
+    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价/,
+    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*人?好评/,
+  ]);
+  const knownReviewTags = [
+    "客服态度超好",
+    "质感不错",
+    "购买推荐",
+    "质量很好",
+    "发货很快",
+    "包装完好",
+    "性价比高",
+  ];
+  const matchedReviewTags = knownReviewTags.filter((tag) => text.includes(tag));
+  fields.review_tags = matchedReviewTags.join(",");
   fields.product_refund_rate = firstMatch(text, [
     /品退率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
     /品质退款率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
