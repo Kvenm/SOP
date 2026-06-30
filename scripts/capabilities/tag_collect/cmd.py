@@ -17,17 +17,18 @@ from capabilities.tag_collect.service import friendly_collect_error, parse_input
 
 def main():
     parser = argparse.ArgumentParser(description="1688 标签选品采集")
-    parser.add_argument("--categories", default="", help="复选类目标签，逗号分隔，如 女装,家居日用品")
+    parser.add_argument("--categories", default="", help="复选1688类目路径，逗号分隔，如 女装、男装、内衣>新中式>汉服套装")
     parser.add_argument("--tags", default="", help="复选运营标签，逗号分隔，如 微信小店,一件代发,48小时发货")
     parser.add_argument("--keywords", default="", help="额外搜索词，逗号分隔；不传则用类目/标签生成")
     parser.add_argument("--source-urls", default="", help="直接采集真实 1688 搜索页或商品详情页 URL，逗号分隔；用于登录受阻时测试公开页面真实数据")
     parser.add_argument("--exclude-tags", default="", help="排除标签，逗号分隔；命中标题/类目/风险提示/标签来源时过滤")
     parser.add_argument("--max-queries", type=int, default=20, help="最大查询词数量")
-    parser.add_argument("--max-items-per-query", type=int, default=20, help="每个查询词最多采集商品数")
+    parser.add_argument("--max-items-per-query", type=int, default=20, help="每个查询词候选扫描预算上限")
+    parser.add_argument("--target-publishable-count", type=int, default=0, help="目标可铺商品数量；不传则沿用候选上限")
     parser.add_argument("--output-format", choices=["xlsx", "csv"], default="xlsx", help="导出格式")
-    parser.add_argument("--collect-source", choices=["rpa", "api"], default="rpa", help="真实采集来源：rpa=打开真实1688页面；api=AK接口")
+    parser.add_argument("--collect-source", choices=["url_direct", "manual_url", "rpa", "api"], default="rpa", help="真实采集来源：rpa=自动打开真实1688页面；manual_url=读取已打开Chrome页面；url_direct=无需Chrome的URL直连读取；api=AK接口")
     parser.add_argument("--auto-verify-details", action="store_true", help="采集后自动进入详情页核验高潜商品关键字段")
-    parser.add_argument("--auto-verify-max-items", type=int, default=3, help="自动详情核验商品上限，默认 3")
+    parser.add_argument("--auto-verify-max-items", type=int, default=0, help="自动详情核验商品上限；默认按目标可铺数/候选数自动取值，最多 20")
     parser.add_argument("--sample-data", action="store_true", help="使用内置样例数据，不调用 1688 接口")
     parser.add_argument("--serve", action="store_true", help="启动本地 Web 筛选测试工作台")
     parser.add_argument("--host", default="127.0.0.1", help="Web 工作台监听地址")
@@ -60,6 +61,7 @@ def main():
             exclude_tags=args.exclude_tags,
             max_queries=args.max_queries,
             max_items_per_query=args.max_items_per_query,
+            target_publishable_count=args.target_publishable_count,
             sample_data=args.sample_data,
             output_format=args.output_format,
             collect_source=args.collect_source,

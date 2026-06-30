@@ -5,8 +5,14 @@ import json
 import mimetypes
 import os
 import secrets
+import socket
+import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict
+from urllib.error import URLError
+from urllib.request import urlopen
 from urllib.parse import parse_qs, urlparse
 
 from _auth import get_ak_from_env
@@ -27,12 +33,148 @@ from capabilities.tag_collect.service import (
     get_run_payload,
     parse_input,
     run_tag_collect,
+    save_error_payload,
     verify_run_details,
 )
 
 
 SERVER_TOKEN = ""
 ALLOW_REAL_COLLECT = True
+DEFAULT_CDP_PORT = int(os.environ.get("TAG_COLLECT_CDP_PORT") or 9222)
+DEFAULT_CDP_URL = f"http://127.0.0.1:{DEFAULT_CDP_PORT}"
+
+
+def _tag_collect_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _chrome_runtime_status() -> Dict[str, Any]:
+    cdp_url = os.environ.get("TAG_COLLECT_CDP_URL", "").strip() or DEFAULT_CDP_URL
+    os.environ.setdefault("TAG_COLLECT_CDP_URL", cdp_url)
+    status = {
+        "mode": "chrome_cdp",
+        "use_cdp": True,
+        "cdp_url": cdp_url,
+        "cdp_connected": False,
+        "cdp_ready": False,
+        "cdp_page_count": 0,
+        "page_count": 0,
+        "candidate_count": 0,
+        "pages": [],
+        "current_page": {},
+        "label": "采集浏览器未连接",
+        "message": "点击“启动采集浏览器”，然后在弹出的 Chrome 中手动打开/筛选 1688 页面。",
+    }
+    parsed = urlparse(cdp_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            status["cdp_connected"] = True
+        with urlopen(f"http://{host}:{port}/json/version", timeout=0.8) as response:
+            version_payload = json.loads(response.read().decode("utf-8") or "{}")
+        with urlopen(f"http://{host}:{port}/json/list", timeout=0.8) as response:
+            pages_payload = json.loads(response.read().decode("utf-8") or "[]")
+        pages = pages_payload if isinstance(pages_payload, list) else []
+        page_items = []
+        for item in pages:
+            if not isinstance(item, dict):
+                continue
+            page_url = str(item.get("url") or "")
+            page_title = str(item.get("title") or "")
+            is_1688 = _is_1688_url(page_url)
+            is_blocked = _is_blocked_1688_url(page_url) if is_1688 else False
+            is_collectable = _is_collectable_1688_url(page_url)
+            page_items.append({
+                "id": str(item.get("id") or ""),
+                "title": page_title,
+                "url": page_url,
+                "type": str(item.get("type") or ""),
+                "is_1688": is_1688,
+                "is_blocked": is_blocked,
+                "is_collectable": is_collectable,
+            })
+        candidate_pages = [item for item in page_items if item.get("is_collectable")]
+        browser_name = str(version_payload.get("Browser") or "")
+        status["cdp_page_count"] = len(pages)
+        status["page_count"] = len(pages)
+        status["candidate_count"] = len(candidate_pages)
+        status["pages"] = page_items[:20]
+        status["current_page"] = candidate_pages[0] if len(candidate_pages) == 1 else {}
+        status["cdp_ready"] = bool(version_payload.get("webSocketDebuggerUrl"))
+        status["label"] = "真实 Chrome CDP"
+        if status["cdp_ready"]:
+            if len(candidate_pages) == 1:
+                page = candidate_pages[0]
+                title = page.get("title") or "当前 1688 页面"
+                status["message"] = f"已连接采集 Chrome，检测到 1 个可读取的 1688 页签：{title}。"
+            elif len(candidate_pages) > 1:
+                status["message"] = f"已连接采集 Chrome，但检测到 {len(candidate_pages)} 个可读取的 1688 页签。请只保留要采集的那个页签，或把该页 URL 粘贴到可选 URL 框用于匹配。"
+            elif pages:
+                status["message"] = "已连接采集 Chrome。自动批量采集可直接按本页类目/筛选执行；只有使用“当前页兜底读取”时，才需要先在 Chrome 中打开商品列表/详情页。"
+            else:
+                status["message"] = f"采集 Chrome 调试端口已打开（{browser_name or 'Chrome'}）；请先在弹出的 Chrome 中登录 1688，然后回到本页开始自动采集。"
+        else:
+            status["message"] = "9222 端口已打开，但不是完整的 Chrome CDP 调试端点；请重启项目专用 Chrome。"
+    except OSError:
+        status["message"] = "采集浏览器未启动；请点击“启动采集浏览器”。"
+    except Exception as exc:
+        status["message"] = f"已配置真实 Chrome CDP，但调试端点健康检查失败：{exc}。请重启项目专用 Chrome。"
+    return status
+
+
+def _start_chrome_debug_browser() -> Dict[str, Any]:
+    script = _tag_collect_dir() / "start_chrome_debug.sh"
+    if not script.exists():
+        raise RuntimeError(f"未找到采集浏览器启动脚本：{script}")
+    env = os.environ.copy()
+    env.setdefault("TAG_COLLECT_CDP_PORT", str(DEFAULT_CDP_PORT))
+    os.environ["TAG_COLLECT_CDP_URL"] = DEFAULT_CDP_URL
+    subprocess.Popen(
+        [str(script)],
+        cwd=str(_tag_collect_dir()),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    status = _chrome_runtime_status()
+    deadline = time.time() + 8
+    while time.time() < deadline and not status.get("cdp_ready"):
+        time.sleep(0.5)
+        status = _chrome_runtime_status()
+    if not status.get("cdp_ready"):
+        raise RuntimeError(status.get("message") or "采集浏览器已尝试启动，但 CDP 调试端点未就绪。")
+    return status
+
+
+def _is_1688_url(page_url: str) -> bool:
+    parsed = urlparse(page_url)
+    host = parsed.hostname or ""
+    return host == "1688.com" or host.endswith(".1688.com")
+
+
+def _is_blocked_1688_url(page_url: str) -> bool:
+    lowered = page_url.lower()
+    return any(term in lowered for term in ("login", "punish", "captcha", "verify", "sec"))
+
+
+def _is_collectable_1688_url(page_url: str) -> bool:
+    if not _is_1688_url(page_url) or _is_blocked_1688_url(page_url):
+        return False
+    parsed = urlparse(page_url)
+    host = parsed.hostname or ""
+    path = parsed.path or ""
+    query = parsed.query or ""
+    if "detail.1688.com" in host or "detail.m.1688.com" in host:
+        return True
+    if "s.1688.com" in host and ("selloffer" in path or "offer_search" in path):
+        return True
+    if "offer" in path and ("offerId" in query or "keywords" in query):
+        return True
+    if any(key in query for key in ("keywords=", "keyword=", "offerId=", "offerIds=", "categoryId=", "catId=")):
+        return True
+    return False
 
 
 def _json_bytes(payload: Dict[str, Any]) -> bytes:
@@ -91,6 +233,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 "data": {
                     "token": SERVER_TOKEN,
                     "allow_real_collect": ALLOW_REAL_COLLECT,
+                    "runtime": _chrome_runtime_status(),
                     "limits": {
                         "max_queries": MAX_QUERIES,
                         "max_items_per_query": MAX_ITEMS_PER_QUERY,
@@ -112,6 +255,13 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 },
             })
             return
+        if parsed.path == "/api/chrome/status":
+            self._send_json(200, {
+                "success": True,
+                "markdown": "",
+                "data": {"runtime": _chrome_runtime_status()},
+            })
+            return
         if parsed.path == "/api/run":
             run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
             payload = get_run_payload(run_id)
@@ -127,7 +277,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/collect", "/api/verify"):
+        if parsed.path not in ("/api/collect", "/api/verify", "/api/chrome/start"):
             self._send_json(404, {"success": False, "markdown": "Not found", "data": {}})
             return
 
@@ -139,6 +289,22 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 "markdown": "本地工作台 token 校验失败，已拒绝执行采集任务。",
                 "data": {"run_id": "", "row_count": 0, "rows": []},
             })
+            return
+
+        if parsed.path == "/api/chrome/start":
+            try:
+                runtime = _start_chrome_debug_browser()
+                self._send_json(200, {
+                    "success": True,
+                    "markdown": runtime.get("message", ""),
+                    "data": {"runtime": runtime},
+                })
+            except Exception as exc:
+                self._send_json(200, {
+                    "success": False,
+                    "markdown": f"启动采集浏览器失败：{exc}",
+                    "data": {"runtime": _chrome_runtime_status()},
+                })
             return
 
         if parsed.path == "/api/verify":
@@ -168,6 +334,8 @@ class TagCollectHandler(BaseHTTPRequestHandler):
         auto_verify_details = bool(payload.get("auto_verify_details", False))
         if isinstance(payload.get("auto_verify_details"), str):
             auto_verify_details = payload.get("auto_verify_details", "").lower() in ("1", "true", "yes", "on")
+        if collect_source in ("url_direct", "direct_url", "http_url") and not sample_data:
+            auto_verify_details = False
 
         if not sample_data:
             if not ALLOW_REAL_COLLECT:
@@ -181,7 +349,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             if collect_source == "api" and not ak_id:
                 self._send_json(200, {
                     "success": False,
-                    "markdown": "AK 未配置，当前 Web 工作台已阻止 API 真实采集。请先配置 AK，或改用真实页面 RPA 采集。",
+                    "markdown": "AK 未配置，当前 Web 工作台已阻止 API 真实采集。请先配置 AK，或改用人工页面读取。",
                     "data": {"run_id": "", "row_count": 0, "rows": []},
                 })
                 return
@@ -195,12 +363,13 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 exclude_tags=_csv_join(payload.get("exclude_tags")),
                 max_queries=int(payload.get("max_queries") or 20),
                 max_items_per_query=int(payload.get("max_items_per_query") or 20),
+                target_publishable_count=int(payload.get("target_publishable_count") or payload.get("max_items_per_query") or 20),
                 sample_data=sample_data,
                 output_format=str(payload.get("output_format") or "xlsx"),
                 collect_source=collect_source,
                 library_filters=payload.get("library_filters") or {},
                 auto_verify_details=auto_verify_details,
-                auto_verify_max_items=int(payload.get("auto_verify_max_items") or 3),
+                auto_verify_max_items=int(payload.get("auto_verify_max_items") or 0),
             )
             result = run_tag_collect(config)
             data = dict(result["data"])
@@ -209,6 +378,24 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"success": result["success"], "markdown": result["markdown"], "data": data})
         except Exception as exc:
             error_state = collect_error_state(exc)
+            detail = getattr(exc, "data", {}) or {}
+            filter_results = error_state.get("filter_results") or detail.get("filter_results") or []
+            if not isinstance(filter_results, list):
+                filter_results = []
+            error_snapshot_path = save_error_payload({
+                "request": {
+                    "categories": payload.get("categories") or [],
+                    "tags": payload.get("tags") or [],
+                    "keywords": payload.get("keywords") or "",
+                    "source_urls": payload.get("source_urls") or "",
+                    "collect_source": collect_source,
+                    "sample_data": sample_data,
+                    "max_items_per_query": payload.get("max_items_per_query"),
+                    "library_filters": payload.get("library_filters") or {},
+                },
+                "error_state": error_state,
+                "error_data": detail,
+            })
             self._send_json(200, {
                 "success": False,
                 "markdown": f"采集失败：{error_state['message']}",
@@ -220,6 +407,11 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                     "action": error_state["action"],
                     "retryable": error_state["retryable"],
                     "suggestion": error_state["suggestion"],
+                    "runtime": error_state.get("runtime", _chrome_runtime_status()),
+                    "filter_results": filter_results,
+                    "diagnostics": error_state.get("diagnostics") or detail.get("diagnostics") or {},
+                    "category_path": error_state.get("category_path") or detail.get("category_path") or "",
+                    "error_snapshot_path": error_snapshot_path,
                 },
             })
 
@@ -249,7 +441,8 @@ def serve_tag_collect_workbench(host: str = "127.0.0.1", port: int = 8765, allow
     server = ThreadingHTTPServer((host, port), TagCollectHandler)
     print(f"标签选品 Web 工作台已启动：http://{host}:{port}")
     if ALLOW_REAL_COLLECT:
-        print("真实页面采集已开启；默认通过 Playwright/RPA 打开 1688 页面采集真实数据。")
+        runtime = _chrome_runtime_status()
+        print(f"真实页面采集已开启；当前浏览器模式：{runtime['label']}。{runtime['message']}")
     else:
         print("真实采集未开启；当前环境只允许查看页面，不执行真实采集。")
     print("按 Ctrl+C 停止服务。")
@@ -879,6 +1072,201 @@ HTML_PAGE = r"""<!doctype html>
       min-height: 28px;
       padding: 5px 9px;
     }
+    .collect-mode-panel {
+      background: #f8fbff;
+      border: 1px solid #cfe3ff;
+      border-radius: 4px;
+      display: grid;
+      gap: 10px;
+      margin: 0 0 12px;
+      padding: 12px;
+    }
+    .collect-mode-head {
+      align-items: center;
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+    }
+    .collect-mode-head strong {
+      color: #111827;
+      font-size: 14px;
+      font-weight: 780;
+    }
+    .collect-mode-head span {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+    }
+    .collect-mode-options {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .collect-mode-card {
+      background: #ffffff;
+      border: 1px solid #dbe3ec;
+      border-radius: 4px;
+      cursor: pointer;
+      display: grid;
+      gap: 5px;
+      margin: 0;
+      min-height: 86px;
+      padding: 10px 12px;
+      position: relative;
+      transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+    }
+    .collect-mode-card input {
+      position: absolute;
+      opacity: 0;
+    }
+    .collect-mode-card strong {
+      color: #111827;
+      font-size: 13px;
+      font-weight: 780;
+      line-height: 1.25;
+    }
+    .collect-mode-card span {
+      color: #667085;
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+    .collect-mode-card em {
+      color: #98a2b3;
+      font-size: 11px;
+      font-style: normal;
+      line-height: 1.3;
+    }
+    .collect-mode-card:has(input:checked) {
+      background: #eef6ff;
+      border-color: #1677ff;
+      box-shadow: inset 3px 0 0 #1677ff, 0 2px 6px rgba(22, 119, 255, .12);
+    }
+    .collect-mode-card.is-risk:has(input:checked) {
+      background: #fff7e6;
+      border-color: #faad14;
+      box-shadow: inset 3px 0 0 #faad14, 0 2px 6px rgba(250, 173, 20, .12);
+    }
+    .collect-mode-status {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .collect-mode-status .status-pill {
+      background: #ffffff;
+    }
+    .browser-assist-box {
+      background: #ffffff;
+      border: 1px solid #b7d7ff;
+      border-radius: 4px;
+      display: grid;
+      gap: 10px;
+      padding: 11px;
+    }
+    .browser-assist-title {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+    }
+    .browser-assist-title strong {
+      color: #0958d9;
+      font-size: 13px;
+      font-weight: 780;
+    }
+    .browser-assist-actions {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .browser-assist-steps {
+      color: #344054;
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .browser-page-list {
+      display: grid;
+      gap: 6px;
+    }
+    .browser-page-item {
+      background: #f8fafc;
+      border: 1px solid #e4e9f2;
+      border-radius: 4px;
+      color: #475467;
+      display: grid;
+      gap: 3px;
+      padding: 8px;
+    }
+    .browser-page-item strong {
+      color: #111827;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .browser-page-item span {
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .collect-mode-hint {
+      color: #344054;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .collect-url-box {
+      background: #ffffff;
+      border: 1px solid #b7d7ff;
+      border-radius: 4px;
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+    }
+    .collect-url-box label {
+      align-items: center;
+      color: #0958d9;
+      display: flex;
+      font-size: 13px;
+      font-weight: 780;
+      justify-content: space-between;
+      margin: 0;
+    }
+    .collect-url-box label span {
+      color: #667085;
+      font-size: 12px;
+      font-weight: 560;
+    }
+    .collect-url-steps {
+      background: #f0f7ff;
+      border: 1px solid #d6e8ff;
+      border-radius: 4px;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 620;
+      line-height: 1.5;
+      padding: 8px 10px;
+    }
+    .collect-url-box textarea {
+      border-color: #91caff;
+      min-height: 72px;
+    }
+    .collect-url-box textarea:focus {
+      border-color: #1677ff;
+      box-shadow: 0 0 0 2px rgba(22, 119, 255, .14);
+    }
+    .collect-url-box.is-attention {
+      animation: urlAttention 1.4s ease 1;
+      border-color: #ff9f1a;
+      box-shadow: 0 0 0 3px rgba(255, 159, 26, .12);
+    }
+    @keyframes urlAttention {
+      0%, 100% { transform: translateY(0); }
+      35% { transform: translateY(-2px); }
+      70% { transform: translateY(1px); }
+    }
     .library-section {
       background: #ffffff;
       border-bottom: 1px solid var(--line-soft);
@@ -1113,7 +1501,7 @@ HTML_PAGE = r"""<!doctype html>
     }
     table {
       border-collapse: collapse;
-      min-width: 1780px;
+      min-width: 2060px;
       table-layout: fixed;
       width: 100%;
     }
@@ -1123,6 +1511,9 @@ HTML_PAGE = r"""<!doctype html>
       text-align: left;
       vertical-align: top;
       white-space: nowrap;
+      max-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     th {
       background: #f8fafc;
@@ -1135,6 +1526,7 @@ HTML_PAGE = r"""<!doctype html>
     }
     tbody tr:hover td { background: #fbfbfd; }
     th.col-seq, td.col-seq { width: 58px; }
+    th.col-_select, td.col-_select { width: 46px; }
     th.col-category_path, td.col-category_path { width: 270px; }
     th.col-title, td.col-title { width: 360px; }
     th.col-item_id, td.col-item_id { width: 140px; }
@@ -1151,11 +1543,21 @@ HTML_PAGE = r"""<!doctype html>
     th.col-shipment_rate, td.col-shipment_rate,
     th.col-recommendation_level, td.col-recommendation_level,
     th.col-verification_status, td.col-verification_status { width: 120px; }
+    th.col-verified_at, td.col-verified_at { width: 150px; }
     th.col-risk_flags, td.col-risk_flags { width: 210px; }
     th.col-wechat_shop_suggestion, td.col-wechat_shop_suggestion { width: 170px; }
-    td.col-category_path, td.col-title, td.col-risk_flags {
+    td.col-category_path, td.col-title, td.col-risk_flags,
+    td.col-wholesale_shipping_fee, td.col-dropship_shipping_fee,
+    td.col-product_refund_rate, td.col-shipment_rate {
       white-space: normal;
+      overflow-wrap: anywhere;
       word-break: break-word;
+    }
+    td.col-wholesale_shipping_fee,
+    td.col-dropship_shipping_fee,
+    td.col-product_refund_rate,
+    td.col-shipment_rate {
+      line-height: 1.45;
     }
     .badge {
       border-radius: 999px;
@@ -2467,6 +2869,17 @@ HTML_PAGE = r"""<!doctype html>
       background: #f7fbff;
       border-color: #b7dcff;
     }
+    .is-category-mismatch {
+      background: #f8fafc !important;
+      border-color: #e5e7eb !important;
+      opacity: .56;
+    }
+    .category-scope-label {
+      color: #64748b;
+      font-size: 11px;
+      margin-left: 6px;
+      white-space: nowrap;
+    }
     .is-reserved-filter {
       display: none !important;
     }
@@ -2831,6 +3244,65 @@ HTML_PAGE = r"""<!doctype html>
             </div>
           </div>
 
+          <div class="collect-mode-panel" id="collectModePanel">
+            <div class="collect-mode-head">
+              <strong>采集方式</strong>
+              <span>主流程：系统按你选择的类目和筛选条件批量执行；人工只负责登录和必要验证</span>
+            </div>
+            <div class="collect-mode-options" role="radiogroup" aria-label="采集方式">
+              <label class="collect-mode-card">
+                <input type="radio" name="collectModeChoice" value="rpa" checked />
+                <strong>自动批量采集（推荐）</strong>
+                <span>你在本页选类目、筛选和数量；系统复用采集 Chrome 登录态自动打开 1688、点击类目和筛选、翻页采集。</span>
+                <em>主流程；遇到滑块会暂停给你人工处理</em>
+              </label>
+              <label class="collect-mode-card">
+                <input type="radio" name="collectModeChoice" value="manual_url" />
+                <strong>当前页兜底读取</strong>
+                <span>风控或类目点击失败时使用：你在采集 Chrome 里手动筛好页面，系统只读取当前商品列表/详情页。</span>
+                <em>备用；不适合批量主流程</em>
+              </label>
+            </div>
+            <select id="collectSource" hidden aria-hidden="true">
+              <option value="rpa" selected>自动批量采集（推荐）</option>
+              <option value="manual_url">当前页兜底读取</option>
+              <option value="url_direct">URL 直连读取（备用）</option>
+              <option value="api">1688 AK/API</option>
+            </select>
+            <div id="browserAssistBox" class="browser-assist-box">
+              <div class="browser-assist-title">
+                <strong id="browserAssistTitle">自动批量采集流程</strong>
+                <span id="browserPageCount" class="status-pill">等待检测</span>
+              </div>
+              <div class="browser-assist-actions">
+                <button id="startChromeBtn" class="primary" type="button">启动采集 Chrome</button>
+                <button id="refreshChromeBtn" class="secondary" type="button">刷新状态</button>
+                <button id="readCurrentPageBtn" class="secondary" type="button">读取当前页兜底</button>
+              </div>
+              <div class="browser-assist-steps">
+                <span id="browserStep1">1. 先点击“启动采集 Chrome”，在弹出的 Chrome 里登录 1688 并完成必要验证。</span>
+                <span id="browserStep2">2. 回到本页选择类目、关键词、筛选条件和采集数量。</span>
+                <span id="browserStep3">3. 点击“开始自动采集”，系统会自动进入 1688 执行类目/筛选/翻页，采集完成后导出真实数据。</span>
+              </div>
+              <div id="browserPageList" class="browser-page-list"></div>
+            </div>
+            <div id="collectUrlBox" class="collect-url-box">
+              <label for="sourceUrls">
+                可选：指定要读取的 1688 页签 URL
+                <span>多个 1688 页签时用于匹配；URL 直连模式下必填</span>
+              </label>
+              <div class="collect-url-steps">
+                仅兜底读取模式需要：如果采集 Chrome 里打开了多个 1688 页签，可以粘贴目标页 URL 防止读错。
+              </div>
+              <textarea id="sourceUrls" placeholder="例如：https://s.1688.com/selloffer/offer_search.htm?keywords=收纳盒 或 https://detail.1688.com/offer/xxxx.html"></textarea>
+            </div>
+            <div class="collect-mode-status">
+              <span id="collectModeBadge" class="status-pill">自动批量采集</span>
+              <span id="runtimeBadge" class="status-pill">真实 Chrome 未连接</span>
+              <span id="realModeHint" class="collect-mode-hint">系统会自动按本页类目和筛选条件执行；如 1688 弹滑块/验证码，会暂停并交给你人工处理。</span>
+            </div>
+          </div>
+
           <div id="categoryFilterSection" class="filter-row compact">
             <div class="row-label">类目范围</div>
             <div class="row-control">
@@ -2879,13 +3351,8 @@ HTML_PAGE = r"""<!doctype html>
                   <input id="historyKeyword" type="text" placeholder="请输入历史关键词" />
                 </div>
                 <input id="sampleMode" type="checkbox" hidden aria-hidden="true" />
-                <div id="realModeHint" class="subtle-count" hidden>默认真实采集；可粘贴 1688 搜索页或详情页 URL 测试真实页面</div>
               </div>
               <div class="library-grid url-grid">
-                <div>
-                  <label for="sourceUrls">1688 页面 URL</label>
-                  <textarea id="sourceUrls" placeholder="可粘贴 1688 搜索页或商品详情页链接，用逗号分隔；填写后优先按 URL 采集真实页面"></textarea>
-                </div>
                 <div>
                   <label for="excludeTags">排除标签</label>
                   <textarea id="excludeTags" placeholder="屏蔽多个商品关键词，顿号隔开"></textarea>
@@ -2917,13 +3384,6 @@ HTML_PAGE = r"""<!doctype html>
                 </select>
               </div>
               <div>
-                <label for="collectSource">真实采集来源</label>
-                <select id="collectSource">
-                  <option value="rpa">1688 页面 RPA</option>
-                  <option value="api">1688 AK/API</option>
-                </select>
-              </div>
-              <div>
                 <label for="statPeriod">统计周期</label>
                 <select id="statPeriod" class="reserved-inline" data-library-select="stat_period" data-default-value="近30天" data-reserved-filter="true">
                   <option value="近30天">近30天</option>
@@ -2947,7 +3407,7 @@ HTML_PAGE = r"""<!doctype html>
                 <input id="maxQueries" type="number" min="1" max="200" value="20" />
               </div>
               <div>
-                <label for="maxItems">每词商品上限</label>
+                <label for="maxItems">目标可铺数</label>
                 <input id="maxItems" type="number" min="1" max="100" value="5" />
               </div>
               <div>
@@ -2959,13 +3419,13 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div>
                 <label for="autoVerifyMax">自动核验上限</label>
-                <input id="autoVerifyMax" type="number" min="1" max="20" value="3" />
+                <input id="autoVerifyMax" type="number" min="1" max="20" value="20" />
               </div>
             </div>
           </div>
 
           <div class="action-strip">
-            <button id="runBtn" class="primary" type="button">开始查询</button>
+            <button id="runBtn" class="primary" type="button">开始自动采集</button>
             <button id="resetBtn" class="secondary" type="button">重置筛选</button>
             <button id="saveFilterBtn" class="secondary ghost" type="button" disabled title="筛选模板接口预留">保存筛选</button>
           </div>
@@ -2974,9 +3434,9 @@ HTML_PAGE = r"""<!doctype html>
           <div class="sticky-action-bar" aria-label="筛选任务操作">
             <div class="sticky-action-meta">
               <strong id="stickyActionTitle">准备筛选 1688 商品</strong>
-              <span id="stickyActionText">选择类目、关键词或筛选项后开始查询；导出后再人工复核。</span>
+              <span id="stickyActionText">选择类目、关键词或筛选项后开始自动采集；导出后再人工复核。</span>
             </div>
-            <button id="stickyRunBtn" class="primary" type="button">开始查询</button>
+            <button id="stickyRunBtn" class="primary" type="button">开始自动采集</button>
             <button id="stickyResetBtn" class="secondary" type="button">重置</button>
             <a id="stickyDownloadLink" class="download" href="#" hidden>导出</a>
           </div>
@@ -2993,9 +3453,9 @@ HTML_PAGE = r"""<!doctype html>
           </div>
           <div class="summary">
             <div class="metric"><span>采集批次</span><strong id="runId">-</strong></div>
-            <div class="metric"><span>商品数</span><strong id="rowCount">0</strong></div>
+            <div class="metric"><span>结果商品</span><strong id="rowCount">0</strong></div>
             <div class="metric"><span>P0/P1</span><strong id="highCount">0</strong></div>
-            <div class="metric"><span>可铺/谨慎</span><strong id="suggestCount">0</strong></div>
+            <div class="metric"><span>达标可铺</span><strong id="suggestCount">0</strong></div>
           </div>
           </div>
         </div>
@@ -3028,7 +3488,7 @@ HTML_PAGE = r"""<!doctype html>
             <button id="verifyBtn" class="secondary" type="button" disabled>真实详情核验</button>
           </div>
           <div id="automationMessage" class="automation-message"></div>
-          <div id="resultEmptyHint" class="empty-result-card">还没有查询结果。先完成类目、搜索词或筛选条件，再点击“开始查询”；生成结果后可导出 Excel/CSV，导出后再人工复核。</div>
+          <div id="resultEmptyHint" class="empty-result-card">还没有查询结果。先完成类目、搜索词或筛选条件，再点击“开始自动采集”；生成结果后可导出 Excel/CSV，导出后再人工复核。</div>
           <div class="result-tools">
             <div>
               <label for="titleFilter">商品/类目</label>
@@ -3102,6 +3562,7 @@ HTML_PAGE = r"""<!doctype html>
       verificationRecords: [],
       filterReevaluationRecords: [],
       automationState: {},
+      runtime: {},
       filterPlan: {},
       filterResults: [],
       filterWarnings: [],
@@ -3163,6 +3624,269 @@ HTML_PAGE = r"""<!doctype html>
       const node = $("notice");
       node.textContent = text;
       node.className = `notice show ${mode || (ok ? "ok" : "fail")}`;
+    }
+
+    function runtimeLabel(runtime = state.runtime) {
+      if (!runtime) return "未知浏览器模式";
+      if (runtime.use_cdp) return runtime.cdp_connected ? "真实 Chrome 已连接" : "真实 Chrome 未连接";
+      return "项目内置浏览器";
+    }
+
+    function collectSourceLabel(value) {
+      if (value === "url_direct") return "URL 直连读取";
+      if (value === "manual_url") return "当前页兜底读取";
+      if (value === "rpa") return "自动批量采集";
+      if (value === "api") return "1688 AK/API";
+      return "未知采集方式";
+    }
+
+    function readable1688Pages(runtime = state.runtime) {
+      return (runtime?.pages || []).filter(page => page.is_collectable);
+    }
+
+    function renderChromeRuntime(runtime = state.runtime) {
+      const sourceMode = $("collectSource")?.value || "rpa";
+      const pages = readable1688Pages(runtime);
+      const all1688Pages = (runtime?.pages || []).filter(page => page.is_1688);
+      if ($("browserPageCount")) {
+        if (!runtime?.cdp_connected) {
+          $("browserPageCount").textContent = "Chrome 未连接";
+        } else if (sourceMode === "rpa") {
+          $("browserPageCount").textContent = "Chrome 已连接";
+        } else if (!pages.length) {
+          $("browserPageCount").textContent = all1688Pages.length ? "未进入商品页" : "未发现 1688 页";
+        } else {
+          $("browserPageCount").textContent = `${pages.length} 个可读取页签`;
+        }
+      }
+      if ($("browserPageList")) {
+        if (!runtime?.cdp_connected) {
+          $("browserPageList").innerHTML = `<div class="browser-page-item"><strong>还没有连接采集 Chrome</strong><span>点击“启动采集 Chrome”，在弹出的 Chrome 中打开并筛好 1688 页面。</span></div>`;
+        } else if (sourceMode === "rpa") {
+          $("browserPageList").innerHTML = `<div class="browser-page-item"><strong>采集 Chrome 已连接</strong><span>自动批量模式会从本页选择的类目和筛选条件开始执行，不要求你先手动打开商品列表页。</span></div>`;
+        } else if (!pages.length) {
+          const openedText = all1688Pages.length ? `已检测到 ${all1688Pages.length} 个 1688 页签，但还不是商品列表/详情页。` : "未检测到 1688 页签。";
+          $("browserPageList").innerHTML = `<div class="browser-page-item"><strong>未检测到可读取页面</strong><span>${openedText}请在采集 Chrome 中手动搜索、点击左侧类目或打开商品详情页，确认页面上有商品后再读取。</span></div>`;
+        } else {
+          $("browserPageList").innerHTML = pages.slice(0, 5).map(page => `
+            <div class="browser-page-item">
+              <strong>${esc(page.title || "1688 页面")}</strong>
+              <span>${esc(page.url || "-")}</span>
+            </div>
+          `).join("") + (pages.length > 5 ? `<div class="browser-page-item"><strong>还有 ${pages.length - 5} 个页签未展示</strong><span>建议只保留本次要采集的商品列表/详情页签。</span></div>` : "");
+        }
+      }
+    }
+
+    function updateRunButtonLabels() {
+      const sourceMode = $("collectSource")?.value || "rpa";
+      const label = sourceMode === "manual_url" ? "读取当前页" : "开始自动采集";
+      if ($("runBtn") && !$("runBtn").disabled) $("runBtn").textContent = label;
+      if ($("stickyRunBtn")) $("stickyRunBtn").textContent = label;
+      if ($("readCurrentPageBtn")) $("readCurrentPageBtn").hidden = sourceMode !== "manual_url";
+    }
+
+    function collectModeNoticeText(sourceMode) {
+      if (!state.options || !state.options.allow_real_collect) {
+        return {
+          text: "当前环境未开启真实采集：不会打开真实 1688 页面。正式测试请在运行服务的本机打开 127.0.0.1。",
+          ok: false,
+          mode: "paused"
+        };
+      }
+      if (state.debugSampleMode) {
+        return {
+          text: "调试样例入口已开启：本轮不会采集真实 1688 数据。人工验收请直接打开普通地址，不带调试参数。",
+          ok: false,
+          mode: "paused"
+        };
+      }
+      if (sourceMode === "url_direct") {
+        return {
+          text: "当前采集方式：URL 直连读取。该方式不复用登录态，容易被 1688 风控拦截；只建议用于公开页面诊断。",
+          ok: true,
+          mode: "ok"
+        };
+      }
+      if (sourceMode === "manual_url") {
+        return {
+          text: "当前采集方式：当前页兜底读取。只在自动批量被风控或类目点击失败后使用；请在采集 Chrome 中手动筛好商品列表页，再读取当前页。",
+          ok: true,
+          mode: "ok"
+        };
+      }
+      if (sourceMode === "rpa") {
+        return {
+          text: "当前采集方式：自动批量采集。系统会复用采集 Chrome 登录态，按本页类目和筛选条件自动执行；遇到滑块/验证码会暂停，交给你人工处理后继续。",
+          ok: true,
+          mode: "ok"
+        };
+      }
+      return {
+        text: "当前采集方式：1688 AK/API。该模式需要先配置 AK，未配置时会阻止真实采集。",
+        ok: true,
+        mode: "ok"
+      };
+    }
+
+    function updateCollectModeUI(showToast = false) {
+      const select = $("collectSource");
+      if (!select) return;
+      const sourceMode = select.value || "rpa";
+      renderChromeRuntime();
+      document.querySelectorAll("input[name='collectModeChoice']").forEach(input => {
+        input.checked = input.value === sourceMode;
+      });
+      if ($("collectModeBadge")) $("collectModeBadge").textContent = collectSourceLabel(sourceMode);
+      if ($("runtimeBadge")) {
+        if (sourceMode === "url_direct") {
+          $("runtimeBadge").textContent = "无需 Chrome";
+        } else if (sourceMode === "manual_url") {
+          $("runtimeBadge").textContent = state.runtime && state.runtime.cdp_connected ? "真实 Chrome 已连接" : "真实 Chrome 未连接";
+        } else if (sourceMode === "rpa") {
+          $("runtimeBadge").textContent = runtimeLabel();
+        } else {
+          $("runtimeBadge").textContent = "等待 AK 配置";
+        }
+      }
+      if ($("browserAssistBox")) $("browserAssistBox").hidden = !["manual_url", "rpa"].includes(sourceMode);
+      if ($("browserAssistTitle")) $("browserAssistTitle").textContent = sourceMode === "manual_url" ? "当前页兜底读取流程" : "自动批量采集流程";
+      if ($("browserStep1")) $("browserStep1").textContent = sourceMode === "manual_url"
+        ? "1. 点击“启动采集 Chrome”，在弹出的 Chrome 里登录 1688 并完成必要验证。"
+        : "1. 点击“启动采集 Chrome”，在弹出的 Chrome 里登录 1688 并完成必要验证。";
+      if ($("browserStep2")) $("browserStep2").textContent = sourceMode === "manual_url"
+        ? "2. 在采集 Chrome 里手动搜索、点击左侧类目、设置筛选条件，确认页面已经出现商品列表。"
+        : "2. 回到本页选择类目、关键词、筛选条件和采集数量。";
+      if ($("browserStep3")) $("browserStep3").textContent = sourceMode === "manual_url"
+        ? "3. 回到本页点击“读取当前页”，系统只读取你已经打开的真实页面。"
+        : "3. 点击“开始自动采集”，系统会自动进入 1688 执行类目/筛选/翻页，采集完成后导出真实数据。";
+      if ($("collectUrlBox")) {
+        const needsUrl = sourceMode === "url_direct";
+        const needsMatch = sourceMode === "manual_url" && readable1688Pages().length > 1;
+        $("collectUrlBox").hidden = !(needsUrl || needsMatch);
+      }
+      const notice = collectModeNoticeText(sourceMode);
+      if ($("realModeHint")) $("realModeHint").textContent = notice.text;
+      if ($("autoVerifyDetails")) {
+        const directMode = sourceMode === "url_direct";
+        $("autoVerifyDetails").disabled = directMode;
+        if (directMode) $("autoVerifyDetails").checked = false;
+      }
+      updateRunButtonLabels();
+      if (showToast) showNotice(notice.text, notice.ok, notice.mode);
+      updateSelectedSummary();
+    }
+
+    async function refreshChromeStatus(showToast = false) {
+      const response = await fetch("/api/chrome/status");
+      const result = await response.json();
+      if (result.success && result.data && result.data.runtime) {
+        state.runtime = result.data.runtime;
+        renderChromeRuntime();
+        updateCollectModeUI(false);
+        if (showToast) {
+          const sourceMode = $("collectSource")?.value || "rpa";
+          const ok = Boolean(state.runtime.cdp_ready);
+          const message = sourceMode === "rpa" && ok
+            ? "采集 Chrome 已连接；自动批量采集会按本页类目和筛选条件开始执行，不需要你先手动打开商品列表页。"
+            : (state.runtime.message || "采集 Chrome 状态已刷新。");
+          showNotice(message, ok, ok ? "ok" : "paused");
+        }
+      }
+      return state.runtime;
+    }
+
+    async function startCollectChrome() {
+      const btn = $("startChromeBtn");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "启动中";
+      }
+      try {
+        const response = await fetch("/api/chrome/start", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({token: state.options.token})
+        });
+        const result = await response.json();
+        if (result.data && result.data.runtime) state.runtime = result.data.runtime;
+        renderChromeRuntime();
+        updateCollectModeUI(false);
+        const sourceMode = $("collectSource")?.value || "rpa";
+        const ok = result.success && Boolean(state.runtime.cdp_ready);
+        const message = sourceMode === "rpa" && ok
+          ? "采集 Chrome 已连接；现在可以选择类目和筛选条件后点击“开始自动采集”。"
+          : (result.markdown || state.runtime.message || "采集 Chrome 已启动。");
+        showNotice(message, ok, ok ? "ok" : "paused");
+        return result.success;
+      } catch (err) {
+        showNotice(`启动采集 Chrome 失败：${err.message}`, false, "fail");
+        return false;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "启动采集 Chrome";
+        }
+      }
+    }
+
+    async function ensureChromeRuntimeReady() {
+      await refreshChromeStatus(false).catch(() => state.runtime);
+      if (!(state.runtime?.use_cdp && state.runtime?.cdp_ready)) {
+        const started = await startCollectChrome();
+        if (!started) return false;
+      }
+      return true;
+    }
+
+    async function ensureManualChromeReady() {
+      const chromeReady = await ensureChromeRuntimeReady();
+      if (!chromeReady) return false;
+      const pages = readable1688Pages();
+      if (!pages.length) {
+        showNotice("采集 Chrome 已启动，但还没有检测到可读取的商品列表/详情页。请在弹出的 Chrome 中手动登录 1688、搜索或点击左侧类目，确认页面上有商品后，再点击“读取当前页”。", false, "paused");
+        return false;
+      }
+      if (pages.length > 1 && !$("sourceUrls").value.trim()) {
+        if ($("collectUrlBox")) $("collectUrlBox").hidden = false;
+        showNotice("检测到多个可读取的 1688 页签。为避免读错页面，请只保留本次要采集的页签，或把目标页 URL 粘贴到“可选 URL”框后再读取。", false, "paused");
+        return false;
+      }
+      return true;
+    }
+
+    function focusSourceUrlBox() {
+      const box = $("collectUrlBox");
+      const input = $("sourceUrls");
+      if (!box || !input) return;
+      box.classList.remove("is-attention");
+      void box.offsetWidth;
+      box.classList.add("is-attention");
+      box.scrollIntoView({behavior: "smooth", block: "center"});
+      window.setTimeout(() => input.focus(), 280);
+    }
+
+    function runtimeHint(runtime = state.runtime) {
+      if (!runtime) return "";
+      return runtime.message || "";
+    }
+
+    function collectFailureNotice(result) {
+      const data = result.data || {};
+      const runtime = data.runtime || state.runtime || {};
+      const base = result.markdown || "采集失败";
+      const suggestion = data.suggestion || "";
+      if (data.error_code === "security_verification_required") {
+        const pageUrl = runtime.page_url ? ` 当前拦截页：${runtime.page_url}` : "";
+        return `${base} ${suggestion}${pageUrl}`;
+      }
+      if (data.error_code === "login_required") {
+        return `${base} ${suggestion || "请先在真实 Chrome 中完成 1688 登录，再回到本页查询。"}`;
+      }
+      if (runtime.use_cdp && runtime.cdp_connected === false) {
+        return `${base} 当前采集 Chrome 未连接。请点击“启动采集 Chrome”，在弹出的 Chrome 中登录 1688 后再开始自动采集。`;
+      }
+      return `${base}${suggestion ? ` ${suggestion}` : ""}`;
     }
 
     function updateCategorySummary() {
@@ -3399,13 +4123,14 @@ HTML_PAGE = r"""<!doctype html>
 
     function fieldStatusHint(field) {
       const mapping = field.mapping ? `映射：${field.mapping}` : "";
+      const scope = field.applicable_roots?.length ? `适用类目：${field.applicable_roots.slice(0, 6).join("、")}${field.applicable_roots.length > 6 ? "等" : ""}` : "";
       const statusHint = {
         supported: "可参与当前真实采集计划。",
         partial_supported: "可尝试执行，但命中情况以页面返回和详情核验为准。",
         detail_required: "列表页无法完全确认，需进入商品详情页核验后再判断。",
         reserved: "接口或数据源预留，默认不参与本次真实过滤。"
       }[field.status] || "需评审确认字段状态。";
-      return [statusHint, mapping].filter(Boolean).join(" ");
+      return [statusHint, scope, mapping].filter(Boolean).join(" ");
     }
 
     function fieldClass(field) {
@@ -3413,7 +4138,30 @@ HTML_PAGE = r"""<!doctype html>
       if (field.status === "reserved") classes.push("is-reserved-filter");
       if (field.status === "detail_required") classes.push("is-detail-filter");
       if (field.status === "partial_supported") classes.push("is-partial-filter");
+      if (!fieldAppliesToSelectedCategories(field)) classes.push("is-category-mismatch");
       return classes.join(" ");
+    }
+
+    function selectedCategoryRoots() {
+      return [...state.selectedCategories]
+        .map(value => String(value || "").split(">")[0])
+        .filter(Boolean);
+    }
+
+    function fieldAppliesToSelectedCategories(field) {
+      const roots = field.applicable_roots || [];
+      if (!roots.length) return true;
+      const selectedRoots = selectedCategoryRoots();
+      if (!selectedRoots.length) return true;
+      return selectedRoots.some(root => roots.includes(root));
+    }
+
+    function categoryScopeBadge(field) {
+      const roots = field.applicable_roots || [];
+      if (!roots.length) return "";
+      return fieldAppliesToSelectedCategories(field)
+        ? `<span class="category-scope-label">适用于当前类目</span>`
+        : `<span class="category-scope-label">当前类目未确认</span>`;
     }
 
     function renderLibraryFilters() {
@@ -3440,7 +4188,7 @@ HTML_PAGE = r"""<!doctype html>
         <div class="range-grid">
           ${rangeFields.map(field => `
             <div class="range-field ${fieldClass(field)}">
-              <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+              <label>${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</label>
               <div class="range-pair">
                 <input type="number" data-library-range="${esc(field.key)}" data-bound="min" placeholder="最小" />
                 <span class="range-sep">至</span>
@@ -3462,7 +4210,7 @@ HTML_PAGE = r"""<!doctype html>
     function renderLibraryField(field) {
       if (field.type === "multi_chip") {
         return `<div class="filter-block ${fieldClass(field)}" style="margin-top:0;">
-          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
           <div class="tag-grid">${(field.options || []).map(option => `
             <label class="chip"><input type="checkbox" data-library-list="${esc(field.key)}" value="${esc(option)}" />${esc(option)}</label>
           `).join("")}</div>
@@ -3471,7 +4219,7 @@ HTML_PAGE = r"""<!doctype html>
       }
       if (field.type === "radio") {
         return `<div class="filter-block ${fieldClass(field)}" style="margin-top:0;">
-          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
+          <div class="filter-block-head"><strong>${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</strong><span class="mapping-label">${esc(field.mapping || "")}</span></div>
           <div class="tag-grid">${(field.options || []).map((option, index) => `
             <label class="chip"><input type="radio" name="library-${esc(field.key)}" data-library-radio="${esc(field.key)}" value="${esc(option)}" ${index === 0 ? "checked" : ""} />${esc(option)}</label>
           `).join("")}</div>
@@ -3480,13 +4228,13 @@ HTML_PAGE = r"""<!doctype html>
       }
       if (field.type === "boolean") {
         return `<div class="boolean-field ${fieldClass(field)}">
-          <label class="chip"><input type="checkbox" data-library-bool="${esc(field.key)}" />${esc(field.label)} ${statusBadge(field.status)}</label>
+          <label class="chip"><input type="checkbox" data-library-bool="${esc(field.key)}" />${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</label>
           <div class="field-hint">${esc(fieldStatusHint(field))}</div>
         </div>`;
       }
       if (field.type === "select") {
         return `<div class="select-field ${fieldClass(field)}">
-          <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+          <label>${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</label>
           <select data-library-select="${esc(field.key)}">
             <option value="">不限</option>
             ${(field.options || []).map(option => `<option value="${esc(option)}">${esc(option)}</option>`).join("")}
@@ -3495,10 +4243,17 @@ HTML_PAGE = r"""<!doctype html>
         </div>`;
       }
       return `<div class="text-field ${fieldClass(field)}">
-        <label>${esc(field.label)} ${statusBadge(field.status)}</label>
+        <label>${esc(field.label)} ${statusBadge(field.status)} ${categoryScopeBadge(field)}</label>
         <input type="text" data-library-text="${esc(field.key)}" />
         <div class="field-hint">${esc(fieldStatusHint(field))}</div>
       </div>`;
+    }
+
+    function effectiveSourceUrls() {
+      const sourceMode = $("collectSource")?.value || "rpa";
+      const raw = $("sourceUrls")?.value.trim() || "";
+      if (sourceMode === "rpa" && state.selectedCategories.size > 0) return "";
+      return raw;
     }
 
     function collectLibraryFilters() {
@@ -3508,7 +4263,7 @@ HTML_PAGE = r"""<!doctype html>
       const matchType = $("matchType").value;
       const historyKeyword = $("historyKeyword").value.trim();
       const templateName = $("templateName").value.trim();
-      const sourceUrls = $("sourceUrls").value.trim();
+      const sourceUrls = effectiveSourceUrls();
       if (categoryPaths.length) filters.category_paths = categoryPaths;
       if (keyword) filters.search_keyword = keyword;
       if (matchType && matchType !== "模糊匹配") filters.match_type = matchType;
@@ -3597,20 +4352,33 @@ HTML_PAGE = r"""<!doctype html>
       const categoryPaths = filters.category_paths || [];
       const activeLabels = activeLibraryLabels(filters);
       const keyword = $("keywords")?.value.trim() || "";
-      const sourceUrls = $("sourceUrls")?.value.trim() || "";
+      const sourceUrls = effectiveSourceUrls();
       const historyKeyword = $("historyKeyword")?.value.trim() || "";
       const searchParts = [keyword, historyKeyword].filter(Boolean);
       $("selectedCategoryCount").textContent = categoryPaths.length ? `${categoryPaths.length} 个` : "全部";
       $("selectedCategoryText").textContent = categoryPaths.length ? categoryPaths.slice(0, 3).join("、") : "全部类目";
       $("selectedFilterCount").textContent = `${activeLabels.length} 项`;
       $("selectedFilterText").textContent = activeLabels.length ? activeLabels.slice(0, 5).join("、") : "未选择高级筛选";
-      $("selectedSearchMode").textContent = sourceUrls ? "URL" : "关键词";
-      $("selectedKeywordText").textContent = sourceUrls || searchParts.join("、") || "未填写关键词或 URL";
+      const sourceMode = $("collectSource")?.value || "rpa";
+      if (sourceMode === "manual_url") {
+        $("selectedSearchMode").textContent = "当前页";
+        const currentPage = state.runtime?.current_page || {};
+        $("selectedKeywordText").textContent = currentPage.url || sourceUrls || "读取采集 Chrome 当前 1688 页";
+      } else if (sourceMode === "rpa") {
+        $("selectedSearchMode").textContent = "自动批量";
+        $("selectedKeywordText").textContent = searchParts.join("、") || (categoryPaths.length ? "按已选类目自动采集" : "按筛选条件自动采集");
+      } else {
+        $("selectedSearchMode").textContent = sourceUrls ? "URL" : "关键词";
+        $("selectedKeywordText").textContent = sourceUrls || searchParts.join("、") || "未填写关键词或 URL";
+      }
       $("selectedResultText").textContent = `${state.rows.length} 条`;
       $("selectedExportText").textContent = state.runId ? `批次 ${state.runId}` : "运行后生成导出文件";
       if ($("stickyActionTitle")) {
         $("stickyActionTitle").textContent = state.runId ? `已生成 ${state.rows.length} 条结果` : "准备筛选 1688 商品";
-        $("stickyActionText").textContent = `${categoryPaths.length ? `类目 ${categoryPaths.length} 个` : "全部类目"} · ${activeLabels.length} 个筛选 · ${sourceUrls ? "URL 采集" : (keyword ? `关键词 ${keyword}` : "待填写搜索入口")}`;
+        const searchText = sourceMode === "manual_url"
+          ? "当前页兜底读取"
+          : (sourceMode === "rpa" ? "自动批量采集" : (sourceUrls ? "URL 采集" : (keyword ? `关键词 ${keyword}` : "待填写搜索入口")));
+        $("stickyActionText").textContent = `${categoryPaths.length ? `类目 ${categoryPaths.length} 个` : "全部类目"} · ${activeLabels.length} 个筛选 · ${searchText}`;
       }
       const detailLabels = selectedDetailLabels(filters);
       const warning = $("detailWarning");
@@ -3766,7 +4534,7 @@ HTML_PAGE = r"""<!doctype html>
       $("runId").textContent = data.run_id || "-";
       $("rowCount").textContent = String(state.rows.length);
       $("highCount").textContent = String(state.rows.filter(row => ["P0", "P1"].includes(row.recommendation_level)).length);
-      $("suggestCount").textContent = String(state.rows.filter(row => ["可铺", "谨慎"].includes(row.wechat_shop_suggestion)).length);
+      $("suggestCount").textContent = String(data.publishable_count ?? state.rows.filter(row => row.wechat_shop_suggestion === "可铺").length);
       $("queueCount").textContent = String(state.verificationQueue.length);
       $("verifiedCount").textContent = String(state.rows.filter(row => ["sample_verified", "verified", "partial_verified"].includes(row.verification_status)).length);
       $("recordCount").textContent = String(state.verificationRecords.length);
@@ -3778,7 +4546,27 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     function renderFilterRecords() {
+      const categoryDiagnosticText = (record) => {
+        const diagnostics = record.diagnostics || {};
+        const visibleTexts = Array.isArray(diagnostics.visible_category_texts) ? diagnostics.visible_category_texts.slice(0, 8).join("、") : "";
+        const missingStep = Array.isArray(record.category_steps)
+          ? record.category_steps.find(step => ["not_found", "click_failed", "not_confirmed"].includes(step.status))
+          : null;
+        const missing = missingStep && (missingStep.expected_text || (missingStep.needles || [])[0]);
+        const navigationState = record.navigation_state || {};
+        const steps = Array.isArray(record.category_steps)
+          ? record.category_steps.map(step => `${step.depth}.${step.expected_text || "-"}:${step.mode || "-"}=${step.status || "-"}`).join(" / ")
+          : "";
+        const pieces = [];
+        if (missing) pieces.push(`未命中：${missing}`);
+        if (steps) pieces.push(`点击链路：${steps}`);
+        if (record.status === "not_confirmed") pieces.push("未确认进入目标类目结果页");
+        if (navigationState.leaf_in_url || navigationState.leaf_in_page) pieces.push("叶子类目已在结果页出现");
+        if (visibleTexts) pieces.push(`页面可见类目：${visibleTexts}`);
+        return pieces.join(" · ");
+      };
       const planned = [
+        ...(state.filterPlan.category_filters || []).map(item => ({...item, plan_type: "1688类目点击"})),
         ...(state.filterPlan.native_filters || []).map(item => ({...item, plan_type: "1688原生筛选"})),
         ...(state.filterPlan.post_filters || []).map(item => ({...item, plan_type: "指标区间"})),
         ...(state.filterPlan.system_rules || []).map(item => ({...item, plan_type: "系统规则"})),
@@ -3794,8 +4582,12 @@ HTML_PAGE = r"""<!doctype html>
       const rows = execution.length
         ? execution.map(record => ({
             title: `${record.label || record.tag || record.filter_key || "-"} · ${record.status || "-"}`,
-            line1: `来源：${record.source || "-"} · ${record.query || "-"}`,
-            line2: record.message || record.matched_text || "-"
+            line1: record.source === "1688_category_navigation"
+              ? `期望：${record.expected_path || record.tag || "-"} · 命中：${record.matched_path || record.matched_text || "-"}`
+              : `来源：${record.source || "-"} · ${record.query || "-"}`,
+            line2: record.source === "1688_category_navigation"
+              ? `层级：${record.matched_depth || 0}/${record.expected_depth || "-"} · ${record.final_url || record.page_url || "-"}${categoryDiagnosticText(record) ? ` · ${categoryDiagnosticText(record)}` : ""}`
+              : (record.message || record.matched_text || "-")
           }))
         : planned.map(record => ({
             title: `${record.plan_type} · ${record.label || record.tag || record.key || "-"}`,
@@ -3826,21 +4618,37 @@ HTML_PAGE = r"""<!doctype html>
 
     async function runCollect() {
       $("runBtn").disabled = true;
-      $("runBtn").textContent = "采集中";
+      $("runBtn").textContent = "读取中";
       try {
+        const sourceMode = $("collectSource").value;
+        if (!state.debugSampleMode && sourceMode === "url_direct" && !$("sourceUrls").value.trim()) {
+          focusSourceUrlBox();
+          showNotice("还没有粘贴 1688 链接：请先去 1688 手动搜索/筛选商品，复制浏览器地址栏链接，再粘贴到下方蓝色 URL 输入框。", false, "paused");
+          return;
+        }
+        if (!state.debugSampleMode && sourceMode === "manual_url") {
+          const ready = await ensureManualChromeReady();
+          if (!ready) return;
+        }
+        if (!state.debugSampleMode && sourceMode === "rpa") {
+          const ready = await ensureChromeRuntimeReady();
+          if (!ready) return;
+        }
+        const sourceUrlsForPayload = effectiveSourceUrls();
         const payload = {
           categories: [...state.selectedCategories],
           tags: [...state.selectedTags],
           keywords: $("keywords").value,
-          source_urls: $("sourceUrls").value,
+          source_urls: sourceUrlsForPayload,
           exclude_tags: $("excludeTags").value,
           library_filters: collectLibraryFilters(),
           max_queries: Number($("maxQueries").value || 20),
           max_items_per_query: Number($("maxItems").value || 5),
+          target_publishable_count: Number($("maxItems").value || 5),
           auto_verify_details: $("autoVerifyDetails").checked,
-          auto_verify_max_items: Number($("autoVerifyMax").value || 3),
+          auto_verify_max_items: Number($("autoVerifyMax").value || $("maxItems").value || 20),
           output_format: $("outputFormat").value,
-          collect_source: $("collectSource").value,
+          collect_source: sourceMode,
           sample_data: state.debugSampleMode,
           token: state.options.token
         };
@@ -3850,13 +4658,22 @@ HTML_PAGE = r"""<!doctype html>
           body: JSON.stringify(payload)
         });
         const result = await response.json();
+        if (result.data && result.data.runtime) {
+          state.runtime = result.data.runtime;
+          renderChromeRuntime();
+          updateCollectModeUI(false);
+        }
         if (!result.success) {
           clearRunState();
-          if (result.data && result.data.error_code === "security_verification_required") {
-            showNotice(`${result.markdown || "1688 风控已暂停采集"} ${result.data.suggestion || "请人工处理后再继续。"}`, false, "paused");
-          } else {
-            showNotice(result.markdown || "采集失败", false);
-          }
+          state.filterResults = (result.data && result.data.filter_results) || [];
+          state.filterWarnings = state.filterResults;
+          renderFilterRecords();
+          const errorCode = result.data && result.data.error_code;
+          showNotice(
+            collectFailureNotice(result),
+            false,
+            ["security_verification_required", "login_required", "search_keyword_encoding_error", "search_box_not_found", "search_results_not_loaded", "category_navigation_not_loaded", "navigation_timeout", "direct_url_required", "direct_url_fetch_failed"].includes(errorCode) ? "paused" : "fail"
+          );
           return;
         }
         state.selectedRows.clear();
@@ -3873,22 +4690,27 @@ HTML_PAGE = r"""<!doctype html>
         $("downloadLink").hidden = false;
         $("stickyDownloadLink").href = result.data.download_url;
         $("stickyDownloadLink").hidden = false;
-        const modeText = state.debugSampleMode ? "调试样例" : `真实数据/${$("collectSource").value === "rpa" ? "1688页面RPA" : "AK/API"}`;
-        const queryLabel = $("sourceUrls").value.trim() ? "采集页面" : "查询词";
+        const sourceLabel = collectSourceLabel($("collectSource").value);
+        const modeText = state.debugSampleMode ? "调试样例" : `真实数据/${sourceLabel}`;
+        const queryLabel = sourceMode === "manual_url" ? "当前页" : (sourceUrlsForPayload ? "采集页面" : "查询词");
         const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
         const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
+        const targetText = result.data.target_publishable_count
+          ? `可铺目标 ${result.data.publishable_count || 0}/${result.data.target_publishable_count}，可铺/谨慎候选 ${result.data.publishable_candidate_count || 0}，候选扫描 ${result.data.candidate_count || 0}/${result.data.candidate_scan_limit || "-"}，历史跳过 ${result.data.skipped_rejected_count || 0}。`
+          : "";
+        const shortfallText = result.data.shortfall_reason ? `未达目标：${result.data.shortfall_reason}。` : "";
         const autoVerifyText = result.data.auto_verify_details
           ? `已自动详情核验 ${result.data.verified_count || 0} 个，剩余待核验 ${state.verificationQueue.length} 个。`
           : "运费、品退率、发货率等关键字段仍需详情页核验。";
         const automation = result.data.automation_state || {};
         const stateText = automation.message ? `状态：${automation.message}` : autoVerifyText;
         const ok = (state.filterWarnings || []).length === 0 && !["paused", "failed", "partial"].includes(automation.status || "");
-        showNotice(`已生成 ${result.data.row_count} 条初筛商品（${modeText}）；${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}${autoVerifyText}${stateText ? ` ${stateText}` : ""}`, ok, automationNoticeMode(automation));
+        showNotice(`已生成 ${result.data.row_count} 条筛选结果（${modeText}）；${targetText}${shortfallText}${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}${autoVerifyText}${stateText ? ` ${stateText}` : ""}`, ok, automationNoticeMode(automation));
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
       } finally {
         $("runBtn").disabled = false;
-        $("runBtn").textContent = "开始查询";
+        updateRunButtonLabels();
       }
     }
 
@@ -3955,6 +4777,7 @@ HTML_PAGE = r"""<!doctype html>
         if (parts[1]) state.activeCategoryChild = parts[1];
       }
       target.dataset.kind === "category" ? renderCategories() : renderFilterGroups();
+      if (target.dataset.kind === "category") renderLibraryFilters();
       updateSelectedSummary();
     });
 
@@ -3984,20 +4807,34 @@ HTML_PAGE = r"""<!doctype html>
       if (remove) {
         state.selectedCategories.delete(remove.dataset.categoryRemove);
         renderCategories();
+        renderLibraryFilters();
+        updateSelectedSummary();
         return;
       }
       const nav = event.target.closest("[data-category-nav]");
       if (!nav) return;
       const parts = (nav.dataset.categoryPath || "").split(">");
+      const path = nav.dataset.categoryPath || "";
       if (nav.dataset.categoryNav === "parent" && parts[0]) {
         state.activeCategoryParent = parts[0];
         state.activeCategoryChild = "";
       }
-      if ((nav.dataset.categoryNav === "child" || nav.dataset.categoryNav === "grand") && parts[0]) {
+      if (nav.dataset.categoryNav === "child" && parts[0]) {
         state.activeCategoryParent = parts[0];
         state.activeCategoryChild = parts[1] || "";
+        const hasGrandchildren = categoryEntries(parts[0]).some(([child, grandchildren]) => (
+          child === parts[1] && Array.isArray(grandchildren) && grandchildren.length
+        ));
+        if (!hasGrandchildren && path) state.selectedCategories.add(path);
+      }
+      if (nav.dataset.categoryNav === "grand" && parts[0]) {
+        state.activeCategoryParent = parts[0];
+        state.activeCategoryChild = parts[1] || "";
+        if (path) state.selectedCategories.add(path);
       }
       renderCategories();
+      renderLibraryFilters();
+      updateSelectedSummary();
     });
 
     document.addEventListener("input", (event) => {
@@ -4010,6 +4847,13 @@ HTML_PAGE = r"""<!doctype html>
       const target = event.target;
       if (!target.matches("#matchType, #autoVerifyDetails, #statPeriod, #sortBy, [data-library-list], [data-library-bool], [data-library-radio], [data-library-select]")) return;
       updateSelectedSummary();
+    });
+
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!target.matches("input[name='collectModeChoice']")) return;
+      $("collectSource").value = target.value;
+      updateCollectModeUI(true);
     });
 
     ["titleFilter", "minScore", "levelFilter", "verificationFilter", "suggestFilter"].forEach(id => {
@@ -4047,8 +4891,9 @@ HTML_PAGE = r"""<!doctype html>
         if ($(id)) $(id).value = "0";
       });
       if ($("autoVerifyDetails")) $("autoVerifyDetails").checked = true;
-      if ($("autoVerifyMax")) $("autoVerifyMax").value = "3";
+      if ($("autoVerifyMax")) $("autoVerifyMax").value = "20";
       if ($("matchType")) $("matchType").value = "模糊匹配";
+      if ($("collectSource")) $("collectSource").value = "rpa";
       if ($("statPeriod")) $("statPeriod").value = "近30天";
       if ($("sortBy")) $("sortBy").value = "推荐分";
       document.querySelectorAll("[data-library-list], [data-library-bool]").forEach(input => input.checked = false);
@@ -4062,6 +4907,7 @@ HTML_PAGE = r"""<!doctype html>
       renderCategories();
       renderFilterGroups();
       renderTable();
+      updateCollectModeUI();
       updateSelectedSummary();
       showNotice("筛选条件已重置。", true);
     });
@@ -4086,6 +4932,9 @@ HTML_PAGE = r"""<!doctype html>
     });
     $("runBtn").addEventListener("click", runCollect);
     $("stickyRunBtn").addEventListener("click", runCollect);
+    $("readCurrentPageBtn").addEventListener("click", runCollect);
+    $("startChromeBtn").addEventListener("click", startCollectChrome);
+    $("refreshChromeBtn").addEventListener("click", () => refreshChromeStatus(true));
     $("stickyResetBtn").addEventListener("click", () => $("resetBtn").click());
     $("verifyBtn").addEventListener("click", runVerify);
     $("reviewModeToggle").addEventListener("change", (event) => {
@@ -4099,6 +4948,7 @@ HTML_PAGE = r"""<!doctype html>
       const response = await fetch("/api/options");
       const result = await response.json();
       state.options = result.data;
+      state.runtime = state.options.runtime || {};
       const caps = state.options.library_capabilities || {};
       $("capabilityBadge").textContent = `已接入 ${((caps.implemented || []).length)} 项 / 预留 ${((caps.reserved || []).length)} 项`;
       $("maxQueries").max = state.options.limits.max_queries;
@@ -4110,16 +4960,7 @@ HTML_PAGE = r"""<!doctype html>
       $("reviewModeToggle").checked = state.reviewMode;
       $("sampleMode").checked = state.debugSampleMode;
       $("verifyBtn").textContent = state.debugSampleMode ? "调试核验高潜" : "真实详情核验";
-      if (!state.options.allow_real_collect) {
-        $("realModeHint").textContent = "当前环境未开启真实采集；请在运行服务的本机打开 127.0.0.1 后测试真实数据";
-        showNotice("当前环境未开启真实采集：不会打开真实 1688 页面。正式测试请在运行服务的本机打开 127.0.0.1。", false, "paused");
-      } else if (state.debugSampleMode) {
-        $("realModeHint").textContent = "调试样例入口已开启；此模式仅用于 Codex 自测，不用于人工验收";
-        showNotice("调试样例入口已开启：本轮不会采集真实 1688 数据。人工验收请直接打开普通地址，不带调试参数。", false, "paused");
-      } else {
-        $("realModeHint").textContent = "默认真实采集；可粘贴 1688 搜索页或详情页 URL 测试真实页面";
-        showNotice("当前将执行真实采集：会打开 1688 页面采集真实数据；如账号登录不上，可粘贴浏览器里能打开的 1688 搜索页/商品详情页 URL 测试。", true);
-      }
+      if ($("collectSource")) $("collectSource").value = "rpa";
       renderCategories();
       renderLibraryFilters();
       renderFilterGroups();
@@ -4127,6 +4968,8 @@ HTML_PAGE = r"""<!doctype html>
       renderFields();
       renderTable();
       updateSummary({});
+      renderChromeRuntime();
+      updateCollectModeUI(true);
       updateSelectedSummary();
     }
 

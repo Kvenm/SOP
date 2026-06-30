@@ -3,20 +3,29 @@
 
 import json
 import os
+import re
+import hashlib
+import html as html_lib
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
 
 from _const import TAG_COLLECT_DATA_DIR
+from _errors import ServiceError
 
 
 _DATA_DIR_CACHE: Optional[str] = None
 MAX_QUERIES = 50
 MAX_ITEMS_PER_QUERY = 50
 DETAIL_VERIFICATION_PENDING = "待详情页核验"
+PUBLISHABLE_SUGGESTIONS = {"可铺"}
+PUBLISHABLE_CANDIDATE_SUGGESTIONS = {"可铺", "谨慎"}
 DETAIL_ONLY_FIELDS = {
     "min_order_range",
     "dropship_price",
@@ -39,10 +48,12 @@ DETAIL_ONLY_FIELDS = {
     "company_type",
     "seller_member_type",
     "source_factory",
+    "shop_url",
     "certificates",
     "trustpass_years",
     "seller_locations",
     "stock",
+    "sku_count",
     "video_query",
     "product_rating",
     "review_tags",
@@ -50,6 +61,16 @@ DETAIL_ONLY_FIELDS = {
 DETAIL_VERIFICATION_FIELDS = DETAIL_ONLY_FIELDS | {
     "good_rate",
     "comment_count",
+}
+AUTO_REVIEW_REQUIRED_DETAIL_FIELDS = {
+    "wholesale_shipping_fee",
+    "dropship_shipping_fee",
+    "free_shipping",
+    "product_refund_rate",
+    "shipment_rate",
+    "collection_rate_24h",
+    "supports_dropship",
+    "return_exchange_support",
 }
 DETAIL_VERIFICATION_LEVELS = {"P0", "P1"}
 VERIFICATION_STATUS_UNVERIFIED = "unverified"
@@ -60,6 +81,14 @@ VERIFICATION_STATUS_FAILED = "failed"
 VERIFICATION_STATUS_FILTERED_OUT = "filtered_out"
 SECURITY_BLOCK_CODE = "security_verification_required"
 LOGIN_REQUIRED_CODE = "login_required"
+SEARCH_KEYWORD_ENCODING_CODE = "search_keyword_encoding_error"
+SEARCH_BOX_NOT_FOUND_CODE = "search_box_not_found"
+SEARCH_RESULTS_NOT_LOADED_CODE = "search_results_not_loaded"
+CATEGORY_NAVIGATION_NOT_LOADED_CODE = "category_navigation_not_loaded"
+CATEGORY_PATH_INVALID_CODE = "category_path_invalid"
+DIRECT_URL_REQUIRED_CODE = "direct_url_required"
+DIRECT_URL_COLLECT_SOURCES = {"url_direct", "direct_url", "http_url"}
+MANUAL_PAGE_COLLECT_SOURCES = {"manual_url", "manual_page", "current_page"}
 REMOVED_LIBRARY_FILTER_KEYS = {
     "selection_modes",
     "order_growth_7d",
@@ -100,56 +129,27 @@ AUTOMATION_ACTION_LABELS = {
     "manual_review": "导出后人工复核",
 }
 
-REFERENCE_EXPORT_LABELS = [
+DIANLEIDA_REFERENCE_EXPORT_LABELS = [
     "序号",
     "商品类目",
     "商品主图",
     "商品标题",
     "商品ID",
     "商品链接(点击下方链接可跳转)",
-    "主图链接(点击下方链接可跳转)",
-    "来源关键词",
-    "命中标签",
+    "上架时间",
     "批发价",
     "起批范围",
-    "代发价",
-    "批发运费",
-    "代发运费",
-    "是否包邮",
-    "标准化价格区间",
-    "上架时间",
     "近30天订单数",
     "近30天件数",
     "近30天销售额",
     "销售趋势(件)",
-    "月代发订单",
-    "收藏客户",
-    "下游铺货数",
-    "同款/相似款数量",
-    "商品标识",
-    "红海/蓝海判断",
     "复购率",
-    "评论数",
-    "好评率",
-    "品退率",
-    "资质证书",
-    "好评率区间",
-    "品退率区间",
-    "评论数区间",
-    "复购率区间",
-    "商品星级",
-    "评价标签",
+    "代发价",
     "权益保障",
     "代发权益",
     "面单支持",
-    "24小时揽收率",
-    "发货率",
-    "发货时效",
-    "是否一件代发",
-    "是否支持退换",
-    "发货率区间",
-    "近30天销量区间",
-    "代发订单量区间",
+    "商品标识",
+    "资质证书",
     "店铺名称",
     "所在地",
     "综合服务",
@@ -158,6 +158,41 @@ REFERENCE_EXPORT_LABELS = [
     "卖家服务",
     "诚信通年限",
     "店铺链接(点击下方链接可跳转)",
+    "主图链接(点击下方链接可跳转)",
+    "月代发订单",
+    "SKU数量",
+    "收藏客户",
+    "评论数",
+    "库存",
+    "查询视频",
+    "批发运费",
+    "代发运费",
+]
+
+PROJECT_EXTENSION_EXPORT_LABELS = [
+    "来源关键词",
+    "命中标签",
+    "是否包邮",
+    "标准化价格区间",
+    "下游铺货数",
+    "同款/相似款数量",
+    "红海/蓝海判断",
+    "好评率",
+    "品退率",
+    "好评率区间",
+    "品退率区间",
+    "评论数区间",
+    "复购率区间",
+    "商品星级",
+    "评价标签",
+    "24小时揽收率",
+    "发货率",
+    "发货时效",
+    "是否一件代发",
+    "是否支持退换",
+    "发货率区间",
+    "近30天销量区间",
+    "代发订单量区间",
     "是否源头工厂",
     "适合微信小店(规则预判)",
     "适合抖店",
@@ -165,12 +200,10 @@ REFERENCE_EXPORT_LABELS = [
     "适合小红书",
     "适合淘宝",
     "推荐平台",
-    "查询视频",
     "品牌/侵权风险",
     "低价质损风险",
     "售后风险",
     "数据不足风险",
-    "库存",
     "推荐分",
     "推荐等级",
     "推荐理由",
@@ -182,6 +215,96 @@ REFERENCE_EXPORT_LABELS = [
     "人工复核状态",
     "人工复核备注",
     "微信小店铺货建议(人工复核)",
+]
+
+REFERENCE_EXPORT_LABELS = DIANLEIDA_REFERENCE_EXPORT_LABELS + PROJECT_EXTENSION_EXPORT_LABELS
+
+DIANLEIDA_REFERENCE_EXPORT_KEYS = [
+    "seq",
+    "category_path",
+    "image_cell",
+    "title",
+    "item_id",
+    "url",
+    "listed_at",
+    "wholesale_price",
+    "min_order_range",
+    "orders_30d",
+    "units_30d",
+    "sales_amount_30d",
+    "sales_trend_units",
+    "repurchase_rate",
+    "dropship_price",
+    "rights_protection",
+    "dropship_rights",
+    "waybill_support",
+    "product_mark",
+    "certificates",
+    "shop_name",
+    "location",
+    "service_score",
+    "company_type",
+    "seller_member_type",
+    "seller_services",
+    "trustpass_years",
+    "shop_url",
+    "image_url",
+    "monthly_dropship_orders",
+    "sku_count",
+    "favorite_customers",
+    "comment_count",
+    "stock",
+    "video_query",
+    "wholesale_shipping_fee",
+    "dropship_shipping_fee",
+]
+
+PROJECT_EXTENSION_EXPORT_KEYS = [
+    "source_keyword",
+    "matched_tags",
+    "free_shipping",
+    "normalized_price_band",
+    "downstream_offer_count",
+    "similar_item_count",
+    "market_competition",
+    "good_rate",
+    "product_refund_rate",
+    "good_rate_bucket",
+    "product_refund_rate_bucket",
+    "comment_count_bucket",
+    "repurchase_rate_bucket",
+    "product_rating",
+    "review_tags",
+    "collection_rate_24h",
+    "shipment_rate",
+    "shipment_speed",
+    "supports_dropship",
+    "return_exchange_support",
+    "shipment_rate_bucket",
+    "units_30d_bucket",
+    "monthly_dropship_orders_bucket",
+    "source_factory",
+    "wechat_shop_suggestion",
+    "douyin_suggestion",
+    "pinduoduo_suggestion",
+    "xiaohongshu_suggestion",
+    "taobao_suggestion",
+    "recommended_platform",
+    "brand_ip_risk",
+    "low_price_quality_risk",
+    "after_sales_risk",
+    "data_gap_risk",
+    "recommendation_score",
+    "recommendation_level",
+    "recommendation_reason",
+    "risk_flags",
+    "tag_source",
+    "run_id",
+    "collected_at",
+    "verification_status",
+    "manual_review_status",
+    "manual_review_note",
+    "manual_wechat_shop_suggestion",
 ]
 
 
@@ -238,6 +361,213 @@ def get_tag_collect_data_dir() -> str:
     raise PermissionError("未找到可写的 tag_collect 数据目录")
 
 
+def _rejected_products_path() -> str:
+    return os.path.join(get_tag_collect_data_dir(), "rejected_products.json")
+
+
+def _empty_rejected_products() -> Dict[str, Any]:
+    return {"version": 1, "updated_at": "", "items": {}}
+
+
+def _load_rejected_products() -> Dict[str, Any]:
+    path = _rejected_products_path()
+    if not os.path.exists(path):
+        return _empty_rejected_products()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return _empty_rejected_products()
+    if not isinstance(payload, dict):
+        return _empty_rejected_products()
+    items = payload.get("items")
+    if isinstance(items, list):
+        converted: Dict[str, List[Dict[str, Any]]] = {}
+        for record in items:
+            if not isinstance(record, dict):
+                continue
+            item_id = str(record.get("item_id") or "").strip()
+            if item_id:
+                converted.setdefault(item_id, []).append(record)
+        payload["items"] = converted
+    elif not isinstance(items, dict):
+        payload["items"] = {}
+    payload["version"] = payload.get("version") or 1
+    payload["updated_at"] = payload.get("updated_at") or ""
+    return payload
+
+
+def _save_rejected_products(payload: Dict[str, Any]) -> None:
+    path = _rejected_products_path()
+    Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
+    payload["updated_at"] = _now_iso()
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def _offer_id_from_url(url: Any) -> str:
+    text = str(url or "")
+    match = re.search(r"/offer/(\d+)", text) or re.search(r"[?&]offerId=(\d+)", text)
+    return match.group(1) if match else ""
+
+
+def _canonical_item_id(item_id: Any, url: Any = "") -> str:
+    return str(item_id or "").strip() or _offer_id_from_url(url)
+
+
+def _append_rejected_products(records: List[Dict[str, Any]]) -> None:
+    normalized = [
+        record for record in records
+        if isinstance(record, dict) and str(record.get("item_id") or "").strip()
+    ]
+    if not normalized:
+        return
+    payload = _load_rejected_products()
+    items = payload.setdefault("items", {})
+    for record in normalized:
+        item_id = str(record.get("item_id") or "").strip()
+        existing = items.setdefault(item_id, [])
+        if not isinstance(existing, list):
+            existing = []
+            items[item_id] = existing
+        key = (
+            str(record.get("filter_signature") or ""),
+            str(record.get("target_platform") or ""),
+            str(record.get("reason_code") or ""),
+        )
+        replaced = False
+        for index, old in enumerate(existing):
+            old_key = (
+                str(old.get("filter_signature") or ""),
+                str(old.get("target_platform") or ""),
+                str(old.get("reason_code") or ""),
+            )
+            if old_key == key:
+                existing[index] = {**old, **record, "updated_at": _now_iso()}
+                replaced = True
+                break
+        if not replaced:
+            existing.append({**record, "created_at": record.get("created_at") or _now_iso()})
+    _save_rejected_products(payload)
+
+
+def _target_platform_from_tags(tags: Iterable[Any]) -> str:
+    values = [str(item or "").strip() for item in tags if str(item or "").strip()]
+    if "微信小店" in values:
+        return "微信小店"
+    for value in values:
+        if value in CHANNEL_TAGS:
+            return value
+    return "微信小店"
+
+
+def _filter_signature_from_parts(
+    categories: Iterable[Any],
+    tags: Iterable[Any],
+    exclude_tags: Iterable[Any],
+    library_filters: Dict[str, Any],
+) -> str:
+    payload = {
+        "categories": sorted(str(item or "").strip() for item in categories if str(item or "").strip()),
+        "tags": sorted(str(item or "").strip() for item in tags if str(item or "").strip()),
+        "exclude_tags": sorted(str(item or "").strip() for item in exclude_tags if str(item or "").strip()),
+        "library_filters": _sanitize_library_filters(library_filters or {}),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _filter_signature_for_config(config: "TagCollectInput") -> str:
+    return _filter_signature_from_parts(
+        config.categories,
+        config.tags,
+        config.exclude_tags,
+        config.library_filters,
+    )
+
+
+def _filter_signature_for_payload(payload: Dict[str, Any]) -> str:
+    return _filter_signature_from_parts(
+        payload.get("categories") or [],
+        payload.get("tags") or [],
+        payload.get("exclude_tags") or [],
+        payload.get("library_filters") or {},
+    )
+
+
+def _matched_rejected_record(
+    item_id: Any,
+    url: Any,
+    rejected_products: Dict[str, Any],
+    *,
+    filter_signature: str,
+    target_platform: str,
+) -> Optional[Dict[str, Any]]:
+    canonical_id = _canonical_item_id(item_id, url)
+    if not canonical_id:
+        return None
+    records = (rejected_products.get("items") or {}).get(canonical_id, [])
+    if isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("expires_at") and str(record.get("expires_at")) < _now_iso():
+            continue
+        record_platform = str(record.get("target_platform") or "微信小店")
+        record_signature = str(record.get("filter_signature") or "")
+        if record.get("scope") == "global":
+            return record
+        if record_platform == target_platform and record_signature == filter_signature:
+            return record
+    return None
+
+
+def _rejection_record(
+    row: Dict[str, Any],
+    *,
+    reason_code: str,
+    reason_text: str,
+    filter_signature: str,
+    target_platform: str,
+    source_run_id: str = "",
+) -> Dict[str, Any]:
+    item_id = _canonical_item_id(row.get("item_id"), row.get("url"))
+    return {
+        "item_id": item_id,
+        "url": row.get("url", ""),
+        "title": row.get("title", ""),
+        "category_path": row.get("category_path", ""),
+        "reason_code": reason_code,
+        "reason_text": reason_text,
+        "target_platform": target_platform,
+        "filter_signature": filter_signature,
+        "scope": "filter_signature",
+        "source_run_id": source_run_id,
+        "wechat_shop_suggestion": row.get("wechat_shop_suggestion", ""),
+        "recommendation_score": row.get("recommendation_score", ""),
+        "created_at": _now_iso(),
+    }
+
+
+def _skip_record_from_product(product: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "item_id": _canonical_item_id(product.id, product.url),
+        "url": product.url,
+        "title": product.title,
+        "reason_code": record.get("reason_code", "historical_rejected"),
+        "reason_text": record.get("reason_text", "历史筛除商品，本次跳过"),
+        "source_run_id": record.get("source_run_id", ""),
+        "filter_signature": record.get("filter_signature", ""),
+        "target_platform": record.get("target_platform", ""),
+        "skipped_at": _now_iso(),
+    }
+
+
 LEGACY_TAG_CATEGORY_TREE = {
     "女装/女士精品": ["连衣裙", "女式T恤", "女式衬衫", "女式休闲裤", "半身裙", "牛仔裤", "大码女装", "防晒衣"],
     "男装": ["男式T恤", "男式衬衫", "男式休闲裤", "男式牛仔裤", "夹克", "卫衣", "短裤", "商务男装"],
@@ -286,7 +616,7 @@ def _legacy_to_nested_category_tree(tree: Dict[str, List[str]]) -> Dict[str, Dic
 
 
 def _load_category_dictionary() -> Dict[str, Any]:
-    """加载可追溯类目字典；完整 1688 字典未采集前，用本地种子增强三级展示。"""
+    """加载可追溯类目字典；有1688首页导航字典时不再混入旧运营类目。"""
     dictionary = {
         "version": "legacy-seed",
         "source": "local_legacy_seed",
@@ -302,7 +632,7 @@ def _load_category_dictionary() -> Dict[str, Any]:
             data = json.load(f)
     except Exception:
         return dictionary
-    nested = _legacy_to_nested_category_tree(LEGACY_TAG_CATEGORY_TREE)
+    nested: Dict[str, Dict[str, List[str]]] = {}
     for node in data.get("tree", []):
         if not isinstance(node, dict):
             continue
@@ -322,6 +652,8 @@ def _load_category_dictionary() -> Dict[str, Any]:
                 if isinstance(grandchild, dict) and str(grandchild.get("name") or "").strip()
             ]
             nested[parent][child] = grandchildren
+    if not nested:
+        return dictionary
     dictionary.update({
         "version": str(data.get("version") or dictionary["version"]),
         "source": str(data.get("source") or dictionary["source"]),
@@ -335,6 +667,35 @@ def _load_category_dictionary() -> Dict[str, Any]:
 CATEGORY_DICTIONARY = _load_category_dictionary()
 TAG_CATEGORY_TREE = CATEGORY_DICTIONARY["tree"]
 TAG_CATEGORY_OPTIONS = list(TAG_CATEGORY_TREE.keys())
+
+
+def _normalize_category_path_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip())
+
+
+def _category_path_index() -> Dict[str, str]:
+    index: Dict[str, str] = {}
+    for parent, children in TAG_CATEGORY_TREE.items():
+        parent_text = str(parent or "").strip()
+        if not parent_text:
+            continue
+        index[_normalize_category_path_text(parent_text)] = parent_text
+        for child, grandchildren in (children or {}).items():
+            child_text = str(child or "").strip()
+            if not child_text:
+                continue
+            child_path = f"{parent_text}>{child_text}"
+            index[_normalize_category_path_text(child_path)] = child_path
+            for grandchild in grandchildren or []:
+                grand_text = str(grandchild or "").strip()
+                if not grand_text:
+                    continue
+                grand_path = f"{child_path}>{grand_text}"
+                index[_normalize_category_path_text(grand_path)] = grand_path
+    return index
+
+
+CATEGORY_PATH_INDEX = _category_path_index()
 
 METRIC_FILTER_GROUPS = {
     "好评率": ["好评率>=90%", "好评率80%-90%", "好评率70%-80%", "好评率<70%"],
@@ -780,7 +1141,8 @@ EXPORT_FIELD_GROUPS: List[Tuple[str, str, List[Dict[str, str]]]] = [
         {"number": "3.4", "key": "sales_amount_30d", "label": "近30天销售额", "source": "搜索/详情", "verify": "否"},
         {"number": "3.5", "key": "sales_trend_units", "label": "销售趋势(件)", "source": "搜索/详情", "verify": "否"},
         {"number": "3.6", "key": "monthly_dropship_orders", "label": "月代发订单", "source": "详情/可信来源", "verify": "建议核验"},
-        {"number": "3.7", "key": "favorite_customers", "label": "收藏客户", "source": "详情/可信来源", "verify": "建议核验"},
+        {"number": "3.7", "key": "sku_count", "label": "SKU数量", "source": "详情", "verify": "建议核验"},
+        {"number": "3.8", "key": "favorite_customers", "label": "收藏客户", "source": "详情/可信来源", "verify": "建议核验"},
     ]),
     ("4", "竞争信息", [
         {"number": "4.1", "key": "downstream_offer_count", "label": "下游铺货数", "source": "搜索 stats/详情", "verify": "否"},
@@ -861,20 +1223,30 @@ EXPORT_FIELD_DEFINITIONS: List[Dict[str, str]] = [
     for group_no, group_name, fields in EXPORT_FIELD_GROUPS
     for field in fields
 ]
-EXPORT_COLUMNS: List[Tuple[str, str]] = [
-    (field["key"], field["label"]) for field in EXPORT_FIELD_DEFINITIONS
-]
+_EXPORT_KEYS = DIANLEIDA_REFERENCE_EXPORT_KEYS + PROJECT_EXTENSION_EXPORT_KEYS
+if len(_EXPORT_KEYS) != len(REFERENCE_EXPORT_LABELS):
+    raise RuntimeError("导出字段键和值数量不一致，请检查店雷达基线和扩展字段配置。")
+EXPORT_COLUMNS: List[Tuple[str, str]] = list(zip(_EXPORT_KEYS, REFERENCE_EXPORT_LABELS))
 
 
 def get_numbered_export_columns() -> List[Dict[str, Any]]:
     return [dict(field) for field in EXPORT_FIELD_DEFINITIONS]
 
 
+APPAREL_CATEGORY_ROOTS = [
+    root for root in TAG_CATEGORY_OPTIONS
+    if any(token in root for token in ("女装", "男装", "内衣", "鞋", "箱包", "配饰", "运动户外", "玩具童装"))
+]
+PHYSICAL_GOODS_CATEGORY_ROOTS = [
+    *TAG_CATEGORY_OPTIONS,
+]
+
+
 LIBRARY_FILTER_SCHEMA: List[Dict[str, Any]] = [
     {
         "key": "scope",
         "title": "类目范围",
-        "description": "对齐店雷达 1688 选品库的类目入口，类目字典来自本地可追溯种子。",
+        "description": "按1688首页左侧导航类目选择采集范围，避免运营类目映射导致错配。",
         "fields": [
             {
                 "key": "category_paths",
@@ -972,9 +1344,9 @@ LIBRARY_FILTER_SCHEMA: List[Dict[str, Any]] = [
         "title": "销售信息",
         "description": "可从列表 stats 初筛的字段会直接过滤，详情字段保留核验记录。",
         "fields": [
-            {"key": "sales_orders", "label": "销售订单数", "type": "range", "field": "orders_30d", "status": "supported", "mapping": "post_filter"},
-            {"key": "sales_units", "label": "销售件数", "type": "range", "field": "units_30d", "status": "supported", "mapping": "post_filter"},
-            {"key": "sales_amount", "label": "销售额", "type": "range", "field": "sales_amount_30d", "status": "supported", "mapping": "post_filter"},
+            {"key": "sales_orders", "label": "销售订单数", "type": "range", "field": "orders_30d", "status": "supported", "mapping": "post_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "sales_units", "label": "销售件数", "type": "range", "field": "units_30d", "status": "supported", "mapping": "post_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "sales_amount", "label": "销售额", "type": "range", "field": "sales_amount_30d", "status": "supported", "mapping": "post_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
         ],
     },
     {
@@ -982,16 +1354,16 @@ LIBRARY_FILTER_SCHEMA: List[Dict[str, Any]] = [
         "title": "商品信息",
         "description": "价格、起批、代发、资质和履约权益。",
         "fields": [
-            {"key": "wholesale_price", "label": "批发价", "type": "range", "field": "wholesale_price", "status": "supported", "mapping": "post_filter"},
-            {"key": "min_order", "label": "最低起批量", "type": "range", "field": "min_order_range", "status": "detail_required", "mapping": "post_filter_after_verify"},
-            {"key": "shop_product_count", "label": "店铺商品数", "type": "range", "field": "shop_product_count", "status": "reserved", "mapping": "search_filter_reserved"},
-            {"key": "dropship_price", "label": "代发价", "type": "range", "field": "dropship_price", "status": "detail_required", "mapping": "post_filter_after_verify"},
-            {"key": "platform_service_filters", "label": "平台服务", "type": "multi_chip", "options": ["新人首单优惠", "新品", "包邮", "严选", "分销严选", "一件代发", "退货包运费", "7天无理由退货", "24H发货", "48H发货"], "status": "supported", "mapping": "native_filter"},
-            {"key": "fulfillment_service_filters", "label": "履约服务", "type": "multi_chip", "options": ["官方物流", "密文面单", "晚揽必赔", "24H支揽率", "48H支揽率"], "status": "supported", "mapping": "native_filter"},
-            {"key": "rights_protection", "label": "权益保障", "type": "multi_chip", "options": ["批发包邮", "7天包退货", "退货包运费", "7天无理由退货", "赠运费险"], "status": "supported", "mapping": "native_filter"},
-            {"key": "fulfillment_times", "label": "发货时间", "type": "multi_chip", "options": ["24小时", "48小时", "72小时"], "status": "supported", "mapping": "native_filter"},
-            {"key": "waybill_support", "label": "面单支持", "type": "multi_chip", "options": ["淘宝", "抖音", "拼多多", "小红书", "快手", "京东", "微信小店"], "status": "supported", "mapping": "native_filter"},
-            {"key": "dropship_rights", "label": "代发权益", "type": "multi_chip", "options": ["一件代发", "一件代发包邮", "先采后付"], "status": "partial_supported", "mapping": "native_filter"},
+            {"key": "wholesale_price", "label": "批发价", "type": "range", "field": "wholesale_price", "status": "supported", "mapping": "post_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "min_order", "label": "最低起批量", "type": "range", "field": "min_order_range", "status": "detail_required", "mapping": "post_filter_after_verify", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "shop_product_count", "label": "店铺商品数", "type": "range", "field": "shop_product_count", "status": "reserved", "mapping": "search_filter_reserved", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "dropship_price", "label": "代发价", "type": "range", "field": "dropship_price", "status": "detail_required", "mapping": "post_filter_after_verify", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "platform_service_filters", "label": "平台服务", "type": "multi_chip", "options": ["新人首单优惠", "新品", "包邮", "严选", "分销严选", "一件代发", "退货包运费", "7天无理由退货", "24H发货", "48H发货"], "status": "supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "fulfillment_service_filters", "label": "履约服务", "type": "multi_chip", "options": ["官方物流", "密文面单", "晚揽必赔", "24H支揽率", "48H支揽率"], "status": "supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "rights_protection", "label": "权益保障", "type": "multi_chip", "options": ["批发包邮", "7天包退货", "退货包运费", "7天无理由退货", "赠运费险"], "status": "supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "fulfillment_times", "label": "发货时间", "type": "multi_chip", "options": ["24小时", "48小时", "72小时"], "status": "supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "waybill_support", "label": "面单支持", "type": "multi_chip", "options": ["淘宝", "抖音", "拼多多", "小红书", "快手", "京东", "微信小店"], "status": "supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "dropship_rights", "label": "代发权益", "type": "multi_chip", "options": ["一件代发", "一件代发包邮", "先采后付"], "status": "partial_supported", "mapping": "native_filter", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
         ],
     },
     {
@@ -1001,9 +1373,9 @@ LIBRARY_FILTER_SCHEMA: List[Dict[str, Any]] = [
         "fields": [
             {"key": "trustpass_years", "label": "诚信通年限", "type": "range", "field": "trustpass_years", "status": "detail_required", "mapping": "detail_verify"},
             {"key": "shop_fans", "label": "店铺粉丝数", "type": "range", "field": "shop_fans", "status": "reserved", "mapping": "seller_page_metric"},
-            {"key": "seller_location_regions", "label": "所在地", "type": "multi_chip", "options": ["广东", "浙江", "江苏", "山东", "福建", "河北", "河南", "上海", "北京", "安徽"], "status": "partial_supported", "mapping": "native_filter_dropdown"},
-            {"key": "seller_features", "label": "商家特色", "type": "multi_chip", "options": ["实力商家", "超级工厂", "诚信通", "源头工厂", "工厂直营"], "status": "partial_supported", "mapping": "native_filter_dropdown"},
-            {"key": "business_modes", "label": "经营模式", "type": "multi_chip", "options": ["生产加工", "经销批发", "招商代理", "商业服务", "个体经营"], "status": "partial_supported", "mapping": "native_filter_dropdown"},
+            {"key": "seller_location_regions", "label": "所在地", "type": "multi_chip", "options": ["广东", "浙江", "江苏", "山东", "福建", "河北", "河南", "上海", "北京", "安徽"], "status": "partial_supported", "mapping": "native_filter_dropdown", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "seller_features", "label": "商家特色", "type": "multi_chip", "options": ["实力商家", "超级工厂", "诚信通", "源头工厂", "工厂直营"], "status": "partial_supported", "mapping": "native_filter_dropdown", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
+            {"key": "business_modes", "label": "经营模式", "type": "multi_chip", "options": ["生产加工", "经销批发", "招商代理", "商业服务", "个体经营"], "status": "partial_supported", "mapping": "native_filter_dropdown", "applicable_roots": PHYSICAL_GOODS_CATEGORY_ROOTS},
             {"key": "merge_suppliers", "label": "合并供应商", "type": "boolean", "status": "supported", "mapping": "native_filter"},
             {"key": "company_type", "label": "公司类型", "type": "radio", "options": ["不限", "店铺", "工厂"], "status": "supported", "mapping": "native_filter"},
             {"key": "seller_services", "label": "卖家服务", "type": "multi_chip", "options": ["深度验厂", "买家保障", "极速退款", "破损包赔", "材质保障"], "status": "reserved", "mapping": "seller_service"},
@@ -1210,8 +1582,10 @@ SAMPLE_DETAIL_VERIFICATIONS: Dict[str, Dict[str, Any]] = {
         "supports_dropship": "是",
         "return_exchange_support": "支持退换",
         "monthly_dropship_orders": "820",
+        "sku_count": "18",
         "favorite_customers": "356",
         "shop_name": "义乌童雨户外用品厂",
+        "shop_url": "https://yuwu-factory.1688.com/",
         "location": "浙江 金华",
         "company_type": "生产厂家",
         "seller_member_type": "诚信通",
@@ -1239,8 +1613,10 @@ SAMPLE_DETAIL_VERIFICATIONS: Dict[str, Dict[str, Any]] = {
         "supports_dropship": "是",
         "return_exchange_support": "支持退换",
         "monthly_dropship_orders": "650",
+        "sku_count": "24",
         "favorite_customers": "218",
         "shop_name": "广州轻熟女装供应链",
+        "shop_url": "https://gz-womenswear.1688.com/",
         "location": "广东 广州",
         "company_type": "经销批发",
         "seller_member_type": "实力商家",
@@ -1268,8 +1644,10 @@ SAMPLE_DETAIL_VERIFICATIONS: Dict[str, Dict[str, Any]] = {
         "supports_dropship": "是",
         "return_exchange_support": "质量问题支持退换",
         "monthly_dropship_orders": "310",
+        "sku_count": "12",
         "favorite_customers": "96",
         "shop_name": "佛山小家电供应链",
+        "shop_url": "https://fs-appliance.1688.com/",
         "location": "广东 佛山",
         "company_type": "生产厂家",
         "seller_member_type": "诚信通",
@@ -1295,6 +1673,8 @@ class TagCollectInput:
     library_filters: Dict[str, Any]
     auto_verify_details: bool = False
     auto_verify_max_items: int = 0
+    target_publishable_count: int = 0
+    skip_historical_rejected: bool = True
 
 
 def _split_csv(value: str) -> List[str]:
@@ -1346,22 +1726,38 @@ def parse_input(
     library_filters: Any = None,
     auto_verify_details: bool = False,
     auto_verify_max_items: int = 0,
+    target_publishable_count: int = 0,
+    skip_historical_rejected: bool = True,
 ) -> TagCollectInput:
     parsed_library_filters = _parse_library_filters(library_filters)
+    parsed_collect_source = (collect_source or "rpa").lower()
+    categories = _validate_category_paths(
+        _dedupe_strings(_split_csv(categories) + _library_categories(parsed_library_filters))
+    )
+    parsed_source_urls = _dedupe_strings(_split_csv(source_urls) + _library_source_urls(parsed_library_filters))
+    if parsed_collect_source == "rpa" and categories:
+        parsed_source_urls = []
+    normalized_max_items = min(MAX_ITEMS_PER_QUERY, max(1, max_items_per_query))
+    normalized_target = min(
+        MAX_ITEMS_PER_QUERY,
+        max(1, int(target_publishable_count or normalized_max_items)),
+    )
     return TagCollectInput(
-        categories=_dedupe_strings(_split_csv(categories) + _library_categories(parsed_library_filters)),
+        categories=categories,
         tags=_dedupe_strings(_split_csv(tags) + _library_tags(parsed_library_filters)),
         keywords=_dedupe_strings(_split_csv(keywords) + _library_keywords(parsed_library_filters)),
-        source_urls=_dedupe_strings(_split_csv(source_urls) + _library_source_urls(parsed_library_filters)),
+        source_urls=parsed_source_urls,
         exclude_tags=_split_csv(exclude_tags),
         max_queries=min(MAX_QUERIES, max(1, max_queries)),
-        max_items_per_query=min(MAX_ITEMS_PER_QUERY, max(1, max_items_per_query)),
+        max_items_per_query=normalized_max_items,
         sample_data=sample_data,
         output_format=(output_format or "xlsx").lower(),
-        collect_source=(collect_source or "rpa").lower(),
+        collect_source=parsed_collect_source,
         library_filters=parsed_library_filters,
         auto_verify_details=bool(auto_verify_details),
         auto_verify_max_items=max(0, min(20, int(auto_verify_max_items or 0))),
+        target_publishable_count=normalized_target,
+        skip_historical_rejected=bool(skip_historical_rejected),
     )
 
 
@@ -1375,6 +1771,149 @@ def _dedupe_strings(items: Iterable[Any]) -> List[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _category_leaf_terms(leaf: str) -> Dict[str, List[str]]:
+    normalized = _normalize_category_path_text(leaf)
+    priority_tokens = [
+        "男士",
+        "女士",
+        "男式",
+        "女式",
+        "儿童",
+        "童装",
+        "婴童",
+        "孕妇",
+        "中老年",
+        "大码",
+        "成人",
+        "宠物",
+    ]
+    priority = [token for token in priority_tokens if token in normalized]
+    words = [
+        word
+        for word in re.split(r"[>、/／,，\s\-]+", str(leaf or ""))
+        if len(_normalize_category_path_text(word)) >= 2
+    ]
+    grams = [
+        normalized[index:index + 2]
+        for index in range(max(0, len(normalized) - 1))
+        if len(normalized[index:index + 2]) >= 2
+    ]
+    generic = {"男装", "女装", "内衣", "内裤", "类目", "商品", "用品"}
+    return {
+        "priority": _dedupe_strings(priority),
+        "words": _dedupe_strings(words),
+        "grams": _dedupe_strings([gram for gram in grams if gram not in generic]),
+    }
+
+
+def _category_suggestion_score(canonical: str, parts: List[str], leaf: str) -> int:
+    candidate = _normalize_category_path_text(canonical)
+    normalized = _normalize_category_path_text(">".join(parts))
+    leaf_text = _normalize_category_path_text(leaf)
+    score = 0
+    if normalized and normalized in candidate:
+        score += 500
+    if leaf_text and leaf_text in candidate:
+        score += 300
+    parent_context = parts[-2] if len(parts) >= 2 else ""
+    for part in parts[:-1]:
+        if part and part in candidate:
+            score += 130 if part == parent_context else 20
+    terms = _category_leaf_terms(leaf)
+    for token in terms["priority"]:
+        if token in candidate:
+            score += 220
+    for word in terms["words"]:
+        word_text = _normalize_category_path_text(word)
+        if word_text and word_text not in terms["priority"] and word_text in candidate:
+            score += 70
+    for gram in terms["grams"]:
+        if gram and gram in candidate:
+            score += 12
+    return score
+
+
+def _suggest_category_paths(category: str, limit: int = 8) -> List[str]:
+    normalized = _normalize_category_path_text(category)
+    parts = [_normalize_category_path_text(part) for part in _category_parts(category)]
+    leaf = parts[-1] if parts else normalized
+    candidates: Dict[str, Tuple[int, int]] = {}
+    original_parts = _category_parts(category)
+
+    def add_candidate(canonical: str, score: int, order: int) -> None:
+        text = str(canonical or "").strip()
+        if not text:
+            return
+        current = candidates.get(text)
+        if current is None or score > current[0] or (score == current[0] and order < current[1]):
+            candidates[text] = (score, order)
+
+    for depth in range(len(original_parts) - 1, 0, -1):
+        prefix = ">".join(original_parts[:depth])
+        canonical_prefix = CATEGORY_PATH_INDEX.get(_normalize_category_path_text(prefix))
+        if not canonical_prefix:
+            continue
+        for order, canonical in enumerate(CATEGORY_PATH_INDEX.values()):
+            if canonical.startswith(f"{canonical_prefix}>") and canonical.count(">") == canonical_prefix.count(">") + 1:
+                add_candidate(
+                    canonical,
+                    80 + depth * 20 + _category_suggestion_score(canonical, parts, leaf),
+                    order,
+                )
+    for order, (key, canonical) in enumerate(CATEGORY_PATH_INDEX.items()):
+        if key == normalized:
+            continue
+        score = _category_suggestion_score(canonical, parts, leaf)
+        if normalized and normalized in key:
+            score += 500
+        elif leaf and leaf in key:
+            score += 300
+        elif parts and all(part and part in key for part in parts[-2:]):
+            score += 200
+        if score > 0:
+            add_candidate(canonical, score, order)
+    ranked = sorted(candidates.items(), key=lambda item: (-item[1][0], item[1][1]))
+    return _dedupe_strings([canonical for canonical, _ in ranked])[:limit]
+
+
+def _validate_category_paths(categories: Iterable[str]) -> List[str]:
+    valid: List[str] = []
+    invalid: List[Dict[str, Any]] = []
+    for category in categories:
+        text = str(category or "").strip()
+        if not text:
+            continue
+        canonical = CATEGORY_PATH_INDEX.get(_normalize_category_path_text(text))
+        if canonical:
+            valid.append(canonical)
+            continue
+        invalid.append({
+            "category_path": text,
+            "suggestions": _suggest_category_paths(text),
+        })
+    if invalid:
+        first = invalid[0]
+        suggestions = first.get("suggestions") or []
+        suggestion_text = f"可选相近类目：{'、'.join(suggestions[:6])}。" if suggestions else "请从页面类目树重新选择 1688 当前存在的路径。"
+        error = ServiceError(
+            f"{CATEGORY_PATH_INVALID_CODE}: 类目路径不在当前 1688 首页类目字典中：{first.get('category_path')}。"
+            f"{suggestion_text}系统不会把该类目改成关键词搜索或宽泛父类采集。"
+        )
+        error.data = {
+            "code": CATEGORY_PATH_INVALID_CODE,
+            "source": "category_dictionary",
+            "invalid_categories": invalid,
+            "category_dictionary": {
+                "version": CATEGORY_DICTIONARY.get("version", ""),
+                "source": CATEGORY_DICTIONARY.get("source", ""),
+                "status": CATEGORY_DICTIONARY.get("status", ""),
+                "updated_at": CATEGORY_DICTIONARY.get("updated_at", ""),
+            },
+        }
+        raise error
+    return _dedupe_strings(valid)
 
 
 def _as_list(value: Any) -> List[str]:
@@ -1492,13 +2031,36 @@ def _dedupe_native_filters(items: Iterable[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def _category_leaf(category: str) -> str:
-    parts = [part.strip() for part in str(category or "").replace("/", ">").split(">") if part.strip()]
+    parts = _category_parts(category)
     return parts[-1] if parts else ""
+
+
+def _category_parts(category: str) -> List[str]:
+    return [part.strip() for part in str(category or "").split(">") if part.strip()]
+
+
+def _category_native_filter(category: str, index: int) -> Dict[str, Any]:
+    parts = _category_parts(category)
+    return {
+        "key": f"category_path_{index}",
+        "tag": category,
+        "label": f"类目:{category}",
+        "category_path": category,
+        "texts": parts,
+        "source": "category_paths",
+        "status": "planned",
+        "mode": "category_path",
+    }
 
 
 def build_filter_plan(config: TagCollectInput) -> Dict[str, Any]:
     """把复选标签拆成搜索词、1688页面原生筛选、后置指标筛选和系统规则。"""
     search_terms: List[str] = []
+    category_filters: List[Dict[str, Any]] = [
+        _category_native_filter(category, index)
+        for index, category in enumerate(config.categories, 1)
+        if _category_parts(category)
+    ]
     native_filters: List[Dict[str, Any]] = []
     post_filters: List[Dict[str, Any]] = []
     system_rules: List[Dict[str, Any]] = []
@@ -1559,6 +2121,7 @@ def build_filter_plan(config: TagCollectInput) -> Dict[str, Any]:
 
     return {
         "search_terms": list(dict.fromkeys(term for term in search_terms if term)),
+        "category_filters": category_filters,
         "native_filters": _dedupe_native_filters(native_filters),
         "post_filters": _dedupe_dicts(post_filters, "tag"),
         "system_rules": _dedupe_dicts(system_rules, "tag"),
@@ -1822,22 +2385,25 @@ def build_library_filter_plan(filters: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_queries(config: TagCollectInput) -> List[str]:
     filter_plan = build_filter_plan(config)
-    bases = config.keywords or [_category_leaf(category) for category in config.categories] or [""]
+    bases = config.keywords or [""]
     bases = [base for base in bases if base]
     hints = filter_plan["search_terms"]
 
     queries: List[str] = []
-    for base in bases:
-        if hints:
-            for hint in hints:
-                q = " ".join(part for part in [base, hint] if part).strip()
-                if q and q not in queries:
-                    queries.append(q)
-        elif base and base not in queries:
-            queries.append(base)
+    if bases:
+        for base in bases:
+            if hints:
+                for hint in hints:
+                    q = " ".join(part for part in [base, hint] if part).strip()
+                    if q and q not in queries:
+                        queries.append(q)
+            elif base and base not in queries:
+                queries.append(base)
+    elif hints:
+        queries = [hint for hint in hints if hint]
 
     if not queries:
-        queries = ["1688 选品"]
+        queries = [""] if config.categories else ["1688 选品"]
     return queries[: config.max_queries]
 
 
@@ -1848,6 +2414,7 @@ def build_filter_rule_summary(config: TagCollectInput) -> Dict[str, Any]:
         "or_categories": config.categories,
         "source_urls": config.source_urls,
         "exclude_tags": config.exclude_tags,
+        "category_filters": filter_plan["category_filters"],
         "search_terms": filter_plan["search_terms"],
         "native_filters": filter_plan["native_filters"],
         "post_filters": filter_plan["post_filters"],
@@ -1894,6 +2461,198 @@ def _default_filter_results(filter_plan: Dict[str, Any], *, source: str, query: 
     ]
 
 
+def _html_to_text(value: Any) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>", " ", str(value or ""), flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return html_lib.unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def _looks_like_1688_blocked(text: str, url: str = "") -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return (
+        "_____tmd_____" in compact
+        or "x5secdata" in compact
+        or "punish" in str(url or "").lower()
+        or "punish" in compact.lower()
+        or any(term in compact for term in ("访问被拒绝", "访问受限", "安全验证", "验证码", "拖动下方滑块", "滑块", "验证失败"))
+    )
+
+
+def _looks_like_1688_login(text: str, url: str = "") -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return (
+        "login.1688.com" in str(url or "")
+        or "login.taobao.com" in str(url or "")
+        or any(term in compact for term in ("扫码登录", "密码登录", "手机登录", "会员登录"))
+    )
+
+
+def _fetch_1688_url_direct(source_url: str) -> Tuple[str, str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "close",
+    }
+    req = Request(source_url, headers=headers)
+    try:
+        with urlopen(req, timeout=15) as response:
+            final_url = response.geturl()
+            charset = response.headers.get_content_charset() or "utf-8"
+            body = response.read(2_500_000).decode(charset, "replace")
+            return body, final_url
+    except HTTPError as exc:
+        body = exc.read(2000).decode("utf-8", "replace")
+        error = ServiceError(f"direct_url_fetch_failed: URL 直连读取失败，HTTP {exc.code}。")
+        error.data = {
+            "code": "direct_url_fetch_failed",
+            "source": "url_direct",
+            "page_url": source_url,
+            "status": exc.code,
+            "body_head": body[:500],
+        }
+        raise error
+    except URLError as exc:
+        error = ServiceError(f"direct_url_fetch_failed: URL 直连读取失败：{exc.reason}")
+        error.data = {
+            "code": "direct_url_fetch_failed",
+            "source": "url_direct",
+            "page_url": source_url,
+        }
+        raise error
+
+
+def _product_id_from_url(url: str) -> str:
+    patterns = [
+        r"/offer/(\d+)\.html",
+        r"(?:offerId|offerid|offer_id)=(\d+)",
+        r"/(\d{8,})(?:\.html|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(url or ""))
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _title_near_link(html: str, start: int, end: int) -> str:
+    window = html[max(0, start - 900): min(len(html), end + 1200)]
+    attr_candidates = []
+    for pattern in (
+        r'(?:title|alt|aria-label)=["\']([^"\']{4,160})["\']',
+        r'"(?:title|subject|offerTitle|name)"\s*:\s*"([^"]{4,160})"',
+    ):
+        attr_candidates.extend(re.findall(pattern, window, flags=re.I))
+    text_candidates = re.split(r"[\n\r。；;<>]+", _html_to_text(window))
+    for candidate in [*attr_candidates, *text_candidates]:
+        title = _clean_product_title(candidate)
+        if title:
+            return title
+    return ""
+
+
+def _price_near_link(html: str, start: int, end: int) -> str:
+    window = html[max(0, start - 700): min(len(html), end + 900)]
+    for pattern in (
+        r'(?:¥|￥)\s*(\d+(?:\.\d+)?)',
+        r'"(?:price|priceRange|discountPrice|salePrice)"\s*:\s*"?(\d+(?:\.\d+)?)',
+    ):
+        match = re.search(pattern, window, flags=re.I)
+        if match:
+            return match.group(1)
+    return "-"
+
+
+def _parse_direct_url_products(html: str, final_url: str, limit: int) -> List[Product]:
+    products: List[Product] = []
+    seen_ids: set[str] = set()
+    link_pattern = re.compile(
+        r'https?:\\/\\/detail\.1688\.com\\/offer\\/\d+\.html'
+        r'|https?://detail\.1688\.com/offer/\d+\.html'
+        r'|//detail\.1688\.com/offer/\d+\.html'
+        r'|/offer/\d+\.html',
+        re.I,
+    )
+    for match in link_pattern.finditer(html):
+        raw_url = html_lib.unescape(match.group(0)).replace("\\/", "/")
+        url = urljoin(final_url, raw_url if not raw_url.startswith("//") else f"https:{raw_url}")
+        item_id = _product_id_from_url(url)
+        if not item_id or item_id in seen_ids:
+            continue
+        title = _title_near_link(html, match.start(), match.end()) or f"1688商品 {item_id}"
+        if not _clean_product_title(title):
+            continue
+        seen_ids.add(item_id)
+        products.append(Product(
+            id=item_id,
+            title=_clean_product_title(title),
+            price=_price_near_link(html, match.start(), match.end()),
+            image="",
+            url=url,
+            stats={
+                "rawText": "URL直连读取候选",
+                "sourceUrl": final_url,
+                "categoryListName": "",
+            },
+        ))
+        if len(products) >= limit:
+            break
+
+    if not products:
+        detail_id = _product_id_from_url(final_url)
+        if detail_id:
+            title = _title_near_link(html, 0, min(len(html), 2000)) or f"1688商品 {detail_id}"
+            products.append(Product(
+                id=detail_id,
+                title=_clean_product_title(title) or f"1688商品 {detail_id}",
+                price=_price_near_link(html, 0, min(len(html), 2000)),
+                image="",
+                url=final_url,
+                stats={
+                    "rawText": "URL直连读取详情页候选",
+                    "sourceUrl": final_url,
+                    "categoryListName": "",
+                },
+            ))
+    return products[:limit]
+
+
+def collect_products_from_direct_url(source_url: str, limit: int) -> Dict[str, Any]:
+    html, final_url = _fetch_1688_url_direct(source_url)
+    visible_text = _html_to_text(html[:8000])
+    if _looks_like_1688_login(visible_text + html[:2000], final_url):
+        error = ServiceError(
+            f"{LOGIN_REQUIRED_CODE}: URL 直连读取被 1688 登录页拦截。"
+            "该模式不能继承你的浏览器登录态，请改用人工页面读取/真实 Chrome，或先换一个无需登录即可访问的 1688 URL。"
+        )
+        error.data = {"code": LOGIN_REQUIRED_CODE, "source": "url_direct", "page_url": final_url, "cdp": False}
+        raise error
+    if _looks_like_1688_blocked(visible_text + html[:3000], final_url):
+        error = ServiceError(
+            f"{SECURITY_BLOCK_CODE}: URL 直连读取被 1688 风控拦截，页面返回 punish/安全验证。"
+            "这不是项目代码报错；无需 Chrome 模式不能绕过平台风控，也不会继续采集或导出不可信数据。"
+        )
+        error.data = {"code": SECURITY_BLOCK_CODE, "source": "url_direct", "page_url": final_url, "cdp": False}
+        raise error
+    products = _parse_direct_url_products(html, final_url, limit)
+    if not products:
+        error = ServiceError(
+            f"{SEARCH_RESULTS_NOT_LOADED_CODE}: URL 直连读取成功，但页面中没有发现可解析的 1688 商品链接。"
+            "请确认粘贴的是商品详情页或商品列表页，且不是登录/空结果/脚本占位页。"
+        )
+        error.data = {"code": SEARCH_RESULTS_NOT_LOADED_CODE, "source": "url_direct", "page_url": final_url, "cdp": False}
+        raise error
+    return {
+        "products": products,
+        "filter_results": [],
+        "final_url": final_url,
+    }
+
+
 def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, source: str, query: str) -> List[Dict[str, Any]]:
     if not isinstance(results, list):
         return _default_filter_results(filter_plan, source=source, query=query)
@@ -1901,7 +2660,7 @@ def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, sour
     for record in results:
         if not isinstance(record, dict):
             continue
-        normalized.append({
+        normalized_record = {
             "filter_key": str(record.get("filter_key") or record.get("key") or ""),
             "label": str(record.get("label") or record.get("tag") or ""),
             "tag": str(record.get("tag") or record.get("label") or ""),
@@ -1911,14 +2670,33 @@ def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, sour
             "page_url": str(record.get("page_url") or ""),
             "message": str(record.get("message") or ""),
             "matched_text": str(record.get("matched_text") or record.get("text") or ""),
-        })
+        }
+        for extra_key in (
+            "expected_path",
+            "matched_path",
+            "expected_depth",
+            "matched_depth",
+            "final_url",
+            "missing_text",
+            "category_steps",
+            "diagnostics",
+        ):
+            if extra_key in record:
+                normalized_record[extra_key] = record.get(extra_key)
+        normalized.append(normalized_record)
     planned_keys = {
         str(spec.get("key") or spec.get("label") or "")
-        for spec in filter_plan.get("native_filters", [])
+        for spec in [
+            *(filter_plan.get("category_filters", []) or []),
+            *(filter_plan.get("native_filters", []) or []),
+        ]
     }
     seen_keys = {str(record.get("filter_key") or record.get("label") or "") for record in normalized}
     missing = [
-        spec for spec in filter_plan.get("native_filters", [])
+        spec for spec in [
+            *(filter_plan.get("category_filters", []) or []),
+            *(filter_plan.get("native_filters", []) or []),
+        ]
         if str(spec.get("key") or spec.get("label") or "") not in seen_keys
     ]
     normalized.extend([
@@ -1938,63 +2716,258 @@ def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, sour
     return [record for record in normalized if record.get("filter_key") or record.get("label") or planned_keys]
 
 
+def _blocking_category_result(filter_results: List[Dict[str, Any]], filter_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    planned_keys = {
+        str(spec.get("key") or spec.get("label") or "")
+        for spec in filter_plan.get("category_filters", []) or []
+    }
+    if not planned_keys:
+        return None
+    blocking_statuses = {"not_found", "click_failed", "not_reported", "partial_clicked", "not_confirmed"}
+    for record in filter_results:
+        key = str(record.get("filter_key") or record.get("key") or record.get("label") or "")
+        source = str(record.get("source") or "")
+        status = str(record.get("status") or "")
+        if (key in planned_keys or source == "1688_category_navigation") and status in blocking_statuses:
+            return record
+    return None
+
+
+def _raise_category_navigation_failed(record: Dict[str, Any]) -> None:
+    label = str(record.get("tag") or record.get("label") or record.get("filter_key") or "-")
+    message = str(record.get("message") or "1688 类目导航未完成")
+    error = ServiceError(f"{CATEGORY_NAVIGATION_NOT_LOADED_CODE}: 1688 类目导航未完成，未生成任何数据。当前类目：{label}。{message}")
+    error.data = {
+        "code": CATEGORY_NAVIGATION_NOT_LOADED_CODE,
+        "source": "1688_category_navigation",
+        "page_url": str(record.get("final_url") or record.get("page_url") or ""),
+        "category_path": label,
+        "filter_results": [record],
+        "diagnostics": record.get("diagnostics") if isinstance(record.get("diagnostics"), dict) else {},
+    }
+    raise error
+
+
+def _filter_plan_for_category(filter_plan: Dict[str, Any], category_filter: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    job_plan = dict(filter_plan)
+    job_plan["category_filters"] = [category_filter] if category_filter else []
+    return job_plan
+
+
+def _candidate_scan_limit(config: TagCollectInput) -> int:
+    if config.sample_data:
+        return config.max_items_per_query
+    target = max(config.max_items_per_query, config.target_publishable_count or 0)
+    if config.auto_verify_details:
+        target = max(target, config.auto_verify_max_items or 0)
+    return min(MAX_ITEMS_PER_QUERY, max(1, target * 3))
+
+
+def _row_has_pending_filter(row: Dict[str, Any]) -> bool:
+    return any(
+        isinstance(record, dict) and record.get("status") in ("pending_detail", "manual_review_required")
+        for record in row.get("filter_match_records", [])
+    )
+
+
+def _row_pending_detail_fields(row: Dict[str, Any], fields: Optional[Iterable[str]] = None) -> List[str]:
+    target_fields = fields or DETAIL_ONLY_FIELDS
+    return [
+        key for key in sorted(target_fields)
+        if row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验", None)
+    ]
+
+
+def is_publishable_row(row: Dict[str, Any], *, include_cautious: bool = False) -> bool:
+    suggestions = PUBLISHABLE_CANDIDATE_SUGGESTIONS if include_cautious else PUBLISHABLE_SUGGESTIONS
+    if row.get("wechat_shop_suggestion") not in suggestions:
+        return False
+    if row.get("filter_verification_status") == "filtered_out":
+        return False
+    if row.get("verification_status") in (VERIFICATION_STATUS_FAILED, VERIFICATION_STATUS_FILTERED_OUT):
+        return False
+    if _row_has_pending_filter(row):
+        return False
+    return True
+
+
+def _publishable_rows(rows: List[Dict[str, Any]], *, include_cautious: bool = False) -> List[Dict[str, Any]]:
+    return [
+        row for row in rows
+        if isinstance(row, dict) and is_publishable_row(row, include_cautious=include_cautious)
+    ]
+
+
+def _collection_stop_reason(
+    rows: List[Dict[str, Any]],
+    *,
+    target_publishable_count: int,
+    candidate_count: int,
+    candidate_scan_limit: int,
+) -> str:
+    publishable_count = len(_publishable_rows(rows))
+    if publishable_count >= target_publishable_count:
+        return "target_met"
+    if candidate_count >= candidate_scan_limit:
+        return "candidate_budget_exhausted"
+    return "source_exhausted_or_filters_too_strict"
+
+
+def _shortfall_reason(
+    *,
+    target_publishable_count: int,
+    publishable_count: int,
+    collection_stop_reason: str,
+    skipped_rejected_count: int,
+) -> str:
+    if publishable_count >= target_publishable_count:
+        return ""
+    shortfall = target_publishable_count - publishable_count
+    if collection_stop_reason == "candidate_budget_exhausted":
+        base = "候选预算已用完"
+    elif collection_stop_reason == "source_exhausted_or_filters_too_strict":
+        base = "当前来源候选不足或筛选条件偏严"
+    else:
+        base = collection_stop_reason or "未达到目标可铺数量"
+    skip_text = f"，历史筛除跳过 {skipped_rejected_count} 个" if skipped_rejected_count else ""
+    return f"{base}，距离目标可铺数量还差 {shortfall} 个{skip_text}"
+
+
 def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     filter_plan = build_filter_plan(config)
-    direct_urls = config.source_urls if (not config.sample_data and config.collect_source == "rpa") else []
-    queries = direct_urls or build_queries(config)
+    manual_page_mode = config.collect_source in MANUAL_PAGE_COLLECT_SOURCES
+    direct_url_mode = config.collect_source in DIRECT_URL_COLLECT_SOURCES
+    direct_urls = config.source_urls if (
+        not config.sample_data
+        and config.collect_source in {"rpa", *MANUAL_PAGE_COLLECT_SOURCES, *DIRECT_URL_COLLECT_SOURCES}
+    ) else []
+    if direct_url_mode and not direct_urls and not config.sample_data:
+        error = ServiceError(
+            f"{DIRECT_URL_REQUIRED_CODE}: URL 直连读取模式不会自动搜索或点击类目，请先粘贴 1688 商品列表页或详情页 URL。"
+        )
+        error.data = {"code": DIRECT_URL_REQUIRED_CODE, "source": "url_direct", "cdp": False}
+        raise error
+    queries = (direct_urls or [""]) if manual_page_mode else (direct_urls or build_queries(config))
+    category_filters = filter_plan.get("category_filters", []) or []
     channel = _channel_from_tags(config.tags)
+    target_platform = _target_platform_from_tags(config.tags)
+    filter_signature = _filter_signature_for_config(config)
+    rejected_products = _load_rejected_products() if (config.skip_historical_rejected and not config.sample_data) else _empty_rejected_products()
+    candidate_scan_limit = _candidate_scan_limit(config)
     seen: set[str] = set()
     rows: List[Dict[str, Any]] = []
     filter_results: List[Dict[str, Any]] = []
+    rejected_records: List[Dict[str, Any]] = []
+    skipped_rejected_records: List[Dict[str, Any]] = []
+    candidate_count = 0
 
     for query in queries:
         if config.sample_data:
-            products = _sample_products_for_query(query, config.max_items_per_query)
+            products = _sample_products_for_query(query, candidate_scan_limit)
             filter_results.extend(_default_filter_results(filter_plan, source="sample", query=query))
         elif config.collect_source == "api":
             from capabilities.search.service import search_products
-            products = search_products(query, channel=channel)[: config.max_items_per_query]
+            products = search_products(query, channel=channel)[:candidate_scan_limit]
             filter_results.extend(_default_filter_results(filter_plan, source="api", query=query))
+        elif direct_url_mode:
+            direct_result = collect_products_from_direct_url(query, candidate_scan_limit)
+            products = direct_result.get("products", [])
+            filter_results.extend(_default_filter_results(filter_plan, source="url_direct", query=query))
         else:
             from capabilities.tag_collect.rpa import collect_products_from_1688_page
-            rpa_result = collect_products_from_1688_page(
-                query if not direct_urls else "",
-                config.max_items_per_query,
-                source_url=query if direct_urls else "",
-                native_filters=filter_plan["native_filters"],
-                return_meta=True,
-            )
-            raw_products = rpa_result.get("products", []) if isinstance(rpa_result, dict) else rpa_result
-            filter_results.extend(_normalize_filter_results(
-                rpa_result.get("filter_results") if isinstance(rpa_result, dict) else [],
-                filter_plan,
-                source="rpa",
-                query=query,
-            ))
-            products = [
-                Product(
-                    id=str(item.get("id", "")),
-                    title=str(item.get("title", "")),
-                    price=str(item.get("price", "-")),
-                    image=str(item.get("image", "")),
-                    url=str(item.get("url", "")),
-                    stats=item.get("stats") if isinstance(item.get("stats"), dict) else {},
+            rpa_jobs = []
+            if manual_page_mode:
+                selected_category = str((category_filters[0] if category_filters else {}).get("category_path") or "").strip()
+                rpa_jobs.append((query, query if direct_urls else "", _filter_plan_for_category(filter_plan, None), [], selected_category))
+            elif direct_urls:
+                rpa_jobs.append((query, query, filter_plan, category_filters, ""))
+            elif category_filters:
+                for category_filter in category_filters:
+                    category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "").strip()
+                    rpa_jobs.append((query, "", _filter_plan_for_category(filter_plan, category_filter), [category_filter], category_path))
+            else:
+                rpa_jobs.append((query, "", filter_plan, [], ""))
+
+            products = []
+            for job_query, job_source_url, job_plan, job_category_filters, job_category_path in rpa_jobs:
+                rpa_result = collect_products_from_1688_page(
+                    "" if job_source_url else job_query,
+                    candidate_scan_limit,
+                    source_url=job_source_url,
+                    native_filters=[] if manual_page_mode else filter_plan["native_filters"],
+                    category_filters=job_category_filters,
+                    manual_url_only=manual_page_mode,
+                    return_meta=True,
                 )
-                for item in raw_products
-                if str(item.get("id", "")).strip()
-            ]
+                raw_products = rpa_result.get("products", []) if isinstance(rpa_result, dict) else rpa_result
+                current_filter_results = _normalize_filter_results(
+                    rpa_result.get("filter_results") if isinstance(rpa_result, dict) else [],
+                    job_plan,
+                    source="rpa",
+                    query=job_query,
+                )
+                filter_results.extend(current_filter_results)
+                if not direct_urls and not manual_page_mode:
+                    blocking_category = _blocking_category_result(current_filter_results, job_plan)
+                    if blocking_category:
+                        _raise_category_navigation_failed(blocking_category)
+                for item in raw_products if isinstance(raw_products, list) else []:
+                    stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+                    if job_category_path and job_category_filters and not stats.get("categoryListName"):
+                        stats = dict(stats)
+                        stats["categoryListName"] = job_category_path
+                        stats["sourceCategoryPath"] = job_category_path
+                    if str(item.get("id", "")).strip() and _clean_product_title(item.get("title", "")):
+                        products.append(Product(
+                            id=str(item.get("id", "")),
+                            title=_clean_product_title(item.get("title", "")),
+                            price=str(item.get("price", "-")),
+                            image=str(item.get("image", "")),
+                            url=str(item.get("url", "")),
+                            stats=stats,
+                        ))
         for product in products:
-            if product.id in seen:
+            product_id = _canonical_item_id(product.id, product.url)
+            if product_id in seen:
                 continue
-            seen.add(product.id)
+            seen.add(product_id)
+            candidate_count += 1
+            historical_rejected = _matched_rejected_record(
+                product.id,
+                product.url,
+                rejected_products,
+                filter_signature=filter_signature,
+                target_platform=target_platform,
+            )
+            if historical_rejected:
+                skipped_rejected_records.append(_skip_record_from_product(product, historical_rejected))
+                continue
             row = product_to_export_row(product, query, config)
             keep_by_filters, post_records = _evaluate_post_filters(row, filter_plan.get("post_filters", []))
             row["filter_match_records"] = post_records
             if not keep_by_filters:
+                rejected_records.append(_rejection_record(
+                    row,
+                    reason_code="post_filter_failed",
+                    reason_text="列表字段未满足筛选条件",
+                    filter_signature=filter_signature,
+                    target_platform=target_platform,
+                ))
                 continue
             if _excluded_by_tags(row, config.exclude_tags):
+                rejected_records.append(_rejection_record(
+                    row,
+                    reason_code="exclude_tag_matched",
+                    reason_text="命中排除标签",
+                    filter_signature=filter_signature,
+                    target_platform=target_platform,
+                ))
                 continue
             rows.append(row)
+            if len(_publishable_rows(rows)) >= config.target_publishable_count:
+                break
+        if len(_publishable_rows(rows)) >= config.target_publishable_count:
+            break
 
     ranked = sorted(rows, key=lambda item: item["recommendation_score"], reverse=True)
     for index, row in enumerate(ranked, 1):
@@ -2002,21 +2975,77 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     filter_plan["filter_results"] = filter_results
     filter_plan["filter_warnings"] = [
         record for record in filter_results
-        if str(record.get("status") or "") in ("not_found", "click_failed", "ambiguous", "not_reported")
+        if str(record.get("status") or "") in ("not_found", "click_failed", "ambiguous", "not_reported", "partial_clicked", "not_confirmed")
     ]
+    publishable_count = len(_publishable_rows(ranked))
+    if rejected_records and not config.sample_data:
+        _append_rejected_products(rejected_records)
+    filter_plan["target_publishable_count"] = config.target_publishable_count
+    filter_plan["publishable_count"] = publishable_count
+    filter_plan["strict_publishable_count"] = publishable_count
+    filter_plan["publishable_candidate_count"] = len(_publishable_rows(ranked, include_cautious=True))
+    filter_plan["candidate_count"] = candidate_count
+    filter_plan["candidate_scan_limit"] = candidate_scan_limit
+    filter_plan["rejection_records"] = rejected_records
+    filter_plan["rejected_count"] = len(rejected_records)
+    filter_plan["skipped_rejected_records"] = skipped_rejected_records
+    filter_plan["skipped_rejected_count"] = len(skipped_rejected_records)
+    filter_plan["persistent_excluded_count"] = len(skipped_rejected_records)
+    filter_plan["filter_signature"] = filter_signature
+    filter_plan["target_platform"] = target_platform
+    filter_plan["collection_stop_reason"] = _collection_stop_reason(
+        ranked,
+        target_publishable_count=config.target_publishable_count,
+        candidate_count=candidate_count,
+        candidate_scan_limit=candidate_scan_limit,
+    )
+    filter_plan["shortfall_reason"] = _shortfall_reason(
+        target_publishable_count=config.target_publishable_count,
+        publishable_count=publishable_count,
+        collection_stop_reason=filter_plan["collection_stop_reason"],
+        skipped_rejected_count=len(skipped_rejected_records),
+    )
     return ranked, queries, filter_plan
 
 
 def friendly_collect_error(error: Exception) -> str:
     """把 RPA/真实采集底层异常转成运营可理解的提示。"""
     message = str(error)
+    detail = getattr(error, "data", {}) or {}
+    use_cdp = bool(detail.get("cdp")) or bool(os.environ.get("TAG_COLLECT_CDP_URL"))
     if f"{SECURITY_BLOCK_CODE}:" in message:
         return message.split(f"{SECURITY_BLOCK_CODE}:", 1)[1].strip()
     if f"{LOGIN_REQUIRED_CODE}:" in message:
         return message.split(f"{LOGIN_REQUIRED_CODE}:", 1)[1].strip()
     if "browser_closed:" in message:
         return message.split("browser_closed:", 1)[1].strip()
+    if f"{SEARCH_KEYWORD_ENCODING_CODE}:" in message:
+        return message.split(f"{SEARCH_KEYWORD_ENCODING_CODE}:", 1)[1].strip()
+    if f"{SEARCH_BOX_NOT_FOUND_CODE}:" in message:
+        return message.split(f"{SEARCH_BOX_NOT_FOUND_CODE}:", 1)[1].strip()
+    if f"{SEARCH_RESULTS_NOT_LOADED_CODE}:" in message:
+        return message.split(f"{SEARCH_RESULTS_NOT_LOADED_CODE}:", 1)[1].strip()
+    if f"{CATEGORY_NAVIGATION_NOT_LOADED_CODE}:" in message:
+        return message.split(f"{CATEGORY_NAVIGATION_NOT_LOADED_CODE}:", 1)[1].strip()
+    if f"{CATEGORY_PATH_INVALID_CODE}:" in message:
+        return message.split(f"{CATEGORY_PATH_INVALID_CODE}:", 1)[1].strip()
+    if "navigation_timeout:" in message or "页面加载超时" in message:
+        return (
+            "1688 页面加载超时，未生成数据。请先在真实 Chrome 中人工打开对应搜索页/商品页，"
+            "确认不是登录、滑块、访问拒绝或网络卡顿后，再回到本工具查询。"
+        )
+    if "cdp_context_unsupported:" in message or "Browser.setDownloadBehavior" in message or "Browser context management is not supported" in message:
+        return (
+            "真实 Chrome 调试端口能连接，但当前 CDP 会话不可用，无法创建采集页面。"
+            "通常是调试 Chrome 状态异常、端口被其它工具占用，或 Chrome/Playwright 版本兼容问题。"
+        )
     if any(term in message for term in ("拖动下方滑块", "验证失败", "点击框体重试", "error:2eDumg", "安全滑块", "验证码")):
+        if use_cdp:
+            return (
+                "1688 在已连接的真实 Chrome 中触发了安全滑块/验证码校验。"
+                "这通常是账号、IP 或当前浏览器环境已被风控，人工拖动仍失败时不要反复刷新。"
+                "请先在这个 Chrome 中确认 1688 搜索页能人工正常打开；恢复后再回到本工具查询。"
+            )
         return (
             "1688 触发了安全滑块/验证码校验，系统不会绕过或自动破解验证，也不会继续采集以免导出不可信数据。"
             "请在弹出的真实浏览器中手动完成验证，或使用已登录且已通过验证的 Chrome CDP 会话后重试。"
@@ -2029,6 +3058,10 @@ def friendly_collect_error(error: Exception) -> str:
         )
     if "真实页面 RPA 返回格式异常" in message:
         return "真实页面 RPA 返回异常，未生成任何数据。请重试一次；如果仍失败，优先使用 1688 页面 URL 模式测试真实页面解析。"
+    if f"{DIRECT_URL_REQUIRED_CODE}:" in message:
+        return message.split(f"{DIRECT_URL_REQUIRED_CODE}:", 1)[1].strip()
+    if "direct_url_fetch_failed:" in message:
+        return message.split("direct_url_fetch_failed:", 1)[1].strip()
     return message
 
 
@@ -2036,6 +3069,117 @@ def collect_error_state(error: Exception) -> Dict[str, Any]:
     """返回 Web 可识别的采集阻断状态，风控/登录场景不进入普通失败重试。"""
     message = str(error)
     friendly = friendly_collect_error(error)
+    detail = getattr(error, "data", {}) or {}
+    filter_results = detail.get("filter_results", [])
+    if not isinstance(filter_results, list):
+        filter_results = []
+    diagnostics = detail.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    use_cdp = bool(detail.get("cdp")) or bool(os.environ.get("TAG_COLLECT_CDP_URL"))
+    runtime = {
+        "use_cdp": use_cdp,
+        "cdp_url": os.environ.get("TAG_COLLECT_CDP_URL", ""),
+        "cdp_connected": True if use_cdp else False,
+        "cdp_ready": True if use_cdp else False,
+        "page_url": detail.get("page_url", ""),
+        "source": detail.get("source", ""),
+    }
+    if use_cdp:
+        security_suggestion = (
+            "当前已连接真实 Chrome，说明不是 testin/临时浏览器问题；请先在这个 Chrome 中人工确认 1688 搜索页可正常访问，"
+            "若仍停留在 punish/验证码页，请停止反复刷新 1688，暂停一段时间或更换正常账号/网络后再测。"
+        )
+    else:
+        security_suggestion = (
+            "已暂停真实采集。请停止反复刷新 1688，由人工在正常浏览器中完成登录/验证；"
+            "验证恢复后，可粘贴已打开的搜索页/商品详情页 URL，或使用已登录 Chrome CDP 会话继续。"
+        )
+    if f"{SEARCH_KEYWORD_ENCODING_CODE}:" in message or "搜索词校验失败" in message or "疑似乱码" in message:
+        return {
+            "code": SEARCH_KEYWORD_ENCODING_CODE,
+            "action": "manual_open_page",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "系统已停止本次采集，避免按错误关键词导出数据。请在真实 Chrome 里确认 1688 搜索框能人工输入中文；"
+                "如果人工搜索正常，再重新查询。也可以粘贴一个人工打开后确认无乱码的 1688 搜索页 URL 进行真实页面解析。"
+            ),
+            "runtime": runtime,
+        }
+    if f"{DIRECT_URL_REQUIRED_CODE}:" in message:
+        return {
+            "code": DIRECT_URL_REQUIRED_CODE,
+            "action": "paste_url",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": "请在“1688 页面 URL”输入框粘贴一个你能打开的 1688 搜索页、类目页或商品详情页链接，再点击查询。",
+            "runtime": runtime,
+        }
+    if f"{CATEGORY_PATH_INVALID_CODE}:" in message:
+        return {
+            "code": CATEGORY_PATH_INVALID_CODE,
+            "action": "select_valid_category",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "请只从本页 1688 类目树选择类目。当前项目不会把不存在的类目路径改成搜索框关键词，"
+                "也不会自动扩大到父类后继续导出，避免出现男士内裤采成内衣这类错配。"
+            ),
+            "runtime": runtime,
+            "invalid_categories": detail.get("invalid_categories", []),
+            "category_dictionary": detail.get("category_dictionary", {}),
+        }
+    if "direct_url_fetch_failed:" in message:
+        return {
+            "code": "direct_url_fetch_failed",
+            "action": "check_url",
+            "retryable": True,
+            "message": friendly,
+            "suggestion": "请确认 URL 可以在浏览器中打开；如果浏览器能打开但直连失败，说明该页面需要浏览器上下文，请改用人工页面读取。",
+            "runtime": runtime,
+        }
+    if f"{SEARCH_BOX_NOT_FOUND_CODE}:" in message:
+        return {
+            "code": SEARCH_BOX_NOT_FOUND_CODE,
+            "action": "manual_open_page",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "系统没有在当前 1688 页面找到可输入的搜索框。请在真实 Chrome 中人工打开 1688 首页或搜索页，"
+                "确认搜索框可见且能输入中文后再查询；也可以直接粘贴已经打开的 1688 搜索页 URL。"
+            ),
+            "runtime": runtime,
+        }
+    if f"{SEARCH_RESULTS_NOT_LOADED_CODE}:" in message or "未在页面中发现商品列表链接" in message:
+        return {
+            "code": SEARCH_RESULTS_NOT_LOADED_CODE,
+            "action": "manual_open_page",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "1688 搜索词已进入页面，但当前页没有加载出可解析的商品卡片。请在真实 Chrome 中人工确认能看到商品列表；"
+                "如果页面停在搜索建议、图搜提示、空白或需要登录/验证，请处理后再查询。"
+            ),
+            "runtime": runtime,
+        }
+    if f"{CATEGORY_NAVIGATION_NOT_LOADED_CODE}:" in message or "未进入可解析的商品列表页" in message:
+        return {
+            "code": CATEGORY_NAVIGATION_NOT_LOADED_CODE,
+            "action": "manual_open_page",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "系统已尝试按类目入口进入 1688 商品结果页，但没有成功进入可解析商品列表。"
+                "这通常是 1688 首页类目入口结构变化、该类目在当前页面没有直达入口，或页面仍停留在登录/验证/首页菜单。"
+                "请先看下方筛选执行记录里的命中层级和可见类目文本；如果 1688 页面确实没有该入口，需修正本地类目字典，"
+                "或在采集 Chrome 中人工进入对应类目后切到“当前页兜底读取”，但兜底读取不作为自动类目命中验收。"
+            ),
+            "runtime": runtime,
+            "filter_results": filter_results,
+            "diagnostics": diagnostics,
+            "category_path": detail.get("category_path", ""),
+        }
     if f"{SECURITY_BLOCK_CODE}:" in message or any(
         term in message
         for term in ("拖动下方滑块", "验证失败", "点击框体重试", "error:", "安全滑块", "验证码", "访问被拒绝", "访问受限")
@@ -2045,10 +3189,35 @@ def collect_error_state(error: Exception) -> Dict[str, Any]:
             "action": "manual_handoff",
             "retryable": False,
             "message": friendly,
+            "suggestion": security_suggestion,
+            "runtime": runtime,
+        }
+    if "navigation_timeout:" in message or "页面加载超时" in message:
+        return {
+            "code": "navigation_timeout",
+            "action": "manual_open_page",
+            "retryable": False,
+            "message": friendly,
             "suggestion": (
-                "已暂停真实采集。请停止反复刷新 1688，由人工在正常浏览器中完成登录/验证；"
-                "验证恢复后，可粘贴已打开的搜索页/商品详情页 URL，或使用已登录 Chrome CDP 会话继续。"
+                "当前真实 Chrome 已连接但 1688 页面没有在限定时间内加载完成。"
+                "请先在该 Chrome 中人工打开 1688 搜索页/详情页，确认能正常看到商品列表后再查询。"
+                if use_cdp
+                else "请先在浏览器中人工打开 1688 搜索页/详情页确认可访问，再重试。"
             ),
+            "runtime": runtime,
+        }
+    if "cdp_context_unsupported:" in message or "Browser.setDownloadBehavior" in message or "Browser context management is not supported" in message:
+        return {
+            "code": "cdp_context_unsupported",
+            "action": "restart_chrome_debug",
+            "retryable": False,
+            "message": friendly,
+            "suggestion": (
+                "这不是 1688 页面本身报错，也不一定是窗口 tab 被关。请先完全关闭由项目启动的 Chrome 调试窗口，"
+                "确认 9222 没有被其它 Chrome/工具占用，然后重新运行 scripts/capabilities/tag_collect/start_chrome_debug.sh，"
+                "再重启本地工作台。"
+            ),
+            "runtime": runtime,
         }
     if f"{LOGIN_REQUIRED_CODE}:" in message:
         return {
@@ -2056,7 +3225,12 @@ def collect_error_state(error: Exception) -> Dict[str, Any]:
             "action": "manual_login",
             "retryable": False,
             "message": friendly,
-            "suggestion": "请人工扫码登录并确认页面能正常访问后，再从 URL 或已登录浏览器会话继续采集。",
+            "suggestion": (
+                "当前已连接真实 Chrome，请在这个 Chrome 窗口内完成 1688 登录，并确认搜索页可以人工正常打开后再查询。"
+                if use_cdp
+                else "请人工扫码登录并确认页面能正常访问后，再从 URL 或已登录浏览器会话继续采集。"
+            ),
+            "runtime": runtime,
         }
     return {
         "code": "collect_failed",
@@ -2064,6 +3238,7 @@ def collect_error_state(error: Exception) -> Dict[str, Any]:
         "retryable": True,
         "message": friendly,
         "suggestion": "请检查筛选条件、URL 或采集来源后再重试。",
+        "runtime": runtime,
     }
 
 
@@ -2327,6 +3502,9 @@ def _apply_detail_filter_exclusions(payload: Dict[str, Any]) -> List[Dict[str, A
         if isinstance(row, dict)
     ]
     existing_ids = {str(row.get("item_id", "")) for row in existing_excluded}
+    filter_signature = str(payload.get("filter_signature") or _filter_signature_for_payload(payload))
+    target_platform = str(payload.get("target_platform") or _target_platform_from_tags(payload.get("tags") or []))
+    persistent_records: List[Dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -2334,9 +3512,20 @@ def _apply_detail_filter_exclusions(payload: Dict[str, Any]) -> List[Dict[str, A
             excluded = dict(row)
             excluded["verification_status"] = VERIFICATION_STATUS_FILTERED_OUT
             excluded["data_gap_risk"] = "详情核验后未满足筛选条件"
+            excluded["manual_review_status"] = "系统剔除"
+            excluded["manual_wechat_shop_suggestion"] = "不建议"
             if str(excluded.get("item_id", "")) not in existing_ids:
                 newly_excluded.append(excluded)
                 existing_ids.add(str(excluded.get("item_id", "")))
+            if not payload.get("sample_data"):
+                persistent_records.append(_rejection_record(
+                    excluded,
+                    reason_code="detail_filter_failed",
+                    reason_text=excluded.get("filter_verification_note") or "详情核验后未满足筛选条件",
+                    filter_signature=filter_signature,
+                    target_platform=target_platform,
+                    source_run_id=str(payload.get("run_id", "")),
+                ))
             continue
         kept_rows.append(row)
     for index, row in enumerate(kept_rows, 1):
@@ -2345,7 +3534,49 @@ def _apply_detail_filter_exclusions(payload: Dict[str, Any]) -> List[Dict[str, A
     payload["row_count"] = len(kept_rows)
     payload["filter_excluded_rows"] = [*existing_excluded, *newly_excluded]
     payload["filter_excluded_count"] = len(payload["filter_excluded_rows"])
+    if persistent_records:
+        _append_rejected_products(persistent_records)
+        payload["rejection_records"] = [
+            *(payload.get("rejection_records") or []),
+            *persistent_records,
+        ]
     return newly_excluded
+
+
+def _persist_non_publishable_rejections(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if payload.get("sample_data"):
+        return []
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        return []
+    filter_signature = str(payload.get("filter_signature") or _filter_signature_for_payload(payload))
+    target_platform = str(payload.get("target_platform") or _target_platform_from_tags(payload.get("tags") or []))
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("wechat_shop_suggestion") != "不建议":
+            continue
+        if row.get("verification_status") not in (VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+            continue
+        if _row_has_pending_filter(row):
+            continue
+        records.append(_rejection_record(
+            row,
+            reason_code="wechat_not_recommended",
+            reason_text=row.get("risk_flags") or row.get("recommendation_reason") or "详情核验后系统判断不适合微信小店投放",
+            filter_signature=filter_signature,
+            target_platform=target_platform,
+            source_run_id=str(payload.get("run_id", "")),
+        ))
+    if records:
+        _append_rejected_products(records)
+        payload["rejection_records"] = [
+            *(payload.get("rejection_records") or []),
+            *records,
+        ]
+        payload["rejected_count"] = len(payload["rejection_records"])
+    return records
 
 
 def _score_product(stats: Dict[str, Any], tags: List[str]) -> Tuple[int, List[str], List[str]]:
@@ -2430,6 +3661,215 @@ def _wechat_suggestion(row: Dict[str, Any], risks: List[str]) -> str:
     return "不建议"
 
 
+def _split_risks(value: Any) -> List[str]:
+    return [part.strip() for part in str(value or "").split("；") if part.strip()]
+
+
+def _auto_review_blocking_reasons(row: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    if row.get("filter_verification_status") == "filtered_out":
+        reasons.append("详情筛选未通过")
+    if _row_has_pending_filter(row) or row.get("filter_verification_status") == "needs_review":
+        reasons.append("筛选规则待详情确认")
+    if row.get("verification_status") == VERIFICATION_STATUS_FAILED:
+        reasons.append(row.get("verification_fail_reason") or "详情核验失败")
+    if row.get("verification_status") == VERIFICATION_STATUS_FILTERED_OUT:
+        reasons.append("已被详情筛选剔除")
+    if row.get("verification_status") not in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+        reasons.append("关键字段尚未完成详情核验")
+    verified_fields = set(row.get("detail_verified_fields") or [])
+    missing_evidence = [
+        key for key in sorted(AUTO_REVIEW_REQUIRED_DETAIL_FIELDS)
+        if key not in verified_fields
+    ]
+    if missing_evidence:
+        reasons.append("关键字段缺少详情核验证据：" + "、".join(_field_label(key) for key in missing_evidence))
+    if _has_blocking_detail_risk(row):
+        reasons.append("品退率或发货率存在履约/售后风险")
+    for risk in _split_risks(row.get("risk_flags")):
+        if any(token in risk for token in ("过高", "过低", "偏低", "偏高", "红海", "不足", "未确认", "退换支持弱")):
+            reasons.append(risk)
+    return list(dict.fromkeys([reason for reason in reasons if reason]))
+
+
+def apply_auto_review_status(row: Dict[str, Any]) -> Dict[str, Any]:
+    suggestion = str(row.get("wechat_shop_suggestion") or "")
+    pending_core_fields = _row_pending_detail_fields(row, AUTO_REVIEW_REQUIRED_DETAIL_FIELDS)
+    blocking_reasons = _auto_review_blocking_reasons(row)
+    if row.get("filter_verification_status") == "filtered_out":
+        row["manual_review_status"] = "系统剔除"
+        row["manual_wechat_shop_suggestion"] = "不建议"
+        row["manual_review_note"] = row.get("filter_verification_note") or "详情核验后未满足筛选条件"
+    elif suggestion == "不建议":
+        row["manual_review_status"] = "系统不建议"
+        row["manual_wechat_shop_suggestion"] = "不建议"
+        row["manual_review_note"] = row.get("risk_flags") or row.get("after_sales_risk") or row.get("recommendation_reason") or "系统规则判断不适合投放"
+    elif suggestion == "可铺" and not pending_core_fields and not blocking_reasons:
+        row["manual_review_status"] = "系统预通过"
+        row["manual_wechat_shop_suggestion"] = "可铺"
+        row["manual_review_note"] = "关键履约/售后字段已核验，未命中阻断风险"
+    elif suggestion == "谨慎":
+        row["manual_review_status"] = "待复核"
+        row["manual_wechat_shop_suggestion"] = "谨慎"
+        row["manual_review_note"] = "系统判断为谨慎，需人工确认是否铺货"
+    else:
+        row["manual_review_status"] = "待复核"
+        row["manual_wechat_shop_suggestion"] = suggestion
+        if pending_core_fields:
+            row["manual_review_note"] = "关键字段待详情页核验：" + "、".join(_field_label(key) for key in pending_core_fields)
+        elif blocking_reasons:
+            row["manual_review_note"] = "；".join(blocking_reasons)
+        else:
+            row["manual_review_note"] = row.get("manual_review_note") or "系统规则暂无法自动确认"
+    return row
+
+
+def apply_auto_review_statuses(rows: Iterable[Dict[str, Any]]) -> None:
+    for row in rows:
+        if isinstance(row, dict):
+            apply_auto_review_status(row)
+
+
+def _manual_review_summary(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    summary = {
+        "system_preapproved": 0,
+        "system_not_recommended": 0,
+        "system_excluded": 0,
+        "manual_pending": 0,
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = row.get("manual_review_status")
+        if status == "系统预通过":
+            summary["system_preapproved"] += 1
+        elif status == "系统不建议":
+            summary["system_not_recommended"] += 1
+        elif status == "系统剔除":
+            summary["system_excluded"] += 1
+        elif status == "待复核":
+            summary["manual_pending"] += 1
+    return summary
+
+
+def _row_needs_exception_review(row: Dict[str, Any]) -> bool:
+    if row.get("manual_review_status") == "待复核":
+        return True
+    if row.get("verification_status") in ("verify_failed", "failed", VERIFICATION_STATUS_FILTERED_OUT):
+        return True
+    if row.get("filter_verification_status") == "filtered_out":
+        return True
+    data_gap = str(row.get("data_gap_risk") or "")
+    return bool(data_gap and data_gap != "关键字段待详情页核验")
+
+
+def _detail_score_adjustments(row: Dict[str, Any]) -> Tuple[int, List[str], List[str]]:
+    delta = 0
+    reasons: List[str] = []
+    risks: List[str] = []
+    refund_rate = _parse_number(row.get("product_refund_rate"))
+    shipment_rate = _parse_number(row.get("shipment_rate"))
+    product_rating = _parse_number(row.get("product_rating"))
+    monthly_dropship_orders = _parse_number(row.get("monthly_dropship_orders"))
+
+    if refund_rate is not None:
+        if refund_rate < 2:
+            delta += 8
+            reasons.append(f"品退率{row.get('product_refund_rate')}较低")
+        elif refund_rate < 5:
+            delta += 3
+            reasons.append(f"品退率{row.get('product_refund_rate')}可接受")
+        elif refund_rate >= 10:
+            delta -= 25
+            risks.append(f"品退率{row.get('product_refund_rate')}过高")
+        else:
+            delta -= 15
+            risks.append(f"品退率{row.get('product_refund_rate')}偏高")
+
+    if shipment_rate is not None:
+        if shipment_rate >= 98:
+            delta += 8
+            reasons.append(f"发货率{row.get('shipment_rate')}较稳")
+        elif shipment_rate >= 95:
+            delta += 3
+            reasons.append(f"发货率{row.get('shipment_rate')}达标")
+        elif shipment_rate < 90:
+            delta -= 25
+            risks.append(f"发货率{row.get('shipment_rate')}过低")
+        else:
+            delta -= 12
+            risks.append(f"发货率{row.get('shipment_rate')}偏低")
+
+    if product_rating is not None:
+        if product_rating >= 4.8:
+            delta += 5
+            reasons.append(f"商品星级{row.get('product_rating')}较高")
+        elif product_rating < 4.5:
+            delta -= 10
+            risks.append(f"商品星级{row.get('product_rating')}偏低")
+
+    if monthly_dropship_orders is not None:
+        if monthly_dropship_orders >= 500:
+            delta += 5
+            reasons.append(f"月代发订单{row.get('monthly_dropship_orders')}较活跃")
+        elif monthly_dropship_orders < 100:
+            delta -= 5
+            risks.append("月代发订单偏低")
+
+    if "是" in str(row.get("supports_dropship") or ""):
+        delta += 3
+        reasons.append("详情确认支持一件代发")
+    elif row.get("supports_dropship") not in ("", DETAIL_VERIFICATION_PENDING, None):
+        delta -= 12
+        risks.append("详情未确认一件代发")
+
+    if any(token in str(row.get("return_exchange_support") or "") for token in ("不支持", "无退", "不退")):
+        delta -= 10
+        risks.append("退换支持弱")
+    elif row.get("return_exchange_support") not in ("", DETAIL_VERIFICATION_PENDING, None):
+        delta += 2
+        reasons.append("详情确认退换支持")
+
+    return delta, reasons, risks
+
+
+def rescore_row_after_detail(row: Dict[str, Any]) -> Dict[str, Any]:
+    before_score = int(row.get("list_recommendation_score") or row.get("recommendation_score") or 0)
+    before_level = row.get("recommendation_level", "")
+    before_suggestion = row.get("wechat_shop_suggestion", "")
+    delta, reasons, risks = _detail_score_adjustments(row)
+    after_score = max(0, min(100, before_score + delta))
+    merged_risks = list(dict.fromkeys([*_split_risks(row.get("risk_flags")), *risks]))
+    row["recommendation_score"] = after_score
+    row["recommendation_level"] = _level(after_score)
+    row["risk_flags"] = "；".join(merged_risks)
+    if risks:
+        row["after_sales_risk"] = "；".join(risks)
+    row["wechat_shop_suggestion"] = _wechat_suggestion(row, merged_risks)
+    if reasons or risks:
+        row["recommendation_reason"] = "；".join(
+            part for part in [
+                str(row.get("recommendation_reason") or ""),
+                *(reasons + risks),
+            ]
+            if part
+        )
+    apply_auto_review_status(row)
+    return {
+        "item_id": row.get("item_id", ""),
+        "title": row.get("title", ""),
+        "score_before": before_score,
+        "score_after": after_score,
+        "score_delta": after_score - before_score,
+        "level_before": before_level,
+        "level_after": row.get("recommendation_level", ""),
+        "wechat_suggestion_before": before_suggestion,
+        "wechat_suggestion_after": row.get("wechat_shop_suggestion", ""),
+        "reasons": reasons,
+        "risks": risks,
+    }
+
+
 def _price_band(price: str) -> str:
     try:
         value = float(str(price).replace("¥", ""))
@@ -2457,24 +3897,61 @@ def _market_competition(stats: Dict[str, Any]) -> str:
     return "待观察"
 
 
+def _looks_like_mojibake(value: Any) -> bool:
+    text = str(value or "")
+    if not text:
+        return False
+    return bool(re.search(r"[ÃÂ�]|(?:\\u00[0-9a-fA-F]{2})", text)) or (
+        bool(re.search(r"[åæçèéäöü]", text, re.I))
+        and not bool(re.search(r"[\u4e00-\u9fff]", text))
+        and len(text) > 8
+    )
+
+
+def _clean_product_title(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^(找相似|进店|立即订购|加入进货单|收藏|¥|￥)\s*", "", text).strip()
+    if not text or _looks_like_mojibake(text):
+        return ""
+    candidates = [
+        re.sub(r"^(找相似|进店|立即订购|加入进货单|收藏|¥|￥)\s*", "", item).strip()
+        for item in re.split(r"[\n\r|｜]+", text)
+        if item.strip()
+    ] or [text]
+    for item in candidates:
+        if len(item) < 4 or len(item) > 140:
+            continue
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", item):
+            continue
+        if re.match(r"^(¥|￥)?\d+(?:\.\d+)?(?:元|起)?$", item):
+            continue
+        if re.search(r"(成交|评价|回头率|复购率|发货|物流|包邮|起批|付款|买家保障|找相似|进店|立即订购)", item[:30]):
+            continue
+        if _looks_like_mojibake(item):
+            continue
+        return item[:120]
+    return ""
+
+
 def _default_platform_suggestion(target: str, tags: List[str]) -> str:
     return "待人工复核" if target in tags else ""
 
 
 def product_to_export_row(product: Product, query: str, config: TagCollectInput) -> Dict[str, Any]:
     stats = product.stats or {}
+    title = _clean_product_title(product.title)
     score, reasons, risks = _score_product(stats, config.tags)
     category_path = (
         stats.get("categoryListName")
         or stats.get("categoryName")
-        or _match_category_from_config(config.categories, product.title)
+        or _match_category_from_config(config.categories, title)
     )
     row: Dict[str, Any] = {
         "seq": 0,
         "run_id": "",
         "category_path": category_path,
         "image_cell": "",
-        "title": product.title,
+        "title": title,
         "item_id": product.id,
         "url": product.url,
         "listed_at": stats.get("earliestListingTime", ""),
@@ -2516,6 +3993,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
         "source_factory": DETAIL_VERIFICATION_PENDING,
         "image_url": product.image,
         "monthly_dropship_orders": DETAIL_VERIFICATION_PENDING,
+        "sku_count": DETAIL_VERIFICATION_PENDING,
         "favorite_customers": DETAIL_VERIFICATION_PENDING,
         "comment_count": stats.get("remarkCnt", ""),
         "stock": DETAIL_VERIFICATION_PENDING,
@@ -2535,6 +4013,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
         "matched_tags": ",".join(config.tags + config.categories),
         "tag_source": ",".join(config.tags + config.categories),
         "list_source": "sample" if config.sample_data else config.collect_source,
+        "list_recommendation_score": score,
         "recommendation_score": score,
         "recommendation_level": _level(score),
         "recommendation_reason": "；".join(reasons) or "待人工复核",
@@ -2552,6 +4031,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
     if any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
         row["data_gap_risk"] = "关键字段待详情页核验"
     _refresh_metric_buckets(row)
+    apply_auto_review_status(row)
     return row
 
 
@@ -2636,7 +4116,7 @@ def _queue_reason(row: Dict[str, Any]) -> str:
     reasons = []
     if row.get("recommendation_level") in DETAIL_VERIFICATION_LEVELS:
         reasons.append(f"{row.get('recommendation_level')} 高潜商品")
-    if row.get("list_source") == "rpa":
+    if row.get("list_source") in ("rpa", "manual_url", "url_direct"):
         reasons.append("真实页面候选商品")
     if row.get("wechat_shop_suggestion") in ("可铺", "谨慎"):
         reasons.append(f"微信小店预判{row.get('wechat_shop_suggestion')}")
@@ -2650,7 +4130,7 @@ def build_verification_queue(rows: List[Dict[str, Any]], max_items: int = 20) ->
     for row in rows:
         if row.get("verification_status") not in ("", VERIFICATION_STATUS_UNVERIFIED):
             continue
-        if row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS and row.get("list_source") != "rpa":
+        if row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS and row.get("list_source") not in ("rpa", "manual_url", "url_direct"):
             continue
         if not any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
             continue
@@ -2674,17 +4154,28 @@ def build_verification_queue(rows: List[Dict[str, Any]], max_items: int = 20) ->
     return queue
 
 
+def _auto_verify_limit(config: TagCollectInput, rows: List[Dict[str, Any]]) -> int:
+    configured = int(config.auto_verify_max_items or 0)
+    if configured > 0:
+        return max(1, min(20, configured))
+    target = int(config.target_publishable_count or config.max_items_per_query or 0)
+    desired = max(target, min(len(rows), MAX_ITEMS_PER_QUERY))
+    return max(1, min(20, desired))
+
+
 def _has_blocking_detail_risk(row: Dict[str, Any]) -> bool:
-    refund_rate_text = str(row.get("product_refund_rate", "")).replace("%", "").strip()
-    shipment_rate_text = str(row.get("shipment_rate", "")).replace("%", "").strip()
-    try:
-        refund_rate = float(refund_rate_text) if refund_rate_text else 0.0
-    except ValueError:
-        refund_rate = 0.0
-    try:
-        shipment_rate = float(shipment_rate_text) if shipment_rate_text else 100.0
-    except ValueError:
-        shipment_rate = 100.0
+    refund_value = row.get("product_refund_rate", "")
+    shipment_value = row.get("shipment_rate", "")
+    refund_rate_text = str(refund_value).replace("%", "").strip()
+    shipment_rate_text = str(shipment_value).replace("%", "").strip()
+    refund_rate = _parse_number(refund_value)
+    shipment_rate = _parse_number(shipment_value)
+    if refund_rate_text and refund_rate is None and refund_value != DETAIL_VERIFICATION_PENDING:
+        return True
+    if shipment_rate_text and shipment_rate is None and shipment_value != DETAIL_VERIFICATION_PENDING:
+        return True
+    refund_rate = refund_rate if refund_rate is not None else 0.0
+    shipment_rate = shipment_rate if shipment_rate is not None else 100.0
     return refund_rate >= 5.0 or shipment_rate < 95.0
 
 
@@ -2834,6 +4325,9 @@ def _automation_state(
     verified_count = len([row for row in rows if row.get("verification_status") in verified_statuses])
     failed_count = len([row for row in rows if row.get("verification_status") == VERIFICATION_STATUS_FAILED])
     partial_count = len([row for row in rows if row.get("verification_status") == VERIFICATION_STATUS_PARTIAL])
+    target_publishable_count = int(payload.get("target_publishable_count") or 0)
+    publishable_count = len(_publishable_rows(rows))
+    shortfall_reason = str(payload.get("shortfall_reason") or "")
 
     if not rows:
         status = "empty"
@@ -2854,12 +4348,16 @@ def _automation_state(
         status = "pending_detail"
         stage = "detail_verification"
         action = "continue_detail_verification"
-        message = "列表字段仅完成初筛，仍有高潜商品等待进入详情页核验。"
+        message = (
+            f"已筛出 {publishable_count}/{target_publishable_count} 个可铺候选，仍有高潜商品等待进入详情页核验。"
+            if target_publishable_count
+            else "列表字段仅完成初筛，仍有高潜商品等待进入详情页核验。"
+        )
     elif partial_count or failed_count:
         status = "partial"
         stage = "export_ready"
         action = "manual_review"
-        message = "部分详情字段未完全核验，导出后必须人工复核。"
+        message = shortfall_reason or "部分详情字段未完全核验，导出后重点复核异常/边界商品。"
     elif verified_count:
         status = "sample_verified" if sample_data else "verified"
         stage = "export_ready"
@@ -2867,13 +4365,17 @@ def _automation_state(
         message = (
             "样例流程已核验，不能当作真实 1688 数据。"
             if sample_data
-            else "详情字段已完成本轮核验，导出后仍需人工复核。"
+            else (
+                f"详情字段已完成本轮核验，已筛出 {publishable_count}/{target_publishable_count} 个可铺候选；导出后重点复核异常/边界商品。"
+                if target_publishable_count
+                else "详情字段已完成本轮核验，导出后重点复核异常/边界商品。"
+            )
         )
     else:
         status = "collected"
         stage = "export_ready"
         action = "manual_review"
-        message = "列表初筛已完成，关键字段仍未进入详情页核验。"
+        message = shortfall_reason or "列表初筛已完成，关键字段仍未进入详情页核验。"
 
     return {
         "status": status,
@@ -2888,6 +4390,11 @@ def _automation_state(
         "verified_count": verified_count,
         "failed_count": failed_count,
         "partial_count": partial_count,
+        "target_publishable_count": target_publishable_count,
+        "publishable_count": publishable_count,
+        "strict_publishable_count": len(_publishable_rows(rows, include_cautious=False)),
+        "publishable_candidate_count": len(_publishable_rows(rows, include_cautious=True)),
+        "shortfall_reason": shortfall_reason,
         "stopped_reason": stopped_reason,
         "retryable": not bool(stopped_reason),
         "real_data": not sample_data,
@@ -2904,6 +4411,12 @@ def update_automation_state(payload: Dict[str, Any], *, verification_stopped_rea
 
 def refresh_run_artifacts(payload: Dict[str, Any]) -> Dict[str, Any]:
     output_path = payload.get("output_path")
+    rows = payload.get("rows", [])
+    if isinstance(rows, list):
+        apply_auto_review_statuses(rows)
+    excluded_rows = payload.get("filter_excluded_rows", [])
+    if isinstance(excluded_rows, list):
+        apply_auto_review_statuses(excluded_rows)
     update_automation_state(payload)
     if isinstance(output_path, str) and output_path:
         if output_path.endswith(".csv"):
@@ -2931,6 +4444,7 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
     evidence: List[Dict[str, Any]] = list(payload.get("verification_records") or [])
     filter_plan = payload.get("filter_plan") or {}
     filter_reevaluation_records: List[Dict[str, Any]] = []
+    rescore_records: List[Dict[str, Any]] = []
     verified_count = 0
     failed_count = 0
     stopped_reason = ""
@@ -2944,6 +4458,8 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
         records = _sample_verify_row(row) if sample_data else _real_verify_row(row)
         evidence.extend(records)
         filter_records = reevaluate_row_filters_after_verification(row, filter_plan)
+        if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+            rescore_records.append(rescore_row_after_detail(row))
         for record in filter_records:
             filter_reevaluation_records.append({
                 "item_id": item_id,
@@ -2963,8 +4479,27 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
         *(payload.get("filter_reevaluation_records") or []),
         *filter_reevaluation_records,
     ]
+    payload["rescore_records"] = [
+        *(payload.get("rescore_records") or []),
+        *rescore_records,
+    ]
     excluded_rows = _apply_detail_filter_exclusions(payload)
     rows = payload.get("rows", [])
+    if isinstance(rows, list):
+        apply_auto_review_statuses(rows)
+    non_publishable_rejections = _persist_non_publishable_rejections(payload)
+    rows = payload.get("rows", [])
+    publishable_count = len(_publishable_rows(rows))
+    payload["publishable_count"] = publishable_count
+    payload["strict_publishable_count"] = publishable_count
+    payload["publishable_candidate_count"] = len(_publishable_rows(rows, include_cautious=True))
+    payload["collection_stop_reason"] = "target_met" if publishable_count >= int(payload.get("target_publishable_count") or 0) else payload.get("collection_stop_reason", "")
+    payload["shortfall_reason"] = _shortfall_reason(
+        target_publishable_count=int(payload.get("target_publishable_count") or 0),
+        publishable_count=publishable_count,
+        collection_stop_reason=str(payload.get("collection_stop_reason") or "source_exhausted_or_filters_too_strict"),
+        skipped_rejected_count=int(payload.get("skipped_rejected_count") or 0),
+    )
     payload["verification_queue"] = build_verification_queue(rows, max_items=max_items)
     payload["verified_count"] = len([
         row for row in rows
@@ -2973,6 +4508,10 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
     payload["verification_failed_count"] = len([
         row for row in rows
         if isinstance(row, dict) and row.get("verification_status") == VERIFICATION_STATUS_FAILED
+    ])
+    payload["verification_field_failed_count"] = len([
+        record for record in evidence
+        if isinstance(record, dict) and record.get("status") == VERIFICATION_STATUS_FAILED
     ])
     payload["last_verified_at"] = _now_iso() if queue else payload.get("last_verified_at", "")
     payload["verification_stopped_reason"] = stopped_reason
@@ -2995,13 +4534,22 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             "run_id": run_id,
             "verified_count": verified_count,
             "failed_count": failed_count,
+            "field_failed_count": payload.get("verification_field_failed_count", 0),
             "filter_excluded_count": len(excluded_rows),
+            "rejected_count": payload.get("rejected_count", 0),
+            "non_publishable_rejected_count": len(non_publishable_rejections),
             "row_count": len(rows),
             "rows": rows,
             "filter_excluded_rows": payload.get("filter_excluded_rows", []),
             "verification_queue": payload["verification_queue"],
             "verification_records": evidence,
             "filter_reevaluation_records": payload["filter_reevaluation_records"],
+            "rescore_records": payload.get("rescore_records", []),
+            "publishable_count": payload.get("publishable_count", 0),
+            "strict_publishable_count": payload.get("strict_publishable_count", 0),
+            "publishable_candidate_count": payload.get("publishable_candidate_count", 0),
+            "target_publishable_count": payload.get("target_publishable_count", 0),
+            "shortfall_reason": payload.get("shortfall_reason", ""),
             "download_url": f"/download?run_id={run_id}",
             "output_path": payload.get("output_path", ""),
             "verification_stopped_reason": stopped_reason,
@@ -3103,9 +4651,21 @@ def _styles_xml() -> str:
 
 def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[Dict[str, Any]] = None) -> str:
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+    apply_auto_review_statuses(rows)
+    if payload:
+        excluded_rows = payload.get("filter_excluded_rows", [])
+        if isinstance(excluded_rows, list):
+            apply_auto_review_statuses(excluded_rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
     labels = [label for _, label in EXPORT_COLUMNS]
     result_rows = [labels] + [[row.get(key, "") for key in keys] for row in rows]
+    review_summary = _manual_review_summary([
+        *rows,
+        *[
+            row for row in payload.get("filter_excluded_rows", [])
+            if isinstance(row, dict)
+        ],
+    ])
     field_rows = [["编号", "分组", "字段", "字段键", "来源", "是否必须核验"]] + [
         [field["number"], field["group"], field["label"], field["key"], field["source"], field["verify"]]
         for field in EXPORT_FIELD_DEFINITIONS
@@ -3119,10 +4679,26 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["建议动作", (payload.get("automation_state") or {}).get("action_label", "")],
         ["状态说明", (payload.get("automation_state") or {}).get("message", "")],
         ["详情核验暂停原因", payload.get("verification_stopped_reason", "")],
+        ["自动详情核验", "开启" if payload.get("auto_verify_details") else "关闭"],
+        ["自动核验上限", payload.get("auto_verify_max_items", "")],
+        ["目标可铺数量", payload.get("target_publishable_count", "")],
+        ["目标达标数量(可铺)", payload.get("publishable_count", 0)],
+        ["可铺/谨慎候选数量", payload.get("publishable_candidate_count", 0)],
+        ["候选扫描数量", payload.get("candidate_count", 0)],
+        ["候选扫描预算", payload.get("candidate_scan_limit", "")],
+        ["历史筛除跳过", payload.get("skipped_rejected_count", 0)],
+        ["本次筛除记录", payload.get("rejected_count", 0)],
+        ["采集停止原因", payload.get("collection_stop_reason", "")],
+        ["目标短缺原因", payload.get("shortfall_reason", "")],
         ["已核验商品数", payload.get("verified_count", 0)],
         ["核验失败商品数", payload.get("verification_failed_count", 0)],
+        ["核验失败字段数", payload.get("verification_field_failed_count", 0)],
         ["详情筛选剔除商品数", payload.get("filter_excluded_count", 0)],
         ["待详情核验商品数", len(payload.get("verification_queue", []) or [])],
+        ["系统预通过数量", review_summary["system_preapproved"]],
+        ["系统不建议数量", review_summary["system_not_recommended"]],
+        ["系统剔除数量", review_summary["system_excluded"]],
+        ["待人工复核数量", review_summary["manual_pending"]],
         ["查询词", ", ".join(payload.get("queries", []))],
         ["类目标签", ", ".join(payload.get("categories", []))],
         ["运营标签", ", ".join(payload.get("tags", []))],
@@ -3137,6 +4713,9 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["预留筛选字段", json.dumps((payload.get("filter_plan") or {}).get("library_reserved_fields", []), ensure_ascii=False)],
         ["筛选覆盖状态", json.dumps(payload.get("library_filter_coverage", get_library_filter_coverage()), ensure_ascii=False)],
         ["详情核验后筛选重评估", json.dumps(payload.get("filter_reevaluation_records", []), ensure_ascii=False)],
+        ["详情核验后重评分", json.dumps(payload.get("rescore_records", []), ensure_ascii=False)],
+        ["历史筛除跳过记录", json.dumps(payload.get("skipped_rejected_records", []), ensure_ascii=False)],
+        ["本次筛除记录", json.dumps(payload.get("rejection_records", []), ensure_ascii=False)],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
         ["筛选执行记录", json.dumps(payload.get("filter_results", []), ensure_ascii=False)],
         ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
@@ -3153,9 +4732,7 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
     failed_rows = [labels] + [
         [row.get(key, "") for key in keys]
         for row in failed_candidates
-        if row.get("verification_status") in ("verify_failed", "failed", VERIFICATION_STATUS_FILTERED_OUT)
-        or row.get("data_gap_risk")
-        or row.get("filter_verification_status") == "filtered_out"
+        if _row_needs_exception_review(row)
     ]
     verification_rows = [[
         "商品ID",
@@ -3216,7 +4793,7 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ("选品结果", result_rows),
         ("字段说明", field_rows),
         ("标签配置", config_rows),
-        ("核验失败", failed_rows),
+        ("异常复核", failed_rows),
         ("核验记录", verification_rows),
         ("筛选执行记录", filter_rows),
     ]
@@ -3235,6 +4812,7 @@ def export_csv(rows: List[Dict[str, Any]], output_path: str) -> str:
     import csv
 
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+    apply_auto_review_statuses(rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
     labels = [label for _, label in EXPORT_COLUMNS]
     with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -3251,6 +4829,17 @@ def save_run_payload(payload: Dict[str, Any], run_id: str) -> str:
     path = os.path.join(data_dir, f"tag_collect_{run_id}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def save_error_payload(payload: Dict[str, Any]) -> str:
+    data_dir = get_tag_collect_data_dir()
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    error_id = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
+    path = os.path.join(data_dir, f"tag_collect_error_{error_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"error_id": error_id, "created_at": now.isoformat(timespec="seconds"), **payload}, f, ensure_ascii=False, indent=2)
     return path
 
 
@@ -3288,6 +4877,8 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
     run_id = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
     for row in rows:
         row["run_id"] = run_id
+    apply_auto_review_statuses(rows)
+    auto_verify_limit = _auto_verify_limit(config, rows) if config.auto_verify_details else config.auto_verify_max_items
     ext = "csv" if config.output_format == "csv" else "xlsx"
     output_path = os.path.join(get_tag_collect_data_dir(), f"tag_collect_{run_id}.{ext}")
     payload = {
@@ -3312,15 +4903,35 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "sample_data": config.sample_data,
         "collect_source": config.collect_source,
         "row_count": len(rows),
+        "target_publishable_count": filter_plan.get("target_publishable_count", config.target_publishable_count),
+        "publishable_count": filter_plan.get("publishable_count", len(_publishable_rows(rows))),
+        "strict_publishable_count": filter_plan.get("strict_publishable_count", len(_publishable_rows(rows, include_cautious=False))),
+        "publishable_candidate_count": filter_plan.get("publishable_candidate_count", len(_publishable_rows(rows, include_cautious=True))),
+        "candidate_count": filter_plan.get("candidate_count", len(rows)),
+        "candidate_scan_limit": filter_plan.get("candidate_scan_limit", _candidate_scan_limit(config)),
+        "collection_stop_reason": filter_plan.get("collection_stop_reason", ""),
+        "shortfall_reason": filter_plan.get("shortfall_reason", ""),
+        "rejection_records": filter_plan.get("rejection_records", []),
+        "rejected_count": filter_plan.get("rejected_count", 0),
+        "skipped_rejected_records": filter_plan.get("skipped_rejected_records", []),
+        "skipped_rejected_count": filter_plan.get("skipped_rejected_count", 0),
+        "persistent_excluded_count": filter_plan.get("persistent_excluded_count", 0),
+        "filter_signature": filter_plan.get("filter_signature", ""),
+        "target_platform": filter_plan.get("target_platform", _target_platform_from_tags(config.tags)),
         "output_path": output_path,
         "rows": rows,
-        "verification_queue": build_verification_queue(rows),
+        "verification_queue": build_verification_queue(rows, max_items=auto_verify_limit or 20),
         "verification_records": [],
         "filter_reevaluation_records": [],
+        "rescore_records": [],
         "filter_excluded_rows": [],
         "filter_excluded_count": 0,
         "verified_count": 0,
         "verification_failed_count": 0,
+        "verification_field_failed_count": 0,
+        "auto_verify_details": config.auto_verify_details,
+        "auto_verify_max_items": auto_verify_limit,
+        "auto_verify_result": {},
         "last_verified_at": "",
         "verification_stopped_reason": "",
     }
@@ -3335,10 +4946,14 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         auto_verify_result = verify_run_details(
             run_id,
             sample_data=config.sample_data,
-            max_items=config.auto_verify_max_items or 5,
+            max_items=auto_verify_limit,
         )
         if auto_verify_result.get("success"):
             payload = get_run_payload(run_id) or payload
+            payload["auto_verify_details"] = config.auto_verify_details
+            payload["auto_verify_max_items"] = auto_verify_limit
+            payload["auto_verify_result"] = auto_verify_result.get("data", {})
+            refresh_run_artifacts(payload)
             snapshot_path = os.path.join(get_tag_collect_data_dir(), f"tag_collect_{run_id}.json")
     markdown = build_markdown(payload, snapshot_path)
     if auto_verify_result and auto_verify_result.get("success"):
@@ -3349,7 +4964,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             f"- 已自动进入详情页核验：{auto_data.get('verified_count', 0)} 个商品\n"
             f"- 核验失败：{auto_data.get('failed_count', 0)} 个商品\n"
             + (f"- 已暂停后续详情核验：{stopped_reason}\n" if stopped_reason else "")
-            + "- 导出文件已刷新，详情字段仍需人工复核后用于铺货。"
+            + "- 导出文件已刷新，系统已自动标记预通过/不建议/剔除；仅异常和边界商品需要人工复核。"
         )
     return {
         "success": True,
@@ -3359,6 +4974,19 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "queries": queries,
             "source_urls": config.source_urls,
             "row_count": payload.get("row_count", len(payload.get("rows", rows))),
+            "target_publishable_count": payload.get("target_publishable_count", config.target_publishable_count),
+            "publishable_count": payload.get("publishable_count", len(_publishable_rows(payload.get("rows", rows)))),
+            "strict_publishable_count": payload.get("strict_publishable_count", len(_publishable_rows(payload.get("rows", rows), include_cautious=False))),
+            "publishable_candidate_count": payload.get("publishable_candidate_count", len(_publishable_rows(payload.get("rows", rows), include_cautious=True))),
+            "candidate_count": payload.get("candidate_count", 0),
+            "candidate_scan_limit": payload.get("candidate_scan_limit", 0),
+            "collection_stop_reason": payload.get("collection_stop_reason", ""),
+            "shortfall_reason": payload.get("shortfall_reason", ""),
+            "rejection_records": payload.get("rejection_records", []),
+            "rejected_count": payload.get("rejected_count", 0),
+            "skipped_rejected_records": payload.get("skipped_rejected_records", []),
+            "skipped_rejected_count": payload.get("skipped_rejected_count", 0),
+            "persistent_excluded_count": payload.get("persistent_excluded_count", 0),
             "output_path": output_path,
             "snapshot_path": snapshot_path,
             "sample_data": config.sample_data,
@@ -3377,6 +5005,7 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "verification_queue": payload["verification_queue"],
             "verification_records": payload["verification_records"],
             "filter_reevaluation_records": payload["filter_reevaluation_records"],
+            "rescore_records": payload.get("rescore_records", []),
             "verified_count": payload.get("verified_count", 0),
             "verification_failed_count": payload.get("verification_failed_count", 0),
             "verification_stopped_reason": payload.get("verification_stopped_reason", ""),
@@ -3417,6 +5046,19 @@ def build_markdown(payload: Dict[str, Any], snapshot_path: str) -> str:
             f"（{category_dictionary.get('status', '')}）"
         )
     lines.append(f"- 商品数：{payload['row_count']}")
+    if payload.get("target_publishable_count"):
+        lines.append(
+            "- 可铺目标："
+            f"{payload.get('publishable_count', 0)}/{payload.get('target_publishable_count', 0)}"
+            f"（可铺/谨慎候选 {payload.get('publishable_candidate_count', 0)}）"
+        )
+    if payload.get("candidate_count") is not None:
+        lines.append(
+            f"- 候选扫描：{payload.get('candidate_count', 0)}/{payload.get('candidate_scan_limit', '')}"
+            f"，历史筛除跳过 {payload.get('skipped_rejected_count', 0)}"
+        )
+    if payload.get("shortfall_reason"):
+        lines.append(f"- 未达目标原因：{payload.get('shortfall_reason')}")
     lines.append(f"- 待详情页核验商品：{len(payload.get('verification_queue', []))}")
     automation_state = payload.get("automation_state") or _automation_state(payload)
     lines.append(f"- 任务状态：{automation_state.get('status_label', '')} / {automation_state.get('stage_label', '')}")
@@ -3429,6 +5071,6 @@ def build_markdown(payload: Dict[str, Any], snapshot_path: str) -> str:
     else:
         lines.append(f"- 数据模式：真实数据（来源：{payload.get('collect_source') or 'rpa'}）")
     lines.append("\n### 人工复核说明")
-    lines.append("导出后请在表格中更新 `人工复核状态`、`人工复核备注`、`微信小店铺货建议`。")
-    lines.append("列表字段只做初筛，运费、品退率、发货率等关键字段仍需进入详情页核验。")
+    lines.append("系统会优先自动筛除明确不满足条件的商品，并把历史失败商品跳过；导出后重点复核异常、边界和 `谨慎` 商品。")
+    lines.append("列表字段只做初筛，运费、品退率、发货率等关键字段仍需进入详情页核验；触发风控时不会继续刷新或绕过验证。")
     return "\n".join(lines)

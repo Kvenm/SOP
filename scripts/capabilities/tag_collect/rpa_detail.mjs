@@ -15,22 +15,26 @@ function failWithCode(code, message, extra = {}) {
   process.exit(0);
 }
 
-let chromium;
-try {
-  ({ chromium } = await import("playwright"));
-} catch {
-  fail("未安装 playwright，无法执行真实详情页核验。请在项目目录执行：npm install playwright");
-}
-
 const url = String(input.url || "").trim();
 const itemId = String(input.item_id || "").trim();
-if (!url) fail("缺少商品详情页 URL");
+const testHtml = String(input.test_html || "").trim();
+if (!url && !testHtml) fail("缺少商品详情页 URL");
+
+let chromium;
+if (!testHtml) {
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch {
+    fail("未安装 playwright，无法执行真实详情页核验。请在项目目录执行：npm install playwright");
+  }
+}
 
 const profileDir = process.env.TAG_COLLECT_RPA_PROFILE
   || path.join(os.homedir(), ".sop-1688-rpa-profile");
 const headless = process.env.TAG_COLLECT_RPA_HEADLESS === "1";
-const loginWaitMs = Number(process.env.TAG_COLLECT_RPA_LOGIN_WAIT_MS || 90000);
 const cdpUrl = process.env.TAG_COLLECT_CDP_URL || "";
+const loginWaitMs = Number(process.env.TAG_COLLECT_RPA_LOGIN_WAIT_MS || (cdpUrl ? 15000 : 30000));
+const pageTimeoutMs = Number(process.env.TAG_COLLECT_RPA_PAGE_TIMEOUT_MS || 30000);
 const pacingMode = String(process.env.TAG_COLLECT_RPA_PACING || "human").toLowerCase();
 const pacingProfiles = {
   fast: {
@@ -98,13 +102,34 @@ function securityMessage(currentUrl, waited) {
 
 async function openRuntime() {
   if (cdpUrl) {
-    const browser = await chromium.connectOverCDP(cdpUrl);
+    let browser;
+    try {
+      browser = await chromium.connectOverCDP(cdpUrl, { noDefaults: true });
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      failWithCode(
+        "cdp_context_unsupported",
+        "真实 Chrome CDP 端口能连接，但当前调试端点不支持 Playwright 初始化上下文。请关闭该调试 Chrome 后重新运行 scripts/capabilities/tag_collect/start_chrome_debug.sh；如果仍失败，先确认 9222 没有被其它浏览器/工具占用。",
+        {
+          source: "chrome_cdp",
+          cdp: Boolean(cdpUrl),
+          cdp_url: cdpUrl,
+          low_level_error: message,
+        }
+      );
+    }
     const context = browser.contexts()[0] || await browser.newContext({
       viewport: { width: 1440, height: 960 },
       locale: "zh-CN",
     });
     const page = await context.newPage();
-    return { page, close: async () => page.close().catch(() => {}) };
+    return {
+      page,
+      close: async () => {
+        await page.close().catch(() => {});
+        await browser.close().catch(() => {});
+      },
+    };
   }
   const context = await chromium.launchPersistentContext(profileDir, {
     headless,
@@ -115,10 +140,6 @@ async function openRuntime() {
   return { page, close: async () => context.close() };
 }
 
-const runtime = await openRuntime();
-const page = runtime.page;
-page.setDefaultTimeout(45000);
-
 function firstMatch(text, patterns) {
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -127,8 +148,184 @@ function firstMatch(text, patterns) {
   return "";
 }
 
+function cleanExtractedValue(value, maxLength = 80) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[：:，,；;\-—\s]+/, "")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function stopAtNextLabel(value, maxLength = 80) {
+  return cleanExtractedValue(value, maxLength)
+    .split(/(?=\s*(?:起批|起订|品退率|品质退款率|退款率|发货率|准时发货率|24\s*小时|24h|24H|SKU|规格|收藏|诚信通|生产厂家|经销批发|招商代理|商业服务|个体经营|密文面单|电子面单|面单|\{|"shopName"|'shopName'))/)[0]
+    .trim();
+}
+
+function cleanShopName(value) {
+  const text = cleanExtractedValue(value, 60)
+    .replace(/^(店铺|店铺名称|供应商|公司|公司名称|进入店铺|进店)[:：]?\s*/, "")
+    .replace(/(进入店铺|进店|联系供应商|收藏店铺).*$/, "")
+    .trim();
+  if (!text || /^(回头率|复购率|发货率|好评率|店铺|公司|供应商|联系|全部商品)$/.test(text)) return "";
+  if (!/[一-龥A-Za-z]/.test(text)) return "";
+  return text;
+}
+
+function firstJsonValue(rawText, keys) {
+  const text = String(rawText || "");
+  for (const key of keys) {
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      new RegExp(`"${escaped}"\\s*:\\s*"([^"]{1,120})"`, "i"),
+      new RegExp(`'${escaped}'\\s*:\\s*'([^']{1,120})'`, "i"),
+      new RegExp(`"${escaped}"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?%?)`, "i"),
+    ];
+    const value = firstMatch(text, patterns);
+    if (value) return cleanExtractedValue(value);
+  }
+  return "";
+}
+
+function extractDetailFieldsFromText(text, structuredText = "") {
+  const combined = `${structuredText || ""} ${text || ""}`.replace(/\s+/g, " ").trim();
+  const fields = {};
+  fields.product_rating = firstMatch(combined, [
+    /商品评价[^0-9]{0,20}([0-5](?:\.[0-9])?)(?:\s*\(|\s*好评率|\s*$)/,
+    /([0-5](?:\.[0-9])?)\s*(?:分)?\s*\(?\s*[0-9万+]*条?评价/,
+    /([0-5](?:\.[0-9])?)\s*好评率/,
+  ]);
+  fields.good_rate = firstMatch(combined, [
+    /好评率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /([0-9]+(?:\.[0-9]+)?%)\s*好评/,
+  ]) || firstJsonValue(structuredText, ["goodRate", "goodRates", "positiveRate"]);
+  fields.comment_count = firstMatch(combined, [
+    /[\(（]\s*([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价\s*[\)）]/,
+    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价/,
+    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*人?好评/,
+  ]) || firstJsonValue(structuredText, ["remarkCount", "remarkCnt", "commentCount"]);
+  const knownReviewTags = [
+    "客服态度超好",
+    "质感不错",
+    "购买推荐",
+    "质量很好",
+    "发货很快",
+    "包装完好",
+    "性价比高",
+  ];
+  fields.review_tags = knownReviewTags.filter((tag) => combined.includes(tag)).join(",");
+  fields.product_refund_rate = firstMatch(combined, [
+    /品退率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /品质退款率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /退款率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+  ]) || firstJsonValue(structuredText, ["refundRate", "qualityRefundRate"]);
+  fields.shipment_rate = firstMatch(combined, [
+    /发货率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /准时发货率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+  ]) || firstJsonValue(structuredText, ["shipmentRate", "deliveryRate", "onTimeDeliveryRate"]);
+  fields.collection_rate_24h = firstMatch(combined, [
+    /24\s*小时揽收率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
+    /24h揽收率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/i,
+    /24H支揽率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/i,
+  ]) || firstJsonValue(structuredText, ["collectionRate24h", "collectRate24h"]);
+  fields.shipment_speed = firstMatch(combined, [
+    /(24小时内发货|48小时内发货|72小时内发货|[0-9]+小时发货|[0-9]+天内发货)/,
+  ]);
+  fields.wholesale_shipping_fee = stopAtNextLabel(firstMatch(combined, [
+    /(首重\s*[0-9]+(?:\.[0-9]+)?元(?:\s*(?:续重|续件)\s*[0-9]+(?:\.[0-9]+)?元)?)/,
+    /(运费[:：]?\s*(?:包邮|免运费|另计|到付|首重\s*[0-9]+(?:\.[0-9]+)?元(?:\s*(?:续重|续件)\s*[0-9]+(?:\.[0-9]+)?元)?|最高\s*[0-9]+(?:\.[0-9]+)?元))/,
+    /(快递[:：]?\s*(?:包邮|免运费|另计|到付|[0-9]+(?:\.[0-9]+)?元))/,
+  ]), 60);
+  fields.dropship_shipping_fee = fields.wholesale_shipping_fee;
+  fields.free_shipping = /不包邮|运费另计|运费到付/.test(combined)
+    ? "否"
+    : (/包邮|免运费|卖家承担运费/.test(combined) ? "是" : "");
+  fields.supports_dropship = /一件代发|代发/.test(combined) ? "是" : "";
+  fields.dropship_rights = fields.supports_dropship ? "页面出现一件代发/代发信息" : "";
+  fields.return_exchange_support = firstMatch(combined, [
+    /(7天无理由(?:退货|退换货)?|七天无理由(?:退货|退换货)?)/,
+    /(支持退换(?:货)?)/,
+  ]);
+  fields.rights_protection = firstMatch(combined, [
+    /(买家保障[^。；，,]{0,40})/,
+    /(保障服务[^。；，,]{0,40})/,
+    /(7天无理由(?:退货|退换货)?|七天无理由(?:退货|退换货)?)/,
+  ]);
+  fields.min_order_range = firstMatch(combined, [
+    /([0-9]+件起批)/,
+    /起批(?:量)?[:：]?\s*([0-9]+[^ ]{0,8})/,
+    /起订(?:量)?[:：]?\s*([0-9]+[^ ]{0,8})/,
+  ]);
+  fields.sku_count = firstMatch(combined, [
+    /SKU(?:数量|数)?[:：]?\s*([0-9]+(?:\.[0-9]+)?万?\+?)/i,
+    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*(?:个|款)?SKU/i,
+    /规格(?:数量|数)?[:：]?\s*([0-9]+(?:\.[0-9]+)?万?\+?)/,
+  ]) || firstJsonValue(structuredText, ["skuCount", "skuNum", "skuQuantity"]);
+  fields.shop_name = cleanShopName(firstJsonValue(structuredText, ["shopName", "sellerName", "companyName", "loginId"])) || cleanShopName(firstMatch(combined, [
+    /(?:店铺名称|店铺|供应商|公司名称|公司)[:：]\s*([^。；，,\n\r]{2,60})/,
+    /进入店铺\s*([^。；，,\n\r]{2,60})/,
+  ]));
+  fields.location = firstMatch(combined, [
+    /所在地[:：]?\s*([^ ]{2,20})/,
+    /货源地[:：]?\s*([^ ]{2,20})/,
+  ]);
+  fields.company_type = firstMatch(combined, [
+    /(生产厂家|经销批发|招商代理|商业服务|个体经营)/,
+  ]);
+  fields.seller_member_type = firstMatch(combined, [
+    /(实力商家|超级工厂|诚信通)/,
+  ]);
+  fields.source_factory = /源头工厂|生产厂家|超级工厂/.test(combined) ? "是" : "";
+  fields.trustpass_years = firstMatch(combined, [
+    /诚信通\s*([0-9]+年)/,
+    /([0-9]+年)\s*诚信通/,
+  ]);
+  fields.certificates = firstMatch(combined, [
+    /(营业执照|生产许可证|质检报告|认证证书|资质证书)/,
+  ]);
+  fields.monthly_dropship_orders = firstMatch(combined, [
+    /月代发(?:订单|销量)?[:：]?\s*([0-9]+(?:\.[0-9]+)?万?\+?)/,
+    /代发订单[:：]?\s*([0-9]+(?:\.[0-9]+)?万?\+?)/,
+  ]);
+  fields.favorite_customers = firstMatch(combined, [
+    /收藏(?:客户|人数)?[:：]?\s*([0-9]+(?:\.[0-9]+)?万?\+?)/,
+  ]);
+  fields.stock = stopAtNextLabel(firstMatch(combined, [
+    /库存[:：]?\s*([^。；，,\s<]{1,30})/,
+    /现货[:：]?\s*([^。；，,\s<]{1,30})/,
+  ]), 40);
+  fields.waybill_support = firstMatch(combined, [
+    /(微信小店面单|抖音面单|拼多多面单|电子面单|密文面单)/,
+    /(面单[^。；，,\s<]{0,12})/,
+  ]);
+  fields.video_query = /视频|主图视频/.test(combined) ? "页面出现视频信息，待人工确认素材可用性" : "";
+  return fields;
+}
+
+if (testHtml) {
+  const plainText = testHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+  const fields = Object.fromEntries(Object.entries(extractDetailFieldsFromText(plainText, testHtml)).filter(([, value]) => value));
+  console.log(JSON.stringify({ success: true, source: "test_html", fields }));
+  process.exit(0);
+}
+
+const runtime = await openRuntime();
+const page = runtime.page;
+page.setDefaultTimeout(Math.max(15000, Math.min(45000, pageTimeoutMs)));
+
 try {
-  await page.goto(url, { waitUntil: "domcontentloaded" });
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageTimeoutMs });
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    await runtime.close().catch(() => {});
+    failWithCode(
+      "navigation_timeout",
+      `1688 详情页加载超时，未写入任何详情字段。请先在真实 Chrome 中人工打开该商品详情页确认能正常访问，再回到本工具核验。${message}`,
+      { source: "1688_detail_page", cdp: Boolean(cdpUrl), item_id: itemId, url, page_url: page.url() }
+    );
+  }
   await humanPause(page, pacing.afterGoto);
   let pageText = await page.locator("body").innerText({ timeout: 10000 }).catch(() => "");
   const needsManualGate = looksLikeSecurityPage(pageText, page.url()) || looksLikeLoginPage(pageText, page.url());
@@ -173,92 +370,45 @@ try {
     process.exit(0);
   }
   const text = String(pageText || "").replace(/\s+/g, " ").trim();
-  const fields = {};
-  fields.product_rating = firstMatch(text, [
-    /商品评价[^0-9]{0,20}([0-5](?:\.[0-9])?)(?:\s*\(|\s*好评率|\s*$)/,
-    /([0-5](?:\.[0-9])?)\s*(?:分)?\s*\(?\s*[0-9万+]*条?评价/,
-    /([0-5](?:\.[0-9])?)\s*好评率/,
-  ]);
-  fields.good_rate = firstMatch(text, [
-    /好评率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-    /([0-9]+(?:\.[0-9]+)?%)\s*好评/,
-  ]);
-  fields.comment_count = firstMatch(text, [
-    /[\(（]\s*([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价\s*[\)）]/,
-    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*条?评价/,
-    /([0-9]+(?:\.[0-9]+)?万?\+?)\s*人?好评/,
-  ]);
-  const knownReviewTags = [
-    "客服态度超好",
-    "质感不错",
-    "购买推荐",
-    "质量很好",
-    "发货很快",
-    "包装完好",
-    "性价比高",
-  ];
-  const matchedReviewTags = knownReviewTags.filter((tag) => text.includes(tag));
-  fields.review_tags = matchedReviewTags.join(",");
-  fields.product_refund_rate = firstMatch(text, [
-    /品退率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-    /品质退款率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-  ]);
-  fields.shipment_rate = firstMatch(text, [
-    /发货率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-    /准时发货率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-  ]);
-  fields.collection_rate_24h = firstMatch(text, [
-    /24\s*小时揽收率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/,
-    /24h揽收率[:：]?\s*([0-9]+(?:\.[0-9]+)?%)/i,
-  ]);
-  fields.shipment_speed = firstMatch(text, [
-    /(24小时内发货|48小时内发货|72小时内发货|[0-9]+小时发货|[0-9]+天内发货)/,
-  ]);
-  fields.wholesale_shipping_fee = firstMatch(text, [
-    /(运费[^。；，,]{0,40}(?:元|包邮|另计))/,
-    /(首重[^。；，,]{0,40})/,
-  ]);
-  fields.dropship_shipping_fee = fields.wholesale_shipping_fee;
-  fields.free_shipping = /包邮/.test(text) ? "是" : "";
-  fields.supports_dropship = /一件代发|代发/.test(text) ? "是" : "";
-  fields.dropship_rights = fields.supports_dropship ? "页面出现一件代发/代发信息" : "";
-  fields.return_exchange_support = firstMatch(text, [
-    /(7天无理由[^。；，,]{0,20})/,
-    /(支持退换[^。；，,]{0,20})/,
-  ]);
-  fields.rights_protection = firstMatch(text, [
-    /(买家保障[^。；，,]{0,40})/,
-    /(保障服务[^。；，,]{0,40})/,
-    /(7天无理由[^。；，,]{0,20})/,
-  ]);
-  fields.min_order_range = firstMatch(text, [
-    /([0-9]+件起批)/,
-    /起批量[:：]?\s*([0-9]+[^ ]{0,8})/,
-  ]);
-  fields.shop_name = firstMatch(text, [
-    /店铺[:：]?\s*([^ ]{2,40})/,
-    /公司[:：]?\s*([^ ]{2,40})/,
-  ]);
-  fields.location = firstMatch(text, [
-    /所在地[:：]?\s*([^ ]{2,20})/,
-    /货源地[:：]?\s*([^ ]{2,20})/,
-  ]);
-  fields.company_type = firstMatch(text, [
-    /(生产厂家|经销批发|招商代理|商业服务|个体经营)/,
-  ]);
-  fields.seller_member_type = firstMatch(text, [
-    /(实力商家|超级工厂|诚信通)/,
-  ]);
-  fields.source_factory = /源头工厂|生产厂家|超级工厂/.test(text) ? "是" : "";
-  fields.stock = firstMatch(text, [
-    /库存[:：]?\s*([^ ]{1,30})/,
-    /现货[:：]?\s*([^ ]{1,30})/,
-  ]);
-  fields.waybill_support = firstMatch(text, [
-    /(电子面单[^。；，,]{0,30})/,
-    /(面单[^。；，,]{0,30})/,
-  ]);
-  fields.video_query = /视频|主图视频/.test(text) ? "页面出现视频信息，待人工确认素材可用性" : "";
+  const structuredText = await page.evaluate(() => {
+    const scripts = Array.from(document.querySelectorAll("script"))
+      .map((script) => script.textContent || "")
+      .filter((content) => /shopName|sellerName|companyName|skuCount|refundRate|shipmentRate|collectionRate/i.test(content))
+      .slice(0, 8)
+      .join("\n");
+    const meta = Array.from(document.querySelectorAll("[content], [title], [aria-label]"))
+      .flatMap((node) => [node.getAttribute("content"), node.getAttribute("title"), node.getAttribute("aria-label")])
+      .filter(Boolean)
+      .join(" ");
+    return `${scripts}\n${meta}`.slice(0, 300000);
+  }).catch(() => "");
+  const fields = extractDetailFieldsFromText(text, structuredText);
+  const shopInfo = await page.evaluate(() => {
+    const normalizeUrl = (value) => {
+      const text = String(value || "").trim();
+      if (!text || /^javascript:/i.test(text)) return "";
+      if (text.startsWith("//")) return `https:${text}`;
+      if (/^https?:\/\//i.test(text)) return text;
+      try {
+        return new URL(text, location.href).toString();
+      } catch {
+        return "";
+      }
+    };
+    const anchors = Array.from(document.querySelectorAll("a[href]"));
+    const preferred = anchors.find((anchor) => {
+      const href = String(anchor.getAttribute("href") || anchor.href || "");
+      const text = String(anchor.innerText || anchor.textContent || anchor.getAttribute("title") || "");
+      return /shop|supplier|company|winport|1688\.com/i.test(href)
+        && /店铺|进店|供应商|公司|首页/.test(text);
+    }) || anchors.find((anchor) => /shop|supplier|company|winport/i.test(String(anchor.getAttribute("href") || anchor.href || "")));
+    return {
+      url: normalizeUrl(preferred?.getAttribute("href") || preferred?.href || ""),
+      name: preferred ? String(preferred.innerText || preferred.textContent || preferred.getAttribute("title") || "") : "",
+    };
+  }).catch(() => ({ url: "", name: "" }));
+  fields.shop_url = shopInfo.url || "";
+  if (!fields.shop_name) fields.shop_name = cleanShopName(shopInfo.name || "");
 
   const cleaned = Object.fromEntries(Object.entries(fields).filter(([, value]) => value));
   await runtime.close();

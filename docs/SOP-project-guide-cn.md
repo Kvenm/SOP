@@ -66,19 +66,19 @@ Web 工作台
 命令行也默认走真实页面 RPA：
 
 ```bash
-python3 cli.py tag_collect --categories "家居日用品" --tags "微信小店,一件代发" --keywords "雨衣"
+python3 cli.py tag_collect --categories "日用餐厨、居家日用>遮阳防雨>雨衣雨披" --tags "微信小店,一件代发"
 ```
 
 如果明确要走 AK/API：
 
 ```bash
-python3 cli.py tag_collect --collect-source api --categories "家居日用品" --tags "微信小店"
+python3 cli.py tag_collect --collect-source api --categories "日用餐厨、居家日用>遮阳防雨" --tags "微信小店"
 ```
 
 开发样例模式仍保留给回归测试，但正式验收不要使用：
 
 ```bash
-python3 cli.py tag_collect --sample-data --categories "女装/女士精品" --tags "微信小店"
+python3 cli.py tag_collect --sample-data --categories "女装、男装、内衣>新中式>汉服套装" --tags "微信小店"
 ```
 
 ### 2.3 真实详情页核验
@@ -110,7 +110,7 @@ XLSX 当前包含 6 个工作表：
 - `选品结果`
 - `字段说明`
 - `标签配置`
-- `核验失败`
+- `异常复核`
 - `核验记录`
 - `筛选执行记录`
 
@@ -249,7 +249,7 @@ http://<运行电脑的局域网 IP>:8765
 - 1688 页面结构变化会影响提取准确性。
 - 详情字段是启发式解析，需继续针对真实页面结构优化。
 - 在线文档同步尚未接入，目前是 XLSX/CSV 导出。
-- 官方完整 1688 类目树尚未自动同步；当前是可追溯本地种子字典 `partial_seed_needs_official_sync`，支持一级/二级/三级路径展示但不能宣称完整。
+- 类目字典已可通过 `scripts/capabilities/tag_collect/sync_1688_categories.py` 从 1688 首页左侧导航同步；当前不是开放平台官方全量类目库，但会校验路径必须存在于同步字典，非法类目不进入 RPA。
 - 多人账号、权限、任务队列、审计日志尚未产品化。
 - 自动铺货只建议先做 dry-run，不建议直接批量写入。
 

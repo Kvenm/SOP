@@ -3,6 +3,8 @@
 
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import threading
 import tempfile
@@ -26,6 +28,7 @@ from capabilities.tag_collect.service import (
     build_library_filter_plan,
     build_queries,
     build_verification_queue,
+    export_xlsx,
     friendly_collect_error,
     get_library_capabilities,
     get_library_filter_coverage,
@@ -76,6 +79,24 @@ def _native_has(native_filters, label):
     return False
 
 
+class _temporary_tag_data_dir:
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_env = os.environ.get("TAG_COLLECT_DATA_DIR")
+        self.old_cache = service._DATA_DIR_CACHE
+        os.environ["TAG_COLLECT_DATA_DIR"] = self.tmp.name
+        service._DATA_DIR_CACHE = None
+        return Path(self.tmp.name)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.old_env is None:
+            os.environ.pop("TAG_COLLECT_DATA_DIR", None)
+        else:
+            os.environ["TAG_COLLECT_DATA_DIR"] = self.old_env
+        service._DATA_DIR_CACHE = self.old_cache
+        self.tmp.cleanup()
+
+
 def _xlsx_first_row_labels(workbook: zipfile.ZipFile, sheet_index: int = 1):
     xml = workbook.read(f"xl/worksheets/sheet{sheet_index}.xml")
     root = ET.fromstring(xml)
@@ -91,6 +112,41 @@ def _xlsx_first_row_labels(workbook: zipfile.ZipFile, sheet_index: int = 1):
     return values
 
 
+def test_category_dictionary_expanded_tree():
+    tree = service.TAG_CATEGORY_TREE
+    dictionary = service.CATEGORY_DICTIONARY
+    root = "女装、男装、内衣"
+    appliance_root = "家用电器、数码电脑"
+    daily_root = "日用餐厨、居家日用"
+    _assert(dictionary["status"] == "synced_from_1688_homepage_left_nav", "类目字典应来自1688首页左侧导航同步")
+    _assert(len(tree) >= 10, "类目字典应覆盖1688首页左侧主要组合一级类目")
+    for parent in {
+        root,
+        "配饰、鞋、箱包",
+        "运动户外、玩具童装",
+        "办公文化、宠物园艺",
+        "美妆个护、收纳清洁",
+        "食品酒水、餐饮生鲜",
+        daily_root,
+        appliance_root,
+        "家装灯饰、家纺家饰",
+        "汽车用品、工业用品",
+    }:
+        _assert(parent in tree, f"类目字典应包含一级类目：{parent}")
+    _assert("女装/女士精品" not in tree, "1688左侧类目模式不应混入旧的女装/女士精品一级类目")
+    _assert("鞋靴" not in tree, "1688左侧类目模式不应混入旧的鞋靴一级类目")
+    _assert("箱包皮具" not in tree, "1688左侧类目模式不应混入旧的箱包皮具一级类目")
+    _assert("新中式" in tree[root], "女装组合入口下应包含新中式二级分组")
+    _assert("下装裤" in tree[root], "女装组合入口下应包含下装裤二级分组")
+    _assert("内裤" in tree[root], "女装组合入口下应包含内裤二级分组")
+    _assert("男士平角裤" in tree[root]["内裤"], "组合入口>内裤下应包含男士平角裤三级类目")
+    _assert("男士内裤" not in tree[root]["内裤"], "当前1688首页没有男士内裤三级时不应在本地伪造")
+    _assert("汉服套装" in tree[root]["新中式"], "组合入口>新中式下应包含汉服套装三级类目")
+    _assert("生活电器" in tree[appliance_root], "家用电器组合入口下应包含生活电器二级类目")
+    _assert("厨房电器" in tree[appliance_root], "家用电器组合入口下应包含厨房电器二级类目")
+    _assert("雨衣雨披" in tree[daily_root]["遮阳防雨"], "居家日用组合入口下应包含1688真实雨衣雨披三级类目")
+
+
 def test_field_numbers():
     fields = get_numbered_export_columns()
     numbers = [field["number"] for field in fields]
@@ -98,20 +154,26 @@ def test_field_numbers():
     labels = [label for _, label in EXPORT_COLUMNS]
     _assert(numbers[0] == "1.1", "字段编号应从 1.1 开始")
     _assert(numbers[-1] == "10.11", "字段编号应到 10.11 结束")
-    _assert(len(labels) == 81, "导出字段应包含附件基线和截图新增评价字段的 81 列")
+    _assert(len(labels) == 82, "导出字段应包含店雷达37列基线和项目扩展字段的82列")
     _assert(labels == REFERENCE_EXPORT_LABELS, "导出字段顺序应与用户确认的附件表头一致")
+    _assert(labels[:37] == service.DIANLEIDA_REFERENCE_EXPORT_LABELS, "导出前37列必须严格对齐店雷达附件表头")
+    _assert(labels[27] == "店铺链接(点击下方链接可跳转)", "店铺链接应保留在店雷达原表第28列")
+    _assert(labels[28] == "主图链接(点击下方链接可跳转)", "主图链接应保留在店雷达原表第29列")
+    _assert(labels[30] == "SKU数量", "SKU数量应保留在店雷达原表第31列")
     _assert("product_refund_rate" in keys, "字段应包含品退率")
     _assert("shipment_rate" in keys, "字段应包含发货率")
     _assert("wholesale_shipping_fee" in keys, "字段应包含批发运费")
     _assert("product_rating" in keys, "字段应包含商品星级")
     _assert("review_tags" in keys, "字段应包含评价标签")
+    _assert("shop_url" in keys, "字段应包含店铺链接")
+    _assert("sku_count" in keys, "字段应包含SKU数量")
     _assert("good_rate_bucket" in keys, "字段应包含好评率区间")
     _assert("shipment_rate_bucket" in keys, "字段应包含发货率区间")
 
 
 def test_filter_plan_splits_native_and_metric_tags():
     config = parse_input(
-        categories="女装/女士精品>防晒衣>冰丝防晒衣",
+        categories="女装、男装、内衣>新中式>汉服套装",
         tags="微信小店,一件代发,48小时发货,好评率>=90%,评论数30-99,防晒",
         sample_data=True,
     )
@@ -119,13 +181,101 @@ def test_filter_plan_splits_native_and_metric_tags():
     queries = build_queries(config)
     query_text = " ".join(queries)
     post_tags = {item["tag"] for item in plan["post_filters"]}
+    category_filters = plan.get("category_filters", [])
+    _assert(category_filters, "类目应进入1688左侧类目点击计划")
+    _assert(category_filters[0]["mode"] == "category_path", "类目筛选应使用 category_path 点击模式")
+    _assert(category_filters[0]["texts"] == ["女装、男装、内衣", "新中式", "汉服套装"], "类目应按1688一级/二级/三级拆分点击")
     _assert(_native_has(plan["native_filters"], "一件代发"), "一件代发应进入1688原生筛选")
     _assert(_native_has(plan["native_filters"], "48小时发货"), "48小时发货应进入1688原生筛选")
     _assert("好评率>=90%" in post_tags, "好评率区间应进入后置指标筛选")
     _assert("评论数30-99" in post_tags, "评论数区间应进入后置指标筛选")
     _assert("防晒" in query_text, "场景词防晒应保留为搜索词")
+    _assert("汉服套装" not in queries, "只有类目时不应把类目叶子直接放进搜索框")
     _assert("一件代发" not in query_text, "原生筛选不应拼进搜索词")
     _assert("48小时发货" not in query_text, "原生筛选不应拼进搜索词")
+
+    category_only = parse_input(categories="女装、男装、内衣>新中式>汉服套装", sample_data=True)
+    _assert(build_queries(category_only) == [""], "只选类目时应由RPA点击类目，不应生成类目搜索词")
+
+
+def test_rpa_category_ignores_stale_source_url():
+    config = parse_input(
+        categories="女装、男装、内衣>新中式>汉服套装",
+        source_urls="https://s.1688.com/selloffer/offer_search.htm?keywords=%E5%86%85%E8%A1%A3",
+        library_filters={
+            "source_urls": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%97%A7%E9%A1%B5%E9%9D%A2",
+        },
+        sample_data=False,
+        collect_source="rpa",
+    )
+    _assert(config.source_urls == [], "自动批量+已选类目时应忽略URL输入框残留，避免跳过1688左侧类目点击")
+
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        calls.append({
+            "query": query,
+            "source_url": source_url,
+            "category_filters": category_filters or [],
+        })
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        return {
+            "products": [{
+                "id": "stale-url-category-1",
+                "title": "汉服套装 类目点击测试商品",
+                "price": "19.9",
+                "image": "",
+                "url": "https://detail.1688.com/offer/1234567892.html",
+                "stats": {"rawText": "真实页面列表候选"},
+            }],
+            "filter_results": [{
+                "filter_key": category_filter.get("key", "category_path_1"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "query": query,
+                "page_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%B1%89%E6%9C%8D%E5%A5%97%E8%A3%85",
+                "final_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%B1%89%E6%9C%8D%E5%A5%97%E8%A3%85",
+                "expected_path": category_path,
+                "matched_path": category_path,
+                "expected_depth": 3,
+                "matched_depth": 3,
+                "category_steps": [
+                    {"depth": 1, "expected_text": "女装、男装、内衣", "mode": "hover", "status": "matched"},
+                    {"depth": 2, "expected_text": "新中式", "mode": "hover", "status": "matched"},
+                    {"depth": 3, "expected_text": "汉服套装", "mode": "click", "status": "clicked"},
+                ],
+                "message": "已在1688页面按类目入口点击并进入商品结果页",
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        result = run_tag_collect(config)
+        _assert(result["success"], "残留URL被忽略后应能按类目采集成功")
+        _assert(len(calls) == 1, "只选一个类目时应只发起一个RPA类目任务")
+        _assert(calls[0]["source_url"] == "", "类目RPA任务不应携带残留source_url")
+        _assert(calls[0]["query"] == "", "只有类目时不应把类目词放进搜索框")
+        _assert(calls[0]["category_filters"], "类目RPA任务必须携带category_filters")
+        _assert(calls[0]["category_filters"][0]["category_path"] == "女装、男装、内衣>新中式>汉服套装", "RPA应接收当前选中的1688类目路径")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
 
 
 def test_library_filter_contract_and_mapping():
@@ -181,7 +331,7 @@ def test_library_filter_contract_and_mapping():
     _assert(any(item["status"] == "reserved" for item in coverage), "覆盖状态应包含预留字段")
 
     library_filters = {
-        "category_paths": ["女装/女士精品>连衣裙"],
+        "category_paths": ["女装、男装、内衣>新中式>汉服套装"],
         "search_keyword": "连衣裙",
         "match_type": "模糊匹配",
         "selection_modes": ["源头工厂", "无货源选品"],
@@ -219,7 +369,7 @@ def test_library_filter_contract_and_mapping():
     post_fields = {item["field"] for item in plan["post_filters"]}
     post_tags = {item["tag"] for item in plan["post_filters"]}
     reserved_keys = {item["field_key"] for item in plan["library_reserved_fields"]}
-    _assert(config.categories == ["女装/女士精品>连衣裙"], "library_filters 类目应进入 config.categories")
+    _assert(config.categories == ["女装、男装、内衣>新中式>汉服套装"], "library_filters 类目应进入 config.categories")
     _assert(config.keywords == ["连衣裙"], "library_filters 关键词应进入 config.keywords")
     _assert(not (set(config.library_filters) & removed_filter_keys), "旧 payload 中已移除字段应在服务端被清洗")
     _assert(not _native_has(plan["native_filters"], "新品"), "已移除的商品标识不应继续转译为原生筛选")
@@ -284,7 +434,7 @@ def test_metric_bucket_ranges():
 
 def test_export_xlsx_and_exclude():
     config = parse_input(
-        categories="女装/女士精品,家用电器",
+        categories="女装、男装、内衣,家用电器、数码电脑",
         tags="微信小店,一件代发,48小时发货",
         exclude_tags="红海",
         sample_data=True,
@@ -313,11 +463,11 @@ def test_export_xlsx_and_exclude():
         result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
         field_xml = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
         result_labels = _xlsx_first_row_labels(workbook, 1)
-        _assert(result_labels == REFERENCE_EXPORT_LABELS, "选品结果 sheet 表头应严格等于附件 79 列基线")
+        _assert(result_labels == REFERENCE_EXPORT_LABELS, "选品结果 sheet 表头应严格等于店雷达37列基线加项目扩展字段")
         _assert("选品结果" in workbook_xml, "应包含选品结果 sheet")
         _assert("字段说明" in workbook_xml, "应包含字段说明 sheet")
         _assert("标签配置" in workbook_xml, "应包含标签配置 sheet")
-        _assert("核验失败" in workbook_xml, "应包含核验失败 sheet")
+        _assert("异常复核" in workbook_xml, "应包含异常复核 sheet")
         _assert("核验记录" in workbook_xml, "应包含核验记录 sheet")
         _assert("筛选执行记录" in workbook_xml, "应包含筛选执行记录 sheet")
         _assert("10.8" in field_xml, "字段说明应包含 10.8 核验状态")
@@ -328,6 +478,41 @@ def test_export_xlsx_and_exclude():
         filter_xml = workbook.read("xl/worksheets/sheet6.xml").decode("utf-8")
         _assert("一件代发" in filter_xml, "筛选执行记录应包含一件代发")
         _assert("sample_skipped" in filter_xml, "样例模式应标记原生筛选未执行")
+
+
+def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
+    html = """
+    <html>
+      <body>
+        店铺 回头率 35%
+        运费 首重8元续重4元
+        2件起批 品退率 1.8% 发货率 98.6% 24小时揽收率 96%
+        48小时内发货 一件代发 7天无理由
+        规格数量: 18 SKU 收藏客户 200+ 诚信通 5年 生产厂家 密文面单
+      </body>
+      <script>
+        window.__INIT__ = {"shopName":"义乌童雨户外用品厂","skuCount":"18","shipmentRate":"98.6%"};
+      </script>
+    </html>
+    """
+    proc = subprocess.run(
+        ["node", str(Path(__file__).resolve().parent / "rpa_detail.mjs")],
+        input=json.dumps({"test_html": html}, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"详情抽取脚本应执行成功：{proc.stderr or proc.stdout}")
+    payload = json.loads((proc.stdout or "").splitlines()[-1])
+    fields = payload.get("fields", {})
+    _assert(fields.get("shop_name") == "义乌童雨户外用品厂", "店铺名应优先取结构化字段，不能误抓回头率")
+    _assert(fields.get("shop_name") != "回头率", "店铺名不能被抽成回头率")
+    _assert(fields.get("wholesale_shipping_fee") == "首重8元续重4元", "运费不应吞入后续品退率/发货率文本")
+    _assert(fields.get("product_refund_rate") == "1.8%", "详情抽取应提取品退率")
+    _assert(fields.get("shipment_rate") == "98.6%", "详情抽取应提取发货率")
+    _assert(fields.get("sku_count") == "18", "详情抽取应提取 SKU 数量")
+    _assert(fields.get("waybill_support") == "密文面单", "面单字段不应吞入 HTML/script 文本")
 
 
 def test_security_verification_error_message():
@@ -345,9 +530,473 @@ def test_security_verification_error_message():
     _assert("不会绕过" in message or "不会继续采集" in message, "提示应明确不会绕过验证码")
 
 
+def test_cdp_security_error_context():
+    error = ServiceError(
+        "security_verification_required: 1688 在已连接的真实 Chrome 中触发了安全滑块/验证码校验。"
+    )
+    error.data = {
+        "cdp": True,
+        "page_url": "https://s.1688.com/selloffer/offer_search.htm?__tmd__/punish",
+        "source": "1688_search_page",
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "security_verification_required", "CDP 风控仍应返回结构化风控状态")
+    _assert(state["runtime"]["use_cdp"] is True, "CDP 风控应保留真实 Chrome 上下文")
+    _assert("不是 testin" in state["suggestion"] or "真实 Chrome" in state["suggestion"], "CDP 风控提示应明确不是临时浏览器问题")
+    _assert("punish" in state["runtime"]["page_url"], "CDP 风控应保留拦截页 URL")
+
+
+def test_navigation_timeout_error_context():
+    error = ServiceError("navigation_timeout: 1688 页面加载超时，未生成任何数据。")
+    error.data = {
+        "cdp": True,
+        "page_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E9%9B%A8%E8%A1%A3",
+        "source": "1688_search_page",
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "navigation_timeout", "页面加载超时应返回结构化超时状态")
+    _assert(state["retryable"] is False, "真实页面超时不应提示自动重试")
+    _assert(state["action"] == "manual_open_page", "页面加载超时应要求人工打开页面确认")
+    _assert("真实 Chrome" in state["suggestion"], "CDP 超时提示应指向真实 Chrome 人工确认")
+
+
+def test_cdp_context_unsupported_error_context():
+    error = ServiceError(
+        "cdp_context_unsupported: 真实 Chrome CDP 端口能连接，但当前调试端点不支持 Playwright 初始化上下文。"
+    )
+    error.data = {
+        "cdp": True,
+        "cdp_url": "http://127.0.0.1:9222",
+        "source": "chrome_cdp",
+        "low_level_error": "Browser.setDownloadBehavior: Browser context management is not supported.",
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "cdp_context_unsupported", "CDP 上下文不可用应返回专用错误码")
+    _assert(state["retryable"] is False, "CDP 上下文不可用不应提示自动重试")
+    _assert(state["action"] == "restart_chrome_debug", "CDP 上下文不可用应要求重启调试 Chrome")
+    _assert("9222" in state["suggestion"], "提示应说明排查 9222 端口占用")
+
+
+def test_dirty_product_title_is_cleaned():
+    config = parse_input(categories="日用餐厨、居家日用", tags="微信小店", sample_data=True)
+    dirty = Product(
+        id="dirty-1",
+        title="Ã¥ÂÂ¿Ã§Â«Â¥Ã©ÂÂ¨Ã¨Â¡Â£",
+        price="9.9",
+        image="",
+        url="https://detail.1688.com/offer/dirty-1.html",
+        stats={},
+    )
+    row = product_to_export_row(dirty, "雨衣", config)
+    _assert(row["title"] == "", "疑似乱码标题不应进入导出标题；真实采集入口会进一步过滤该商品")
+
+
+def test_search_keyword_encoding_error_context():
+    error = ServiceError(
+        "search_keyword_encoding_error: 1688 搜索词校验失败：期望搜索「雨衣」，"
+        "但页面没有确认到原始中文关键词，或出现了疑似乱码。"
+    )
+    error.data = {
+        "cdp": True,
+        "page_url": "https://www.1688.com/",
+        "source": "1688_search_page",
+        "search_keyword_state": {
+            "input_values": ["é›¨è¡£"],
+            "mojibake_values": ["é›¨è¡£"],
+        },
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "search_keyword_encoding_error", "搜索词乱码应返回结构化错误码")
+    _assert(state["retryable"] is False, "搜索词乱码不应继续自动重试")
+    _assert(state["action"] == "manual_open_page", "搜索词乱码应要求人工打开页面确认")
+    _assert("避免按错误关键词导出数据" in state["suggestion"], "搜索词乱码应明确停止导出错误数据")
+
+
+def test_rpa_collect_uses_human_search_not_keyword_url():
+    script = Path(__file__).with_name("rpa_collect.mjs").read_text(encoding="utf-8")
+    _assert("submitHumanSearch" in script, "真实采集应通过页面搜索框提交关键词")
+    _assert("https://www.1688.com/" in script, "关键词模式应先打开 1688 首页")
+    _assert("hasCategoryNavigation" in script, "存在类目时应优先执行1688左侧类目导航")
+    _assert("} else if (hasCategoryNavigation)" in script, "类目导航应排在关键词搜索框提交之前")
+    _assert(script.index("} else if (hasCategoryNavigation)") < script.index("} else if (query)"), "类目路径不能先进入搜索框搜索")
+    _assert("offer_search.htm?keywords=${encodeURIComponent(query)}" not in script, "关键词模式不应再拼中文 URL 参数")
+    _assert("search_keyword_encoding_error" in script, "真实采集应检测搜索词乱码并阻断")
+    _assert("search_results_not_loaded" in script, "真实采集应阻断搜索页无商品卡片的空结果")
+    _assert("category_navigation_not_loaded" in script, "真实采集应区分类目导航未进入商品列表的失败")
+    _assert("offerId=" in script, "真实采集应兼容新版 1688 搜索页 offerId 链接")
+    _assert("offerIds=" in script, "真实采集应兼容找相似等 offerIds 链接")
+    _assert("detail.m.1688.com/page/index.html" in script, "真实采集应兼容移动端详情链接")
+    _assert("search-offer-wrapper" in script, "真实采集应识别新版搜索结果卡片")
+    _assert("collectProductsAcrossPages" in script, "真实采集数量不足时应进入翻页采集流程")
+    _assert("TAG_COLLECT_RPA_MAX_PAGES" in script, "翻页采集应支持最大页数限制")
+    _assert("applyCategoryFilters" in script, "真实采集应支持按1688左侧类目点击")
+    _assert("category_path" in script, "类目筛选不应退化为关键词搜索")
+    _assert("categoryNeedleSets" in script, "类目点击应支持把本地类目名映射到1688页面可见入口")
+    _assert("replace(/[\\uE000-\\uF8FF]/g" in script, "类目点击应忽略1688首页图标字体，避免组合一级类目误判不存在")
+    _assert("replace(/[\\s、，,\\/／|｜·•\\-]+/g" in script, "类目点击应忽略顿号/斜杠等分隔符，匹配1688组合一级类目")
+    _assert("index < needleSets.length - 1" in script, "三级类目应先 hover 一级/二级，不能点击二级后跳成关键词结果")
+    _assert("followCategoryClick" in script, "类目点击后应跟随新页或URL变化")
+    _assert("collectCategoryDiagnostics" in script, "类目点击失败应返回页面可见类目诊断")
+    _assert("filter_results: categoryResults" in script, "类目点击后无商品卡片时也应返回类目执行记录")
+    _assert("deferred_navigation" not in script, "多级类目不能用父级类目 href 兜底跳到关键词结果页")
+    _assert("navigated_parent_href" not in script, "多级类目缺二级时不应跳父级关键词结果页")
+    _assert('"男士内裤":' not in script, "RPA 不应为当前1688类目不存在的男士内裤保留模糊别名")
+    _assert("raw.split(\"、\")" not in script, "组合一级类目不能按顿号拆开，否则会误点单独父类")
+    _assert("fallback_keyword" not in Path(__file__).with_name("service.py").read_text(encoding="utf-8"), "类目失败不应降级为关键词搜索")
+    _assert("manual_page_ambiguous" in script, "人工当前页模式存在多个1688页签时应阻断，不能静默读错页")
+    _assert("noDefaults: true" in script, "CDP 连接应保留浏览器默认下载/媒体设置，避免真实 Chrome 初始化失败")
+    _assert("browser.close().catch" in script, "人工当前页模式读取后应断开 Playwright CDP 连接")
+
+
+def test_web_defaults_to_automatic_batch_collect():
+    html = web.HTML_PAGE
+    _assert('value="rpa" checked' in html, "Web 主入口应默认自动批量采集")
+    _assert('value="url_direct" />' not in html, "URL 直连不应作为普通测试入口展示")
+    _assert('value="api" />' not in html, "AK/API 不应作为普通测试入口展示")
+    _assert('id="startChromeBtn"' in html, "页面应提供启动采集 Chrome 按钮")
+    _assert('id="refreshChromeBtn"' in html, "页面应提供刷新采集 Chrome 状态按钮")
+    _assert('id="readCurrentPageBtn"' in html, "页面应保留当前页兜底读取按钮")
+    _assert('/api/chrome/start' in html, "前端应调用 /api/chrome/start")
+    _assert('/api/chrome/status' in html, "前端应调用 /api/chrome/status")
+    _assert('if ($("collectSource")) $("collectSource").value = "rpa";' in html, "初始化/重置后应回到自动批量采集")
+    _assert("请先运行 scripts/capabilities/tag_collect/start_chrome_debug.sh" not in html, "Web 文案不应再要求用户手动运行终端脚本")
+
+
+def test_chrome_status_sets_cdp_env_and_reports_pages():
+    original_url = os.environ.pop("TAG_COLLECT_CDP_URL", None)
+    try:
+      status = web._chrome_runtime_status()
+      _assert(os.environ.get("TAG_COLLECT_CDP_URL") == web.DEFAULT_CDP_URL, "状态检查应为 RPA 子进程设置默认 CDP URL")
+      _assert("pages" in status and isinstance(status["pages"], list), "Chrome 状态应返回页签列表字段")
+      _assert("candidate_count" in status, "Chrome 状态应返回可读取 1688 页签数量")
+      _assert("current_page" in status, "Chrome 状态应返回唯一当前页信息")
+    finally:
+      if original_url is None:
+          os.environ.pop("TAG_COLLECT_CDP_URL", None)
+      else:
+          os.environ["TAG_COLLECT_CDP_URL"] = original_url
+
+
+def test_1688_homepage_is_not_collectable_current_page():
+    _assert(web._is_1688_url("https://www.1688.com/"), "1688 首页应识别为 1688 页签")
+    _assert(not web._is_collectable_1688_url("https://www.1688.com/"), "1688 首页不能被当作可读取商品页")
+    _assert(web._is_collectable_1688_url("https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%94%B6%E7%BA%B3%E7%9B%92"), "搜索结果页应可读取")
+    _assert(web._is_collectable_1688_url("https://detail.1688.com/offer/123456789.html"), "商品详情页应可读取")
+
+
+def test_start_chrome_script_canary_fallback_name():
+    script = Path(__file__).with_name("start_chrome_debug.sh").read_text(encoding="utf-8")
+    _assert('CHROME_APP_NAME="${CHROME_APP_NAME:-}"' in script, "Chrome app 名称不应提前固定为普通 Chrome")
+    _assert('CHROME_APP_NAME="${CHROME_APP_NAME:-Google Chrome Canary}"' in script, "Canary fallback 应切换 app 名称")
+    _assert('CHROME_APP_NAME="${CHROME_APP_NAME:-Google Chrome}"' in script, "普通 Chrome 路径可用时应使用普通 Chrome app 名称")
+
+
+def test_search_results_not_loaded_error_context():
+    error = ServiceError("search_results_not_loaded: 1688 已打开搜索页，但未在页面中发现商品列表链接。")
+    error.data = {
+        "cdp": True,
+        "page_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%D3%EA%D2%C2",
+        "source": "1688_search_page",
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "search_results_not_loaded", "搜索页无商品卡片应返回结构化错误码")
+    _assert(state["retryable"] is False, "搜索页无商品卡片不应自动重试")
+    _assert(state["action"] == "manual_open_page", "搜索页无商品卡片应要求人工确认页面")
+    _assert("商品列表" in state["suggestion"], "提示应要求人工确认商品列表可见")
+
+
+def test_category_navigation_not_loaded_error_context():
+    error = ServiceError("category_navigation_not_loaded: 1688 已执行类目导航，但未进入可解析的商品列表页。")
+    error.data = {
+        "cdp": True,
+        "page_url": "https://www.1688.com/",
+        "source": "1688_category_navigation",
+        "category_path": "女装、男装、内衣>新中式>汉服套装",
+    }
+    state = collect_error_state(error)
+    _assert(state["code"] == "category_navigation_not_loaded", "类目导航未进入列表应返回结构化错误码")
+    _assert(state["retryable"] is False, "类目导航失败不应自动高频重试")
+    _assert(state["action"] == "manual_open_page", "类目导航失败应要求人工确认页面")
+    _assert("类目" in state["suggestion"] and "商品列表" in state["suggestion"], "提示应说明人工确认类目商品列表")
+
+
+def test_invalid_category_path_blocks_before_rpa():
+    try:
+        parse_input(
+            categories="女装、男装、内衣>内裤>男士内裤",
+            sample_data=False,
+            collect_source="rpa",
+        )
+    except ServiceError as exc:
+        state = collect_error_state(exc)
+        _assert(state["code"] == "category_path_invalid", "不存在于1688字典的类目应在提交前阻断")
+        _assert("男士平角裤" in str(state.get("invalid_categories")), "非法类目应给出相近的真实1688类目建议")
+    else:
+        raise AssertionError("当前1688首页不存在的男士内裤三级不应通过类目校验")
+    try:
+        parse_input(
+            categories="女装、男装、内衣>防晒衣>冰丝防晒衣",
+            sample_data=False,
+            collect_source="rpa",
+        )
+    except ServiceError as exc:
+        state = collect_error_state(exc)
+        _assert(state["code"] == "category_path_invalid", "旧运营类目路径应在提交前阻断")
+        _assert("配饰、鞋、箱包>围巾/防晒>防晒衣" in str(state.get("invalid_categories")), "旧路径应建议当前1688真实防晒衣路径")
+    else:
+        raise AssertionError("旧运营类目防晒衣路径不应通过类目校验")
+
+
+def test_category_navigation_failure_blocks_export():
+    calls = []
+
+    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False):
+        calls.append({"query": query, "category_filters": category_filters or []})
+        return {
+            "products": [{
+                "id": "category-fail-1",
+                "title": "类目失败首轮商品不应直接采用",
+                "price": "19.9",
+                "image": "",
+                "url": "https://detail.1688.com/offer/1234567890.html",
+                "stats": {"rawText": "真实页面列表候选"},
+            }],
+            "filter_results": [{
+                "filter_key": "category_path_1",
+                "label": "类目:女装、男装、内衣>新中式>汉服套装",
+                "tag": "女装、男装、内衣>新中式>汉服套装",
+                "status": "not_found",
+                "source": "1688_category_navigation",
+                "query": "",
+                "page_url": "https://www.1688.com/",
+                "message": "页面左侧类目中未找到：汉服套装",
+                "expected_path": "女装、男装、内衣>新中式>汉服套装",
+                "matched_path": "",
+                "expected_depth": 2,
+                "matched_depth": 0,
+                "diagnostics": {"visible_category_texts": ["女装", "男装"]},
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        config = parse_input(
+            categories="女装、男装、内衣>新中式>汉服套装",
+            sample_data=False,
+            collect_source="rpa",
+            output_format="xlsx",
+        )
+        try:
+            run_tag_collect(config)
+        except ServiceError as exc:
+            state = collect_error_state(exc)
+            _assert(state["code"] == "category_navigation_not_loaded", "类目失败应返回类目导航阻断错误")
+            _assert(state["filter_results"][0]["diagnostics"]["visible_category_texts"], "类目失败应保留页面可见类目诊断")
+        else:
+            raise AssertionError("类目 not_found 时不应导出商品")
+        _assert(len(calls) == 1 and calls[0]["category_filters"], "类目失败不应再次用末级类目词发起关键词搜索")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_partial_category_navigation_blocks_export():
+    calls = []
+
+    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False):
+        calls.append({"query": query, "category_filters": category_filters or []})
+        return {
+            "products": [{
+                "id": "category-partial-1",
+                "title": "类目部分命中首轮商品",
+                "price": "29.9",
+                "image": "",
+                "url": "https://detail.1688.com/offer/1234567891.html",
+                "stats": {"rawText": "真实页面列表候选"},
+            }],
+            "filter_results": [{
+                "filter_key": "category_path_1",
+                "label": "类目:女装、男装、内衣>新中式>汉服套装",
+                "tag": "女装、男装、内衣>新中式>汉服套装",
+                "status": "partial_clicked",
+                "source": "1688_category_navigation",
+                "query": "",
+                "page_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E5%A5%B3%E8%A3%85",
+                "message": "已点击部分类目并进入1688结果页，未找到下一层：连衣裙",
+                "expected_path": "女装、男装、内衣>新中式>汉服套装",
+                "matched_path": "女装",
+                "expected_depth": 2,
+                "matched_depth": 1,
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        config = parse_input(
+            categories="女装、男装、内衣>新中式>汉服套装",
+            sample_data=False,
+            collect_source="rpa",
+            output_format="xlsx",
+        )
+        try:
+            run_tag_collect(config)
+        except ServiceError as exc:
+            state = collect_error_state(exc)
+            _assert(state["code"] == "category_navigation_not_loaded", "部分类目命中应阻断导出")
+            _assert("兜底读取不作为自动类目命中验收" in state["suggestion"], "提示不能引导用户改用关键词搜索")
+        else:
+            raise AssertionError("类目 partial_clicked 时不应导出商品")
+        _assert(len(calls) == 1 and calls[0]["category_filters"], "部分类目命中不应再次用末级类目词发起关键词搜索")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_category_navigation_service_error_keeps_filter_context():
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        calls.append({"query": query, "category_filters": category_filters or []})
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        error = ServiceError("category_navigation_not_loaded: 1688 类目导航未完成，未生成任何数据。")
+        error.data = {
+            "code": "category_navigation_not_loaded",
+            "source": "1688_category_navigation",
+            "cdp": True,
+            "page_url": "https://www.1688.com/",
+            "category_path": category_path,
+            "diagnostics": {"visible_category_texts": ["童装童鞋", "母婴"]},
+            "filter_results": [{
+                "filter_key": category_filter.get("key", "category_path_1"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "not_found",
+                "source": "1688_category_navigation",
+                "query": query,
+                "page_url": "https://www.1688.com/",
+                "message": "页面左侧类目中未找到：童套装",
+                "diagnostics": {"visible_category_texts": ["童装童鞋", "母婴"]},
+            }],
+        }
+        raise error
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        config = parse_input(
+            categories="运动户外、玩具童装>童套>童套装",
+            sample_data=False,
+            collect_source="rpa",
+            output_format="xlsx",
+        )
+        try:
+            run_tag_collect(config)
+        except ServiceError as exc:
+            state = collect_error_state(exc)
+            _assert(state["code"] == "category_navigation_not_loaded", "RPA 类目失败应透传结构化错误")
+            _assert(state["filter_results"][0]["tag"] == "运动户外、玩具童装>童套>童套装", "RPA 类目失败应保留筛选执行记录")
+            _assert(state["diagnostics"]["visible_category_texts"], "RPA 类目失败应保留页面诊断")
+        else:
+            raise AssertionError("RPA 类目失败不应降级导出")
+        _assert(len(calls) == 1 and calls[0]["category_filters"], "RPA 类目失败不应再次用关键词搜索")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_multi_category_rpa_runs_are_isolated():
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        calls.append({
+            "query": query,
+            "source_url": source_url,
+            "category_filters": category_filters or [],
+        })
+        item_id = f"cat-{len(calls)}"
+        return {
+            "products": [{
+                "id": item_id,
+                "title": f"{category_path} 测试商品",
+                "price": "19.9",
+                "image": "",
+                "url": f"https://detail.1688.com/offer/{1000000000 + len(calls)}.html",
+                "stats": {"rawText": "真实页面列表候选"},
+            }],
+            "filter_results": [{
+                "filter_key": category_filter.get("key", f"category_path_{len(calls)}"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "query": query,
+                "page_url": f"https://s.1688.com/selloffer/category-{len(calls)}.html",
+                "message": "已在1688页面按类目入口点击并进入商品结果页",
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        config = parse_input(
+            categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨",
+            sample_data=False,
+            collect_source="rpa",
+            output_format="xlsx",
+        )
+        result = run_tag_collect(config)
+        data = result["data"]
+        _assert(result["success"], "多个完整类目命中时应采集成功")
+        _assert(len(calls) == 2, "多类目应拆成独立RPA任务，避免同页连续点击污染")
+        _assert(all(len(call["category_filters"]) == 1 for call in calls), "每次RPA只应接收一个类目路径")
+        _assert({call["category_filters"][0]["category_path"] for call in calls} == set(config.categories), "每个已选类目都应独立执行")
+        _assert(len(data["rows"]) == 2, "多类目独立采集应保留两个候选商品")
+        _assert({row["category_path"] for row in data["rows"]} == set(config.categories), "导出行应记录对应采集类目")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
 def test_sample_detail_verification():
     config = parse_input(
-        categories="女装/女士精品,家用电器",
+        categories="女装、男装、内衣,家用电器、数码电脑",
         tags="微信小店,一件代发,48小时发货",
         library_filters={"min_order_min": "1"},
         sample_data=True,
@@ -373,9 +1022,25 @@ def test_sample_detail_verification():
         _assert(row.get("shipment_rate") != DETAIL_VERIFICATION_PENDING, "发货率应由样例详情补充")
         _assert(row.get("product_rating") != DETAIL_VERIFICATION_PENDING, "商品星级应由样例详情补充")
         _assert(row.get("review_tags") != DETAIL_VERIFICATION_PENDING, "评价标签应由样例详情补充")
+    preapproved_rows = [
+        row for row in verified_rows
+        if row.get("wechat_shop_suggestion") == "可铺"
+    ]
+    _assert(preapproved_rows, "样例详情核验后应存在系统可铺商品")
+    _assert(
+        all(row.get("manual_review_status") == "系统预通过" for row in preapproved_rows),
+        "关键详情字段已核验且无阻断风险的可铺商品应系统预通过",
+    )
+    _assert(
+        all(row.get("manual_wechat_shop_suggestion") == "可铺" for row in preapproved_rows),
+        "系统预通过商品应同步写入人工复核建议列，减少人工二次判断",
+    )
 
     with zipfile.ZipFile(verify_data["output_path"]) as workbook:
+        config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
         record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
+        _assert("系统预通过数量" in config_xml, "导出标签配置应包含系统预通过数量")
+        _assert("待人工复核数量" in config_xml, "导出标签配置应包含待人工复核数量")
         _assert("sample_detail" in record_xml, "核验记录 sheet 应包含样例来源")
         _assert("商品星级" in record_xml, "核验记录 sheet 应包含商品星级")
         _assert("评价标签" in record_xml, "核验记录 sheet 应包含评价标签")
@@ -383,7 +1048,7 @@ def test_sample_detail_verification():
 
 def test_auto_detail_verification_after_collect():
     config = parse_input(
-        categories="女装/女士精品",
+        categories="女装、男装、内衣",
         tags="微信小店,一件代发,48小时发货",
         sample_data=True,
         output_format="xlsx",
@@ -433,7 +1098,16 @@ def test_auto_detail_verification_security_pause():
                 "url": "https://detail.1688.com/offer/real-security-1.html",
                 "stats": {"rawText": "真实页面列表候选"},
             }],
-            "filter_results": [],
+            "filter_results": [{
+                "filter_key": "category_path_1",
+                "label": "类目:日用餐厨、居家日用",
+                "tag": "日用餐厨、居家日用",
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "query": "收纳盒",
+                "page_url": "https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%94%B6%E7%BA%B3%E7%9B%92",
+                "message": "已在1688页面按类目入口点击并进入商品结果页",
+            }],
         }
 
     def blocked_detail(*args, **kwargs):
@@ -449,7 +1123,7 @@ def test_auto_detail_verification_security_pause():
     )
     try:
         config = parse_input(
-            categories="家居日用品",
+            categories="日用餐厨、居家日用",
             tags="微信小店,一件代发",
             keywords="收纳盒",
             sample_data=False,
@@ -485,7 +1159,6 @@ def test_auto_detail_verification_security_pause():
 
 def test_real_page_candidates_enter_verification_queue():
     config = parse_input(
-        categories="家居日用品",
         tags="微信小店,一件代发",
         source_urls="https://detail.1688.com/offer/1234567890.html",
         sample_data=False,
@@ -505,7 +1178,7 @@ def test_real_page_candidates_enter_verification_queue():
             url="https://detail.1688.com/offer/1234567890.html",
             stats={"rawText": "真实页面列表文本"},
         ),
-        "家居日用品",
+        "日用餐厨、居家日用",
         config,
     )
     _assert(row["list_source"] == "rpa", "真实页面候选商品应标记 list_source=rpa")
@@ -514,9 +1187,78 @@ def test_real_page_candidates_enter_verification_queue():
     _assert("真实页面候选商品" in queue[0]["reason"], "核验队列应标明真实页面来源")
 
 
+def test_url_direct_requires_url_and_parses_html():
+    config = parse_input(
+        categories="日用餐厨、居家日用",
+        collect_source="url_direct",
+        sample_data=False,
+        output_format="xlsx",
+    )
+    try:
+        run_tag_collect(config)
+    except ServiceError as exc:
+        state = collect_error_state(exc)
+        _assert(state["code"] == "direct_url_required", "URL直连未填 URL 应返回 direct_url_required")
+    else:
+        raise AssertionError("URL直连未填 URL 不应执行采集")
+
+    original_fetch = service._fetch_1688_url_direct
+
+    def fake_fetch(source_url):
+        return (
+            """
+            <html><body>
+              <a href="https://detail.1688.com/offer/123456789012.html" title="厨房抽屉收纳盒家用分隔整理盒">商品</a>
+              <span>￥12.80</span>
+            </body></html>
+            """,
+            source_url,
+        )
+
+    service._fetch_1688_url_direct = fake_fetch
+    try:
+        config = parse_input(
+            categories="日用餐厨、居家日用",
+            tags="微信小店",
+            source_urls="https://s.1688.com/selloffer/offer_search.htm?keywords=test",
+            collect_source="url_direct",
+            sample_data=False,
+            output_format="xlsx",
+        )
+        result = run_tag_collect(config)
+        data = result["data"]
+        _assert(result["success"], "URL直连解析到商品链接时应采集成功")
+        _assert(data["collect_source"] == "url_direct", "URL直连结果应保留 collect_source")
+        _assert(data["row_count"] == 1, "URL直连应生成 1 条候选")
+        row = data["rows"][0]
+        _assert(row["item_id"] == "123456789012", "URL直连应提取商品ID")
+        _assert(row["list_source"] == "url_direct", "导出行应标记 URL 直连来源")
+        _assert(row["url"].startswith("https://detail.1688.com/offer/123456789012"), "导出行应保留商品链接")
+        _assert(data["verification_queue"], "URL直连真实候选应进入详情核验队列")
+    finally:
+        service._fetch_1688_url_direct = original_fetch
+
+
+def test_url_direct_security_pause_from_1688():
+    config = parse_input(
+        source_urls="https://s.1688.com/selloffer/offer_search.htm?keywords=%E6%94%B6%E7%BA%B3%E7%9B%92",
+        collect_source="url_direct",
+        sample_data=False,
+        output_format="xlsx",
+    )
+    try:
+        result = run_tag_collect(config)
+    except ServiceError as exc:
+        state = collect_error_state(exc)
+        _assert(state["code"] in ("security_verification_required", "login_required", "search_results_not_loaded", "direct_url_fetch_failed"), "真实1688直连失败应返回可识别错误")
+    else:
+        _assert(result["success"], "若当前网络未被1688拦截，URL直连应可成功")
+        _assert(result["data"]["collect_source"] == "url_direct", "真实直连成功时应保留 url_direct 来源")
+
+
 def test_review_filters_wait_for_detail_then_match():
     config = parse_input(
-        categories="居家日用品",
+        categories="日用餐厨、居家日用",
         tags="微信小店",
         library_filters={
             "product_rating_min": "4.8",
@@ -550,7 +1292,7 @@ def test_review_filters_wait_for_detail_then_match():
 
 def test_detail_filter_excluded_rows_leave_main_results():
     config = parse_input(
-        categories="居家日用品",
+        categories="日用餐厨、居家日用",
         tags="微信小店",
         library_filters={"review_tags": ["不存在的评价标签"]},
         sample_data=True,
@@ -569,7 +1311,7 @@ def test_detail_filter_excluded_rows_leave_main_results():
 
 def test_detail_missing_review_metrics_do_not_use_list_values():
     config = parse_input(
-        categories="居家日用品",
+        categories="日用餐厨、居家日用",
         tags="微信小店",
         library_filters={"good_rate_min": "90", "comment_count_min": "30"},
         sample_data=True,
@@ -595,6 +1337,269 @@ def test_detail_missing_review_metrics_do_not_use_list_values():
     _assert(all(record.get("status") == "pending_detail" for record in records), "详情未提取到好评率/评价数时不能用列表值通过筛选")
 
 
+def test_target_publishable_count_and_candidate_budget():
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        return {
+            "products": [
+                {
+                    "id": "target-bad-1",
+                    "title": "低销量测试商品",
+                    "price": "9.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/900000000001.html",
+                    "stats": {"last30DaysSales": 5, "remarkCnt": 2, "downstreamOffer": 900},
+                },
+                {
+                    "id": "target-good-1",
+                    "title": "高潜测试商品一",
+                    "price": "19.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/900000000002.html",
+                    "stats": {
+                        "last30DaysSales": 1600,
+                        "last30DaysDropShippingSales": 800,
+                        "goodRates": 0.96,
+                        "repurchaseRate": 0.2,
+                        "collectionRate24h": 0.98,
+                        "downstreamOffer": 100,
+                        "remarkCnt": 120,
+                    },
+                },
+                {
+                    "id": "target-good-2",
+                    "title": "高潜测试商品二",
+                    "price": "29.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/900000000003.html",
+                    "stats": {
+                        "last30DaysSales": 1200,
+                        "last30DaysDropShippingSales": 650,
+                        "goodRates": 0.94,
+                        "repurchaseRate": 0.18,
+                        "collectionRate24h": 0.96,
+                        "downstreamOffer": 160,
+                        "remarkCnt": 90,
+                    },
+                },
+            ][:limit],
+            "filter_results": [],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        with _temporary_tag_data_dir():
+            config = parse_input(
+                tags="微信小店",
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+                max_items_per_query=1,
+                target_publishable_count=2,
+            )
+            result = run_tag_collect(config)
+            data = result["data"]
+            _assert(result["success"], "目标可铺数量采集应成功")
+            _assert(data["target_publishable_count"] == 2, "应返回目标可铺数量")
+            _assert(data["candidate_scan_limit"] > config.max_items_per_query, "候选预算应为可铺目标适度放大")
+            _assert(data["candidate_count"] >= 3, "应扫描超过原始每词上限的候选以满足可铺目标")
+            _assert(data["publishable_count"] == 2, "目标计数应按可铺/谨慎结果计算")
+            _assert(data["collection_stop_reason"] == "target_met", "达到目标后应标记 target_met")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_persistent_rejected_products_are_skipped_next_run():
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        calls.append(limit)
+        return {
+            "products": [
+                {
+                    "id": "persistent-reject-1",
+                    "title": "历史不合格商品",
+                    "price": "19.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/910000000001.html",
+                    "stats": {"last30DaysSales": 200, "remarkCnt": 20},
+                },
+                {
+                    "id": "persistent-good-1",
+                    "title": "历史过滤后保留商品",
+                    "price": "19.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/910000000002.html",
+                    "stats": {
+                        "last30DaysSales": 1500,
+                        "last30DaysDropShippingSales": 700,
+                        "goodRates": 0.96,
+                        "repurchaseRate": 0.18,
+                        "collectionRate24h": 0.97,
+                        "downstreamOffer": 100,
+                        "remarkCnt": 120,
+                    },
+                },
+            ],
+            "filter_results": [],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        with _temporary_tag_data_dir() as data_dir:
+            config = parse_input(
+                tags="微信小店",
+                library_filters={"sales_units_min": "1000"},
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+                target_publishable_count=1,
+            )
+            first = run_tag_collect(config)["data"]
+            _assert(first["rejected_count"] >= 1, "列表硬筛失败商品应产生筛除记录")
+            rejected_path = data_dir / "rejected_products.json"
+            _assert(rejected_path.exists(), "真实筛除商品应写入本地排除池")
+
+            second = run_tag_collect(config)["data"]
+            ids = {row["item_id"] for row in second["rows"]}
+            _assert("persistent-reject-1" not in ids, "历史筛除商品下次应跳过")
+            _assert(second["skipped_rejected_count"] >= 1, "返回结果应记录历史筛除跳过数")
+            _assert(second["skipped_rejected_records"], "应返回历史筛除跳过明细供审计")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_detail_verification_rescores_and_rejects_risky_product():
+    config = parse_input(
+        categories="家用电器、数码电脑",
+        tags="微信小店",
+        sample_data=True,
+        output_format="xlsx",
+        auto_verify_details=True,
+        auto_verify_max_items=3,
+    )
+    result = run_tag_collect(config)
+    data = result["data"]
+    risky_rows = [
+        row for row in data["rows"]
+        if row.get("item_id") == "658275444569"
+    ]
+    _assert(risky_rows, "样例中应保留家电高风险商品用于详情重评分")
+    risky = risky_rows[0]
+    _assert(risky["product_refund_rate"] == "6.8%", "自动详情核验应补充高风险商品品退率")
+    _assert(risky["shipment_rate"] == "93.4%", "自动详情核验应补充高风险商品发货率")
+    _assert(risky["recommendation_score"] < risky["list_recommendation_score"], "详情风险应降低推荐分")
+    _assert(risky["wechat_shop_suggestion"] in ("谨慎", "不建议"), "详情风险应降低微信小店建议")
+    _assert(risky["manual_review_status"] != "系统预通过", "高品退率/低发货率商品不能系统预通过")
+    rescore = [
+        record for record in data["rescore_records"]
+        if record.get("item_id") == "658275444569"
+    ]
+    _assert(rescore and rescore[0]["score_delta"] < 0, "详情核验后应生成负向重评分记录")
+
+
+def test_auto_review_status_normalizes_export_rows():
+    config = parse_input(categories="日用餐厨、居家日用", tags="微信小店", sample_data=True)
+    good = product_to_export_row(
+        Product(
+            id="auto-review-good",
+            title="厨房沥水架置物架",
+            price="19.9",
+            image="",
+            url="https://detail.1688.com/offer/auto-review-good.html",
+            stats={
+                "last30DaysSales": 1800,
+                "last30DaysDropShippingSales": 900,
+                "downstreamOffer": 120,
+                "remarkCnt": 320,
+                "goodRates": 0.97,
+                "repurchaseRate": 0.16,
+                "collectionRate24h": 0.98,
+            },
+        ),
+        "厨房沥水架",
+        config,
+    )
+    _assert(good["manual_review_status"] == "待复核", "未进入详情页前可铺候选仍应等待关键字段核验")
+    for key, value in {
+        "wholesale_shipping_fee": "首重6元",
+        "dropship_shipping_fee": "5元起",
+        "free_shipping": "部分地区包邮",
+        "product_refund_rate": "1.2%",
+        "shipment_rate": "98.8%",
+        "collection_rate_24h": "98.0%",
+        "supports_dropship": "是",
+        "return_exchange_support": "支持退换",
+    }.items():
+        good[key] = value
+    service.apply_auto_review_status(good)
+    _assert(good["manual_review_status"] == "待复核", "没有详情核验证据时，即使字段有值也不能系统预通过")
+    good["verification_status"] = "verified"
+    good["detail_verified_fields"] = sorted(service.AUTO_REVIEW_REQUIRED_DETAIL_FIELDS)
+    service.rescore_row_after_detail(good)
+    _assert(good["manual_review_status"] == "系统预通过", "关键字段核验后应自动预通过")
+
+    unclear = dict(good)
+    unclear["item_id"] = "auto-review-unclear"
+    unclear["wechat_shop_suggestion"] = "可铺"
+    unclear["product_refund_rate"] = "暂无"
+    unclear["shipment_rate"] = "未展示"
+    service.apply_auto_review_status(unclear)
+    _assert(unclear["manual_review_status"] == "待复核", "品退率/发货率无法解析时不能系统预通过")
+
+    bad = dict(good)
+    bad["item_id"] = "auto-review-bad"
+    bad["wechat_shop_suggestion"] = "不建议"
+    service.apply_auto_review_status(bad)
+    _assert(bad["manual_review_status"] == "系统不建议", "不建议商品应自动归为系统不建议")
+
+    excluded = dict(good)
+    excluded["item_id"] = "auto-review-excluded"
+    excluded["filter_verification_status"] = "filtered_out"
+    excluded["filter_verification_note"] = "品退率未满足<2%"
+    service.apply_auto_review_status(excluded)
+    _assert(excluded["manual_review_status"] == "系统剔除", "筛选不通过商品应自动剔除")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "auto_review.xlsx")
+        export_xlsx([good, bad], output_path, {"filter_excluded_rows": [excluded], "run_id": "auto-review"})
+        with zipfile.ZipFile(output_path) as workbook:
+            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
+            failed_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
+            _assert("系统预通过数量" in config_xml, "导出配置应展示系统预通过数量")
+            _assert("系统不建议数量" in config_xml, "导出配置应展示系统不建议数量")
+            _assert("系统剔除数量" in config_xml, "导出配置应展示系统剔除数量")
+            _assert("auto-review-excluded" in failed_xml, "筛选剔除商品应进入异常复核 sheet")
+            _assert("auto-review-good" not in failed_xml, "系统预通过商品不应进入异常复核 sheet")
+
+
 def test_web_token_and_sample_api():
     web.SERVER_TOKEN = "tag-collect-smoke-token"
     web.ALLOW_REAL_COLLECT = True
@@ -612,6 +1617,12 @@ def test_web_token_and_sample_api():
         _assert(options["library_filter_coverage"], "options 应返回筛选覆盖状态")
         _assert(options["library_capabilities"]["implemented"], "options 应返回筛选能力清单")
         _assert(options["allow_real_collect"] is True, "本机 Web smoke 应允许真实采集模式开关")
+        category_tree = options["category_tree"]
+        _assert(len(category_tree) >= 10, "options 应返回1688左侧主要组合一级类目树")
+        _assert("内裤" in category_tree["女装、男装、内衣"], "options 应透出组合入口下的内裤二级分组")
+        _assert("男士平角裤" in category_tree["女装、男装、内衣"]["内裤"], "options 应透出女装内裤下的三级类目")
+        _assert("汉服套装" in category_tree["女装、男装、内衣"]["新中式"], "options 应透出女装新中式三级类目")
+        _assert(options["category_dictionary"]["status"] == "synced_from_1688_homepage_left_nav", "options 应返回类目字典可追溯状态")
 
         try:
             _post_json(f"{base_url}/api/collect", {"sample_data": True})
@@ -624,7 +1635,7 @@ def test_web_token_and_sample_api():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装/女士精品"],
+                "categories": ["女装、男装、内衣"],
                 "tags": ["微信小店"],
                 "library_filters": {
                     "search_keyword": "连衣裙",
@@ -638,12 +1649,16 @@ def test_web_token_and_sample_api():
                 "sample_data": True,
                 "auto_verify_details": True,
                 "auto_verify_max_items": 2,
+                "target_publishable_count": 2,
                 "output_format": "xlsx",
             },
         )
         _assert(status == 200, "带 token 样例采集 HTTP 应成功")
         _assert(payload["success"], "带 token 样例采集业务应成功")
         _assert(payload["data"]["row_count"] >= 1, "样例采集应返回商品")
+        _assert(payload["data"]["target_publishable_count"] == 2, "Web 应返回目标可铺数量")
+        _assert(payload["data"]["publishable_count"] >= 1, "Web 应返回可铺/谨慎数量")
+        _assert("collection_stop_reason" in payload["data"], "Web 应返回采集停止原因")
         _assert(payload["data"]["library_filters"]["search_keyword"] == "连衣裙", "Web 返回应保留店雷达筛选对象")
         _assert(_native_has(payload["data"]["filter_plan"]["native_filters"], "48小时发货"), "Web 采集应转译发货时间原生筛选")
         _assert(payload["data"]["filter_plan"]["library_reserved_fields"], "Web 采集应返回预留字段记录")
@@ -656,6 +1671,23 @@ def test_web_token_and_sample_api():
         _assert(
             any(row.get("product_refund_rate") != DETAIL_VERIFICATION_PENDING for row in payload["data"]["rows"]),
             "Web rows 应包含详情页自动补充字段",
+        )
+        status, default_limit_payload = _post_json(
+            f"{base_url}/api/collect",
+            {
+                "token": web.SERVER_TOKEN,
+                "categories": ["女装、男装、内衣"],
+                "tags": ["微信小店"],
+                "sample_data": True,
+                "auto_verify_details": True,
+                "target_publishable_count": 5,
+                "output_format": "xlsx",
+            },
+        )
+        _assert(status == 200 and default_limit_payload["success"], "Web 默认自动核验上限采集应成功")
+        _assert(
+            default_limit_payload["data"]["auto_verify_result"].get("verified_count", 0) >= 3,
+            "未显式传自动核验上限时，后端不应退回只核验 3 个以内的旧默认",
         )
 
         status, headers, body = _get_bytes(f"{base_url}{payload['data']['download_url']}")
@@ -688,7 +1720,7 @@ def test_web_token_and_sample_api():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装/女士精品"],
+                "categories": ["女装、男装、内衣"],
                 "tags": ["微信小店"],
                 "sample_data": False,
                 "collect_source": "rpa",
@@ -726,7 +1758,7 @@ def test_web_security_verification_does_not_export():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装/女士精品"],
+                "categories": ["女装、男装、内衣"],
                 "tags": ["微信小店"],
                 "sample_data": False,
                 "collect_source": "rpa",
@@ -755,19 +1787,43 @@ def test_web_security_verification_does_not_export():
 
 
 def main():
+    test_category_dictionary_expanded_tree()
     test_field_numbers()
     test_filter_plan_splits_native_and_metric_tags()
     test_library_filter_contract_and_mapping()
     test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
+    test_rpa_detail_extracts_structured_fields_without_bad_shop_name()
     test_security_verification_error_message()
+    test_cdp_security_error_context()
+    test_navigation_timeout_error_context()
+    test_cdp_context_unsupported_error_context()
+    test_dirty_product_title_is_cleaned()
+    test_search_keyword_encoding_error_context()
+    test_rpa_collect_uses_human_search_not_keyword_url()
+    test_web_defaults_to_automatic_batch_collect()
+    test_chrome_status_sets_cdp_env_and_reports_pages()
+    test_1688_homepage_is_not_collectable_current_page()
+    test_start_chrome_script_canary_fallback_name()
+    test_search_results_not_loaded_error_context()
+    test_category_navigation_not_loaded_error_context()
+    test_invalid_category_path_blocks_before_rpa()
+    test_category_navigation_failure_blocks_export()
+    test_partial_category_navigation_blocks_export()
+    test_category_navigation_service_error_keeps_filter_context()
+    test_multi_category_rpa_runs_are_isolated()
     test_sample_detail_verification()
     test_auto_detail_verification_after_collect()
     test_auto_detail_verification_security_pause()
     test_real_page_candidates_enter_verification_queue()
+    test_url_direct_requires_url_and_parses_html()
+    test_url_direct_security_pause_from_1688()
     test_review_filters_wait_for_detail_then_match()
     test_detail_filter_excluded_rows_leave_main_results()
     test_detail_missing_review_metrics_do_not_use_list_values()
+    test_target_publishable_count_and_candidate_budget()
+    test_persistent_rejected_products_are_skipped_next_run()
+    test_detail_verification_rescores_and_rejects_risky_product()
     test_web_token_and_sample_api()
     test_web_security_verification_does_not_export()
     print("tag_collect smoke tests passed")

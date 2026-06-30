@@ -40,6 +40,20 @@ def _run_node_script(script_name: str, payload: Dict[str, Any], timeout: int = 1
     stderr = (proc.stderr or "").strip()
     if proc.returncode != 0:
         detail = stderr or stdout or f"exit={proc.returncode}"
+        if "Browser.setDownloadBehavior" in detail or "Browser context management is not supported" in detail:
+            error = ServiceError(
+                "cdp_context_unsupported: 真实 Chrome CDP 端口能连接，但当前调试端点不支持 Playwright 初始化上下文。"
+                "请关闭该调试 Chrome 后重新运行 scripts/capabilities/tag_collect/start_chrome_debug.sh；"
+                "如果仍失败，先确认 9222 没有被其它浏览器/工具占用。"
+            )
+            error.data = {
+                "code": "cdp_context_unsupported",
+                "source": "chrome_cdp",
+                "cdp": bool(os.environ.get("TAG_COLLECT_CDP_URL")),
+                "cdp_url": os.environ.get("TAG_COLLECT_CDP_URL", ""),
+                "low_level_error": detail,
+            }
+            raise error
         raise ServiceError(f"真实页面 RPA 执行失败：{detail}")
 
     try:
@@ -50,7 +64,9 @@ def _run_node_script(script_name: str, payload: Dict[str, Any], timeout: int = 1
     if not result.get("success"):
         code = str(result.get("code") or "").strip()
         message = str(result.get("message") or "真实页面 RPA 采集失败")
-        raise ServiceError(f"{code}: {message}" if code else message)
+        error = ServiceError(f"{code}: {message}" if code else message)
+        error.data = result
+        raise error
     return result
 
 
@@ -59,12 +75,21 @@ def collect_products_from_1688_page(
     limit: int,
     source_url: str = "",
     native_filters: Optional[List[Dict[str, Any]]] = None,
+    category_filters: Optional[List[Dict[str, Any]]] = None,
+    manual_url_only: bool = False,
     return_meta: bool = False,
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """打开或连接真实 Chrome 的 1688 搜索页，从真实页面提取候选商品。"""
     result = _run_node_script(
         "rpa_collect.mjs",
-        {"query": query, "limit": limit, "source_url": source_url, "native_filters": native_filters or []},
+        {
+            "query": query,
+            "limit": limit,
+            "source_url": source_url,
+            "native_filters": native_filters or [],
+            "category_filters": category_filters or [],
+            "manual_url_only": manual_url_only,
+        },
         timeout=int(os.environ.get("TAG_COLLECT_RPA_TIMEOUT", "180")),
     )
     products = result.get("products", [])
