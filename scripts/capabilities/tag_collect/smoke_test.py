@@ -534,6 +534,44 @@ def test_export_normalizes_legacy_sample_rows():
             _assert("样例剔除" in failed_xml, "旧样例筛除行不能混同为真实系统剔除")
 
 
+def test_export_marks_unknown_source_rows_as_needing_verification():
+    unknown_row = {
+        "item_id": "legacy-unknown",
+        "title": "旧批次来源缺失商品",
+        "url": "https://detail.1688.com/offer/legacy-unknown.html",
+        "wechat_shop_suggestion": "可铺",
+        "verification_status": "unverified",
+        "manual_review_status": "待复核",
+    }
+    real_row = {
+        "item_id": "legacy-real",
+        "title": "旧批次真实来源商品",
+        "url": "https://detail.1688.com/offer/legacy-real.html",
+        "list_source": "rpa",
+        "wechat_shop_suggestion": "可铺",
+        "verification_status": "unverified",
+        "manual_review_status": "待复核",
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "truth_modes.xlsx")
+        export_xlsx(
+            [unknown_row, real_row],
+            output_path,
+            {
+                "run_id": "truth-modes",
+                "sample_data": False,
+            },
+        )
+        with zipfile.ZipFile(output_path) as workbook:
+            result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
+            _assert("来源未知/需核验" in result_xml, "无法证明真实来源的旧行不能标为真实数据")
+            _assert("禁止直接作为真实选品" in result_xml, "来源未知行必须说明不能直接铺货")
+            _assert("真实数据" in result_xml, "真实页面来源行仍应标为真实数据")
+            _assert("混合数据（含来源未知/需核验行）" in config_xml, "工作簿级配置应提示含来源未知行")
+
+
 def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
     html = """
     <html>
@@ -1946,6 +1984,7 @@ def main():
     test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
     test_export_normalizes_legacy_sample_rows()
+    test_export_marks_unknown_source_rows_as_needing_verification()
     test_rpa_detail_extracts_structured_fields_without_bad_shop_name()
     test_security_verification_error_message()
     test_cdp_security_error_context()

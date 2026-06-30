@@ -3754,30 +3754,51 @@ def _is_sample_row(row: Dict[str, Any]) -> bool:
     )
 
 
+def _is_real_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> bool:
+    payload = payload or {}
+    real_sources = {"rpa", "url_direct", "manual_url", "1688_detail_page_rpa"}
+    if row.get("list_source") in real_sources:
+        return True
+    if row.get("verification_source") in real_sources:
+        return True
+    if row.get("verification_status") in (VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+        return True
+    if payload.get("collect_source") in real_sources and row.get("item_id"):
+        return True
+    return False
+
+
 def _normalize_row_truth_metadata(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> None:
     payload = payload or {}
     if _is_sample_row(row) or payload.get("sample_data"):
         row["data_mode"] = "开发样例"
         row["data_truth_note"] = "开发样例：未访问1688，禁止作为真实选品/铺货依据"
         return
-    if row.get("data_mode") != "真实数据":
+    if _is_real_row(row, payload):
         row["data_mode"] = "真实数据"
-    if not row.get("data_truth_note"):
         source = row.get("list_source") or payload.get("collect_source") or "unknown"
         row["data_truth_note"] = f"真实采集：来源={source}；详情字段以核验记录为准"
+        return
+    row["data_mode"] = "来源未知/需核验"
+    row["data_truth_note"] = "无法确认是否来自真实1688采集，请重新采集或人工核验，禁止直接作为真实选品/铺货依据"
 
 
 def _normalize_export_truth_metadata(
     rows: Iterable[Dict[str, Any]],
     payload: Optional[Dict[str, Any]] = None,
-) -> bool:
+) -> Dict[str, bool]:
     has_sample_rows = False
+    has_unknown_rows = False
     for row in rows:
         if not isinstance(row, dict):
             continue
         _normalize_row_truth_metadata(row, payload)
         has_sample_rows = has_sample_rows or _is_sample_row(row)
-    return has_sample_rows
+        has_unknown_rows = has_unknown_rows or row.get("data_mode") == "来源未知/需核验"
+    return {
+        "has_sample_rows": has_sample_rows,
+        "has_unknown_rows": has_unknown_rows,
+    }
 
 
 def _manual_review_summary(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
@@ -4713,7 +4734,9 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
     excluded_rows = payload.get("filter_excluded_rows", [])
     if not isinstance(excluded_rows, list):
         excluded_rows = []
-    has_sample_rows = _normalize_export_truth_metadata([*rows, *excluded_rows], payload)
+    truth_summary = _normalize_export_truth_metadata([*rows, *excluded_rows], payload)
+    has_sample_rows = truth_summary["has_sample_rows"]
+    has_unknown_rows = truth_summary["has_unknown_rows"]
     apply_auto_review_statuses(rows)
     apply_auto_review_statuses(excluded_rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
@@ -4730,15 +4753,31 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
     data_mode_label = (
         "开发样例（未访问1688，禁止作为真实选品/铺货依据）"
         if payload.get("sample_data")
-        else ("混合数据（含开发样例，样例行禁止作为真实选品/铺货依据）" if has_sample_rows else "真实采集")
+        else (
+            "混合数据（含开发样例和来源未知行，只有真实数据行可作选品依据）"
+            if has_sample_rows and has_unknown_rows
+            else (
+                "混合数据（含开发样例，样例行禁止作为真实选品/铺货依据）"
+                if has_sample_rows
+                else ("混合数据（含来源未知/需核验行）" if has_unknown_rows else "真实采集")
+            )
+        )
     )
     truth_note = (
         "样例数据只用于开发回归；正式验收必须使用真实采集"
         if payload.get("sample_data")
         else (
-            "当前导出含开发样例行；正式选品只可使用数据模式=真实数据且有核验记录的行"
-            if has_sample_rows
-            else "商品列表和详情字段来自真实采集链路；字段可信度以核验状态/核验记录为准"
+            "当前导出含开发样例和来源未知行；正式选品只可使用数据模式=真实数据且有核验记录的行"
+            if has_sample_rows and has_unknown_rows
+            else (
+                "当前导出含开发样例行；正式选品只可使用数据模式=真实数据且有核验记录的行"
+                if has_sample_rows
+                else (
+                    "当前导出含来源未知/需核验行；这些行禁止直接作为真实选品/铺货依据"
+                    if has_unknown_rows
+                    else "商品列表和详情字段来自真实采集链路；字段可信度以核验状态/核验记录为准"
+                )
+            )
         )
     )
     config_rows = [
