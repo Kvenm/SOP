@@ -208,6 +208,8 @@ PROJECT_EXTENSION_EXPORT_LABELS = [
     "推荐等级",
     "推荐理由",
     "风险提示",
+    "数据模式",
+    "数据真实性说明",
     "标签来源",
     "采集批次",
     "采集时间",
@@ -298,6 +300,8 @@ PROJECT_EXTENSION_EXPORT_KEYS = [
     "recommendation_level",
     "recommendation_reason",
     "risk_flags",
+    "data_mode",
+    "data_truth_note",
     "tag_source",
     "run_id",
     "collected_at",
@@ -1208,13 +1212,15 @@ EXPORT_FIELD_GROUPS: List[Tuple[str, str, List[Dict[str, str]]]] = [
         {"number": "10.2", "key": "recommendation_level", "label": "推荐等级", "source": "计算", "verify": "否"},
         {"number": "10.3", "key": "recommendation_reason", "label": "推荐理由", "source": "规则/AI总结", "verify": "否"},
         {"number": "10.4", "key": "risk_flags", "label": "风险提示", "source": "规则/AI总结", "verify": "否"},
-        {"number": "10.5", "key": "tag_source", "label": "标签来源", "source": "任务上下文", "verify": "否"},
-        {"number": "10.6", "key": "run_id", "label": "采集批次", "source": "系统生成", "verify": "否"},
-        {"number": "10.7", "key": "collected_at", "label": "采集时间", "source": "系统生成", "verify": "否"},
-        {"number": "10.8", "key": "verification_status", "label": "核验状态", "source": "系统生成", "verify": "是"},
-        {"number": "10.9", "key": "manual_review_status", "label": "人工复核状态", "source": "人工", "verify": "人工复核"},
-        {"number": "10.10", "key": "manual_review_note", "label": "人工复核备注", "source": "人工", "verify": "人工复核"},
-        {"number": "10.11", "key": "manual_wechat_shop_suggestion", "label": "微信小店铺货建议(人工复核)", "source": "规则/人工", "verify": "人工复核"},
+        {"number": "10.5", "key": "data_mode", "label": "数据模式", "source": "系统生成", "verify": "是"},
+        {"number": "10.6", "key": "data_truth_note", "label": "数据真实性说明", "source": "系统生成", "verify": "是"},
+        {"number": "10.7", "key": "tag_source", "label": "标签来源", "source": "任务上下文", "verify": "否"},
+        {"number": "10.8", "key": "run_id", "label": "采集批次", "source": "系统生成", "verify": "否"},
+        {"number": "10.9", "key": "collected_at", "label": "采集时间", "source": "系统生成", "verify": "否"},
+        {"number": "10.10", "key": "verification_status", "label": "核验状态", "source": "系统生成", "verify": "是"},
+        {"number": "10.11", "key": "manual_review_status", "label": "人工复核状态", "source": "人工", "verify": "人工复核"},
+        {"number": "10.12", "key": "manual_review_note", "label": "人工复核备注", "source": "人工", "verify": "人工复核"},
+        {"number": "10.13", "key": "manual_wechat_shop_suggestion", "label": "微信小店铺货建议(人工复核)", "source": "规则/人工", "verify": "人工复核"},
     ]),
 ]
 
@@ -3694,20 +3700,30 @@ def _auto_review_blocking_reasons(row: Dict[str, Any]) -> List[str]:
 
 def apply_auto_review_status(row: Dict[str, Any]) -> Dict[str, Any]:
     suggestion = str(row.get("wechat_shop_suggestion") or "")
+    is_sample_row = _is_sample_row(row)
     pending_core_fields = _row_pending_detail_fields(row, AUTO_REVIEW_REQUIRED_DETAIL_FIELDS)
     blocking_reasons = _auto_review_blocking_reasons(row)
     if row.get("filter_verification_status") == "filtered_out":
-        row["manual_review_status"] = "系统剔除"
+        row["manual_review_status"] = "样例剔除" if is_sample_row else "系统剔除"
         row["manual_wechat_shop_suggestion"] = "不建议"
-        row["manual_review_note"] = row.get("filter_verification_note") or "详情核验后未满足筛选条件"
+        row["manual_review_note"] = (
+            "开发样例筛除，不代表真实1688数据；"
+            if is_sample_row else ""
+        ) + (row.get("filter_verification_note") or "详情核验后未满足筛选条件")
     elif suggestion == "不建议":
-        row["manual_review_status"] = "系统不建议"
+        row["manual_review_status"] = "样例不建议" if is_sample_row else "系统不建议"
         row["manual_wechat_shop_suggestion"] = "不建议"
-        row["manual_review_note"] = row.get("risk_flags") or row.get("after_sales_risk") or row.get("recommendation_reason") or "系统规则判断不适合投放"
+        row["manual_review_note"] = (
+            "开发样例结论，不代表真实1688数据；"
+            if is_sample_row else ""
+        ) + (row.get("risk_flags") or row.get("after_sales_risk") or row.get("recommendation_reason") or "系统规则判断不适合投放")
     elif suggestion == "可铺" and not pending_core_fields and not blocking_reasons:
-        row["manual_review_status"] = "系统预通过"
+        row["manual_review_status"] = "样例预通过" if is_sample_row else "系统预通过"
         row["manual_wechat_shop_suggestion"] = "可铺"
-        row["manual_review_note"] = "关键履约/售后字段已核验，未命中阻断风险"
+        row["manual_review_note"] = (
+            "开发样例字段已补齐，仅用于流程回归，不代表真实1688数据"
+            if is_sample_row else "关键履约/售后字段已核验，未命中阻断风险"
+        )
     elif suggestion == "谨慎":
         row["manual_review_status"] = "待复核"
         row["manual_wechat_shop_suggestion"] = "谨慎"
@@ -3728,6 +3744,40 @@ def apply_auto_review_statuses(rows: Iterable[Dict[str, Any]]) -> None:
     for row in rows:
         if isinstance(row, dict):
             apply_auto_review_status(row)
+
+
+def _is_sample_row(row: Dict[str, Any]) -> bool:
+    return (
+        row.get("data_mode") == "开发样例"
+        or row.get("verification_status") == VERIFICATION_STATUS_SAMPLE
+        or row.get("list_source") == "sample"
+    )
+
+
+def _normalize_row_truth_metadata(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> None:
+    payload = payload or {}
+    if _is_sample_row(row) or payload.get("sample_data"):
+        row["data_mode"] = "开发样例"
+        row["data_truth_note"] = "开发样例：未访问1688，禁止作为真实选品/铺货依据"
+        return
+    if row.get("data_mode") != "真实数据":
+        row["data_mode"] = "真实数据"
+    if not row.get("data_truth_note"):
+        source = row.get("list_source") or payload.get("collect_source") or "unknown"
+        row["data_truth_note"] = f"真实采集：来源={source}；详情字段以核验记录为准"
+
+
+def _normalize_export_truth_metadata(
+    rows: Iterable[Dict[str, Any]],
+    payload: Optional[Dict[str, Any]] = None,
+) -> bool:
+    has_sample_rows = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        _normalize_row_truth_metadata(row, payload)
+        has_sample_rows = has_sample_rows or _is_sample_row(row)
+    return has_sample_rows
 
 
 def _manual_review_summary(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
@@ -4018,6 +4068,12 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
         "recommendation_level": _level(score),
         "recommendation_reason": "；".join(reasons) or "待人工复核",
         "risk_flags": "；".join(risks),
+        "data_mode": "开发样例" if config.sample_data else "真实数据",
+        "data_truth_note": (
+            "开发样例：未访问1688，禁止作为真实选品/铺货依据"
+            if config.sample_data
+            else f"真实采集：来源={config.collect_source}；详情字段以核验记录为准"
+        ),
         "verification_status": "unverified",
         "manual_review_status": "待复核",
         "manual_review_note": "",
@@ -4435,6 +4491,8 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             "markdown": "未找到采集批次，无法执行详情核验。",
             "data": {"run_id": run_id, "verified_count": 0, "rows": [], "verification_queue": []},
         }
+    batch_sample_data = bool(payload.get("sample_data"))
+    sample_data = batch_sample_data
 
     rows = payload.get("rows", [])
     if not isinstance(rows, list):
@@ -4651,29 +4709,43 @@ def _styles_xml() -> str:
 
 def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[Dict[str, Any]] = None) -> str:
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+    payload = payload or {}
+    excluded_rows = payload.get("filter_excluded_rows", [])
+    if not isinstance(excluded_rows, list):
+        excluded_rows = []
+    has_sample_rows = _normalize_export_truth_metadata([*rows, *excluded_rows], payload)
     apply_auto_review_statuses(rows)
-    if payload:
-        excluded_rows = payload.get("filter_excluded_rows", [])
-        if isinstance(excluded_rows, list):
-            apply_auto_review_statuses(excluded_rows)
+    apply_auto_review_statuses(excluded_rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
     labels = [label for _, label in EXPORT_COLUMNS]
     result_rows = [labels] + [[row.get(key, "") for key in keys] for row in rows]
     review_summary = _manual_review_summary([
         *rows,
-        *[
-            row for row in payload.get("filter_excluded_rows", [])
-            if isinstance(row, dict)
-        ],
+        *excluded_rows,
     ])
     field_rows = [["编号", "分组", "字段", "字段键", "来源", "是否必须核验"]] + [
         [field["number"], field["group"], field["label"], field["key"], field["source"], field["verify"]]
         for field in EXPORT_FIELD_DEFINITIONS
     ]
-    payload = payload or {}
+    data_mode_label = (
+        "开发样例（未访问1688，禁止作为真实选品/铺货依据）"
+        if payload.get("sample_data")
+        else ("混合数据（含开发样例，样例行禁止作为真实选品/铺货依据）" if has_sample_rows else "真实采集")
+    )
+    truth_note = (
+        "样例数据只用于开发回归；正式验收必须使用真实采集"
+        if payload.get("sample_data")
+        else (
+            "当前导出含开发样例行；正式选品只可使用数据模式=真实数据且有核验记录的行"
+            if has_sample_rows
+            else "商品列表和详情字段来自真实采集链路；字段可信度以核验状态/核验记录为准"
+        )
+    )
     config_rows = [
         ["配置项", "值"],
         ["采集批次", payload.get("run_id", "")],
+        ["数据模式", data_mode_label],
+        ["真实性说明", truth_note],
         ["任务状态", (payload.get("automation_state") or {}).get("status_label", "")],
         ["当前阶段", (payload.get("automation_state") or {}).get("stage_label", "")],
         ["建议动作", (payload.get("automation_state") or {}).get("action_label", "")],
@@ -4718,16 +4790,12 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["本次筛除记录", json.dumps(payload.get("rejection_records", []), ensure_ascii=False)],
         ["过滤规则", json.dumps(payload.get("filter_rules", {}), ensure_ascii=False)],
         ["筛选执行记录", json.dumps(payload.get("filter_results", []), ensure_ascii=False)],
-        ["数据模式", "样例数据" if payload.get("sample_data") else "真实采集"],
         ["采集来源", payload.get("collect_source", "")],
-        ["说明", "列表字段仅用于初筛；运费、品退率、发货率等关键字段需详情页核验后才可信。"],
+        ["说明", "列表字段仅用于初筛；运费、品退率、发货率等关键字段需详情页核验后才可信。样例数据不得混入真实验收。"],
     ]
     failed_candidates = [
         *rows,
-        *[
-            row for row in payload.get("filter_excluded_rows", [])
-            if isinstance(row, dict)
-        ],
+        *excluded_rows,
     ]
     failed_rows = [labels] + [
         [row.get(key, "") for key in keys]
@@ -4788,6 +4856,13 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         for record in payload.get("filter_results", [])
         if isinstance(record, dict)
     ]
+    sample_notice_rows = [
+        ["项目", "说明"],
+        ["数据模式", "开发样例"],
+        ["真实性", "未访问 1688，不代表真实商品、真实店铺、真实运费、真实品退率或真实发货率"],
+        ["用途", "仅用于开发回归、字段映射和导出格式检查"],
+        ["验收要求", "正式验收必须关闭样例模式，使用真实 Chrome 登录态或真实 URL 采集"],
+    ]
 
     sheets = [
         ("选品结果", result_rows),
@@ -4797,6 +4872,8 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ("核验记录", verification_rows),
         ("筛选执行记录", filter_rows),
     ]
+    if payload.get("sample_data") or has_sample_rows:
+        sheets.append(("样例说明", sample_notice_rows))
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", _content_types_xml(len(sheets)))
         zf.writestr("_rels/.rels", _root_rels_xml())
@@ -4812,6 +4889,7 @@ def export_csv(rows: List[Dict[str, Any]], output_path: str) -> str:
     import csv
 
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+    _normalize_export_truth_metadata(rows, None)
     apply_auto_review_statuses(rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
     labels = [label for _, label in EXPORT_COLUMNS]

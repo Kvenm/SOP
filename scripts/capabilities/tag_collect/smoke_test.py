@@ -153,8 +153,8 @@ def test_field_numbers():
     keys = {field["key"] for field in fields}
     labels = [label for _, label in EXPORT_COLUMNS]
     _assert(numbers[0] == "1.1", "字段编号应从 1.1 开始")
-    _assert(numbers[-1] == "10.11", "字段编号应到 10.11 结束")
-    _assert(len(labels) == 82, "导出字段应包含店雷达37列基线和项目扩展字段的82列")
+    _assert(numbers[-1] == "10.13", "字段编号应到 10.13 结束")
+    _assert(len(labels) == 84, "导出字段应包含店雷达37列基线和项目扩展字段的84列")
     _assert(labels == REFERENCE_EXPORT_LABELS, "导出字段顺序应与用户确认的附件表头一致")
     _assert(labels[:37] == service.DIANLEIDA_REFERENCE_EXPORT_LABELS, "导出前37列必须严格对齐店雷达附件表头")
     _assert(labels[27] == "店铺链接(点击下方链接可跳转)", "店铺链接应保留在店雷达原表第28列")
@@ -168,6 +168,8 @@ def test_field_numbers():
     _assert("shop_url" in keys, "字段应包含店铺链接")
     _assert("sku_count" in keys, "字段应包含SKU数量")
     _assert("good_rate_bucket" in keys, "字段应包含好评率区间")
+    _assert("data_mode" in keys, "字段应包含数据模式")
+    _assert("data_truth_note" in keys, "字段应包含数据真实性说明")
     _assert("shipment_rate_bucket" in keys, "字段应包含发货率区间")
 
 
@@ -458,7 +460,7 @@ def test_export_xlsx_and_exclude():
     with zipfile.ZipFile(data["output_path"]) as workbook:
         names = workbook.namelist()
         sheets = [name for name in names if name.startswith("xl/worksheets/sheet")]
-        _assert(len(sheets) == 6, "xlsx 应包含 6 个工作表")
+        _assert(len(sheets) == 7, "样例 xlsx 应包含 7 个工作表，额外包含样例说明")
         workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
         result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
         field_xml = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
@@ -470,14 +472,66 @@ def test_export_xlsx_and_exclude():
         _assert("异常复核" in workbook_xml, "应包含异常复核 sheet")
         _assert("核验记录" in workbook_xml, "应包含核验记录 sheet")
         _assert("筛选执行记录" in workbook_xml, "应包含筛选执行记录 sheet")
-        _assert("10.8" in field_xml, "字段说明应包含 10.8 核验状态")
+        _assert("样例说明" in workbook_xml, "样例导出必须包含样例说明 sheet")
+        _assert("10.10" in field_xml, "字段说明应包含 10.10 核验状态")
+        _assert("数据真实性说明" in field_xml, "字段说明应包含数据真实性说明")
         _assert("品退率" in field_xml, "字段说明应包含品退率")
         _assert("发货率" in field_xml, "字段说明应包含发货率")
         for label in REFERENCE_EXPORT_LABELS:
             _assert(label in result_xml, f"选品结果表头应包含附件基线字段：{label}")
+        _assert("开发样例" in result_xml, "样例结果行必须标注开发样例")
+        _assert("禁止作为真实选品" in result_xml, "样例结果行必须标注不能作为真实选品依据")
         filter_xml = workbook.read("xl/worksheets/sheet6.xml").decode("utf-8")
         _assert("一件代发" in filter_xml, "筛选执行记录应包含一件代发")
         _assert("sample_skipped" in filter_xml, "样例模式应标记原生筛选未执行")
+        sample_notice_xml = workbook.read("xl/worksheets/sheet7.xml").decode("utf-8")
+        _assert("未访问 1688" in sample_notice_xml, "样例说明 sheet 应明确未访问 1688")
+
+
+def test_export_normalizes_legacy_sample_rows():
+    config = parse_input(categories="女装、男装、内衣", tags="微信小店", sample_data=True)
+    legacy_row = product_to_export_row(
+        Product(
+            id="legacy-sample",
+            title="旧样例批次商品",
+            price="19.9",
+            image="",
+            url="https://detail.1688.com/offer/legacy-sample.html",
+            stats={"last30DaysSales": 30},
+        ),
+        "女装、男装、内衣",
+        config,
+    )
+    legacy_row.pop("data_mode", None)
+    legacy_row.pop("data_truth_note", None)
+    legacy_row["list_source"] = "sample"
+    legacy_excluded = dict(legacy_row)
+    legacy_excluded["item_id"] = "legacy-sample-excluded"
+    legacy_excluded["filter_verification_status"] = "filtered_out"
+    legacy_excluded["filter_verification_note"] = "样例筛除"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "legacy_sample.xlsx")
+        export_xlsx(
+            [legacy_row],
+            output_path,
+            {
+                "run_id": "legacy-sample",
+                "sample_data": False,
+                "collect_source": "rpa",
+                "filter_excluded_rows": [legacy_excluded],
+            },
+        )
+        with zipfile.ZipFile(output_path) as workbook:
+            workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+            result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
+            failed_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
+            _assert("样例说明" in workbook_xml, "含旧样例行的导出也必须追加样例说明")
+            _assert("开发样例" in result_xml, "旧样例行缺少新字段时导出前必须回填开发样例")
+            _assert("禁止作为真实选品" in result_xml, "旧样例行必须回填真实性说明")
+            _assert("混合数据" in config_xml, "工作簿级配置应提示当前导出含样例行")
+            _assert("样例剔除" in failed_xml, "旧样例筛除行不能混同为真实系统剔除")
 
 
 def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
@@ -1028,8 +1082,8 @@ def test_sample_detail_verification():
     ]
     _assert(preapproved_rows, "样例详情核验后应存在系统可铺商品")
     _assert(
-        all(row.get("manual_review_status") == "系统预通过" for row in preapproved_rows),
-        "关键详情字段已核验且无阻断风险的可铺商品应系统预通过",
+        all(row.get("manual_review_status") == "样例预通过" for row in preapproved_rows),
+        "样例关键详情字段已补齐时只能标记样例预通过，不能混同真实系统预通过",
     )
     _assert(
         all(row.get("manual_wechat_shop_suggestion") == "可铺" for row in preapproved_rows),
@@ -1041,6 +1095,8 @@ def test_sample_detail_verification():
         record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
         _assert("系统预通过数量" in config_xml, "导出标签配置应包含系统预通过数量")
         _assert("待人工复核数量" in config_xml, "导出标签配置应包含待人工复核数量")
+        _assert("开发样例" in config_xml, "样例导出配置应醒目标注开发样例")
+        _assert("禁止作为真实选品" in config_xml, "样例导出配置应标注禁止作为真实选品依据")
         _assert("sample_detail" in record_xml, "核验记录 sheet 应包含样例来源")
         _assert("商品星级" in record_xml, "核验记录 sheet 应包含商品星级")
         _assert("评价标签" in record_xml, "核验记录 sheet 应包含评价标签")
@@ -1084,6 +1140,7 @@ def test_auto_detail_verification_after_collect():
         result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
         record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
         _assert("sample_verified" in result_xml, "导出结果 sheet 应包含自动核验状态")
+        _assert("样例预通过" in result_xml, "样例自动核验结果应标注样例预通过")
         _assert("sample_detail" in record_xml, "导出核验记录 sheet 应包含自动详情核验记录")
 
 
@@ -1150,6 +1207,92 @@ def test_auto_detail_verification_security_pause():
             _assert("详情核验暂停" in config_xml, "导出标签配置应写入暂停状态")
             _assert("人工接管验证" in config_xml, "导出标签配置应写入建议动作")
             _assert("failed" in result_xml, "导出结果 sheet 应保留核验失败状态")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_real_run_verify_ignores_sample_flag():
+    def fake_collect_products(*args, **kwargs):
+        return {
+            "products": [{
+                "id": "real-mode-1",
+                "title": "真实批次模式保护商品",
+                "price": "18.8",
+                "image": "",
+                "url": "https://detail.1688.com/offer/real-mode-1.html",
+                "stats": {"rawText": "真实页面列表候选", "last30DaysSales": 80},
+            }],
+            "filter_results": [],
+        }
+
+    def fake_detail(*args, **kwargs):
+        return {
+            "min_order_range": "1件起批",
+            "dropship_price": "18.8",
+            "wholesale_shipping_fee": "首重6元",
+            "dropship_shipping_fee": "5元起",
+            "free_shipping": "部分地区包邮",
+            "product_refund_rate": "1.0%",
+            "product_rating": "4.9",
+            "good_rate": "96.0%",
+            "comment_count": "88",
+            "review_tags": "发货快,质量好",
+            "rights_protection": "7天包退换",
+            "dropship_rights": "支持一件代发",
+            "waybill_support": "微信小店",
+            "collection_rate_24h": "98.0%",
+            "shipment_rate": "99.0%",
+            "shipment_speed": "24小时内发货",
+            "supports_dropship": "是",
+            "return_exchange_support": "支持退换",
+            "monthly_dropship_orders": "520",
+            "sku_count": "12",
+            "favorite_customers": "120",
+            "shop_name": "真实供应链店铺",
+            "shop_url": "https://real-mode.1688.com/",
+            "location": "广东 广州",
+            "company_type": "生产厂家",
+            "seller_member_type": "诚信通",
+            "source_factory": "是",
+            "stock": "现货 1000 件",
+            "video_query": "待人工确认素材可用性",
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products,
+        collect_detail_fields_from_1688_page=fake_detail,
+    )
+    try:
+        config = parse_input(
+            categories="",
+            tags="微信小店,一件代发",
+            keywords="收纳盒",
+            sample_data=False,
+            collect_source="rpa",
+            output_format="xlsx",
+            auto_verify_details=False,
+        )
+        result = run_tag_collect(config)
+        data = result["data"]
+        verify_result = verify_run_details(data["run_id"], sample_data=True, max_items=1)
+        verify_data = verify_result["data"]
+        _assert(verify_result["success"], "真实批次详情核验应成功")
+        row = verify_data["rows"][0]
+        _assert(row["data_mode"] == "真实数据", "真实批次不能被前端样例开关改成开发样例")
+        _assert(row["verification_status"] in ("verified", "partial_verified"), "真实批次误传 sample_data=True 时仍应执行真实详情核验")
+        _assert(row["verification_source"] == "1688_detail_page_rpa", "真实批次核验来源必须是真实详情页 RPA")
+        _assert("sample_verified" not in json.dumps(verify_data, ensure_ascii=False), "真实批次不得出现样例核验状态")
+        with zipfile.ZipFile(verify_data["output_path"]) as workbook:
+            workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+            result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
+            _assert("样例说明" not in workbook_xml, "真实批次导出不得包含样例说明 sheet")
+            _assert("真实数据" in result_xml, "真实批次结果行必须标注真实数据")
+            _assert("sample_detail" not in record_xml, "真实批次核验记录不得使用样例详情来源")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -1526,7 +1669,7 @@ def test_detail_verification_rescores_and_rejects_risky_product():
 
 
 def test_auto_review_status_normalizes_export_rows():
-    config = parse_input(categories="日用餐厨、居家日用", tags="微信小店", sample_data=True)
+    config = parse_input(categories="日用餐厨、居家日用", tags="微信小店", sample_data=False)
     good = product_to_export_row(
         Product(
             id="auto-review-good",
@@ -1565,6 +1708,15 @@ def test_auto_review_status_normalizes_export_rows():
     good["detail_verified_fields"] = sorted(service.AUTO_REVIEW_REQUIRED_DETAIL_FIELDS)
     service.rescore_row_after_detail(good)
     _assert(good["manual_review_status"] == "系统预通过", "关键字段核验后应自动预通过")
+
+    sample_good = dict(good)
+    sample_good["item_id"] = "auto-review-sample"
+    sample_good["list_source"] = "sample"
+    sample_good["data_mode"] = "开发样例"
+    sample_good["verification_status"] = "sample_verified"
+    service.apply_auto_review_status(sample_good)
+    _assert(sample_good["manual_review_status"] == "样例预通过", "样例数据不能标记为真实系统预通过")
+    _assert("不代表真实1688数据" in sample_good["manual_review_note"], "样例预通过必须说明不代表真实1688数据")
 
     unclear = dict(good)
     unclear["item_id"] = "auto-review-unclear"
@@ -1793,6 +1945,7 @@ def main():
     test_library_filter_contract_and_mapping()
     test_metric_bucket_ranges()
     test_export_xlsx_and_exclude()
+    test_export_normalizes_legacy_sample_rows()
     test_rpa_detail_extracts_structured_fields_without_bad_shop_name()
     test_security_verification_error_message()
     test_cdp_security_error_context()
@@ -1815,6 +1968,7 @@ def main():
     test_sample_detail_verification()
     test_auto_detail_verification_after_collect()
     test_auto_detail_verification_security_pause()
+    test_real_run_verify_ignores_sample_flag()
     test_real_page_candidates_enter_verification_queue()
     test_url_direct_requires_url_and_parses_html()
     test_url_direct_security_pause_from_1688()
