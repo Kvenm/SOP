@@ -1046,7 +1046,7 @@ def test_multi_category_rpa_runs_are_isolated():
                 "price": "19.9",
                 "image": "",
                 "url": f"https://detail.1688.com/offer/{1000000000 + len(calls)}.html",
-                "stats": {"rawText": "真实页面列表候选"},
+                "stats": {"rawText": f"{category_path} 真实页面列表候选"},
             }],
             "filter_results": [{
                 "filter_key": category_filter.get("key", f"category_path_{len(calls)}"),
@@ -1065,20 +1065,92 @@ def test_multi_category_rpa_runs_are_isolated():
         collect_products_from_1688_page=fake_collect_products
     )
     try:
+        with _temporary_tag_data_dir():
+            config = parse_input(
+                categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨",
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+            )
+            result = run_tag_collect(config)
+            data = result["data"]
+            _assert(result["success"], "多个完整类目命中时应采集成功")
+            _assert(len(calls) == 2, "多类目应拆成独立RPA任务，避免同页连续点击污染")
+            _assert(all(len(call["category_filters"]) == 1 for call in calls), "每次RPA只应接收一个类目路径")
+            _assert({call["category_filters"][0]["category_path"] for call in calls} == set(config.categories), "每个已选类目都应独立执行")
+            _assert(len(data["rows"]) == 2, "多类目独立采集应保留两个候选商品")
+            _assert({row["category_path"] for row in data["rows"]} == set(config.categories), "导出行应记录对应采集类目")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_category_products_require_item_level_evidence():
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        return {
+            "products": [
+                {
+                    "id": "category-evidence-good",
+                    "title": "雨衣雨披 商品",
+                    "price": "19.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/920000000001.html",
+                    "stats": {"rawText": "遮阳防雨 雨衣雨披 真实页面列表候选"},
+                },
+                {
+                    "id": "category-evidence-bad",
+                    "title": "不相关小家电 商品",
+                    "price": "29.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/920000000002.html",
+                    "stats": {"rawText": "厨房电器 电热饭盒 真实页面列表候选"},
+                },
+            ],
+            "filter_results": [{
+                "filter_key": category_filter.get("key", "category_path_1"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "query": query,
+                "page_url": "https://s.1688.com/selloffer/category-evidence.html",
+                "message": "已在1688页面按类目入口点击并进入商品结果页",
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
         config = parse_input(
-            categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨",
+            categories="日用餐厨、居家日用>遮阳防雨>雨衣雨披",
             sample_data=False,
             collect_source="rpa",
             output_format="xlsx",
+            target_publishable_count=2,
         )
         result = run_tag_collect(config)
         data = result["data"]
-        _assert(result["success"], "多个完整类目命中时应采集成功")
-        _assert(len(calls) == 2, "多类目应拆成独立RPA任务，避免同页连续点击污染")
-        _assert(all(len(call["category_filters"]) == 1 for call in calls), "每次RPA只应接收一个类目路径")
-        _assert({call["category_filters"][0]["category_path"] for call in calls} == set(config.categories), "每个已选类目都应独立执行")
-        _assert(len(data["rows"]) == 2, "多类目独立采集应保留两个候选商品")
-        _assert({row["category_path"] for row in data["rows"]} == set(config.categories), "导出行应记录对应采集类目")
+        ids = {row["item_id"] for row in data["rows"]}
+        _assert("category-evidence-good" in ids, "商品级类目证据匹配时应保留")
+        _assert("category-evidence-bad" not in ids, "商品级类目证据不匹配时不能混入目标类目")
+        _assert(
+            any(record.get("reason_code") == "product_category_mismatch" for record in data["rejection_records"]),
+            "错类目商品应留下筛除记录",
+        )
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -1191,7 +1263,7 @@ def test_auto_detail_verification_security_pause():
                 "price": "19.9",
                 "image": "",
                 "url": "https://detail.1688.com/offer/real-security-1.html",
-                "stats": {"rawText": "真实页面列表候选"},
+                "stats": {"rawText": "日用餐厨 居家日用 真实页面列表候选"},
             }],
             "filter_results": [{
                 "filter_key": "category_path_1",
@@ -1218,7 +1290,7 @@ def test_auto_detail_verification_security_pause():
     )
     try:
         config = parse_input(
-            categories="日用餐厨、居家日用",
+            categories="",
             tags="微信小店,一件代发",
             keywords="收纳盒",
             sample_data=False,
@@ -2004,6 +2076,7 @@ def main():
     test_partial_category_navigation_blocks_export()
     test_category_navigation_service_error_keeps_filter_context()
     test_multi_category_rpa_runs_are_isolated()
+    test_category_products_require_item_level_evidence()
     test_sample_detail_verification()
     test_auto_detail_verification_after_collect()
     test_auto_detail_verification_security_pause()

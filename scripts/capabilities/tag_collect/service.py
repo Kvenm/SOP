@@ -2045,6 +2045,40 @@ def _category_parts(category: str) -> List[str]:
     return [part.strip() for part in str(category or "").split(">") if part.strip()]
 
 
+def _category_match_terms(category: str) -> List[str]:
+    parts = _category_parts(category)
+    if not parts:
+        return []
+    leaf = parts[-1]
+    terms = [leaf]
+    if len(parts) >= 2:
+        terms.append(parts[-2])
+    return [
+        _normalize_category_path_text(term)
+        for term in _dedupe_strings(terms)
+        if len(_normalize_category_path_text(term)) >= 2
+    ]
+
+
+def _product_matches_selected_category(product: Product, category_path: str) -> Tuple[bool, str]:
+    if not category_path:
+        return True, "no_category_filter"
+    stats = product.stats or {}
+    evidence = " ".join(
+        str(stats.get(key) or "")
+        for key in ("categoryListName", "categoryName", "rawText")
+    )
+    evidence_norm = _normalize_category_path_text(evidence)
+    if not evidence_norm:
+        return False, "missing_product_category_evidence"
+    terms = _category_match_terms(category_path)
+    if not terms:
+        return True, "no_category_terms"
+    if any(term and term in evidence_norm for term in terms):
+        return True, "matched_product_category_evidence"
+    return False, "product_category_mismatch"
+
+
 def _category_native_filter(category: str, index: int) -> Dict[str, Any]:
     parts = _category_parts(category)
     return {
@@ -2919,19 +2953,27 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                         _raise_category_navigation_failed(blocking_category)
                 for item in raw_products if isinstance(raw_products, list) else []:
                     stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
-                    if job_category_path and job_category_filters and not stats.get("categoryListName"):
-                        stats = dict(stats)
-                        stats["categoryListName"] = job_category_path
-                        stats["sourceCategoryPath"] = job_category_path
-                    if str(item.get("id", "")).strip() and _clean_product_title(item.get("title", "")):
-                        products.append(Product(
-                            id=str(item.get("id", "")),
-                            title=_clean_product_title(item.get("title", "")),
-                            price=str(item.get("price", "-")),
-                            image=str(item.get("image", "")),
-                            url=str(item.get("url", "")),
-                            stats=stats,
+                    product = Product(
+                        id=str(item.get("id", "")),
+                        title=_clean_product_title(item.get("title", "")),
+                        price=str(item.get("price", "-")),
+                        image=str(item.get("image", "")),
+                        url=str(item.get("url", "")),
+                        stats=stats,
+                    )
+                    if not product.id.strip() or not product.title:
+                        continue
+                    matches_category, category_reason = _product_matches_selected_category(product, job_category_path)
+                    if not matches_category:
+                        rejected_records.append(_rejection_record(
+                            product_to_export_row(product, job_query, config),
+                            reason_code=category_reason,
+                            reason_text="商品级类目证据未匹配所选1688类目",
+                            filter_signature=filter_signature,
+                            target_platform=target_platform,
                         ))
+                        continue
+                    products.append(product)
         for product in products:
             product_id = _canonical_item_id(product.id, product.url)
             if product_id in seen:
