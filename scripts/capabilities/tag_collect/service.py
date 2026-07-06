@@ -701,6 +701,15 @@ def _category_path_index() -> Dict[str, str]:
 
 CATEGORY_PATH_INDEX = _category_path_index()
 
+
+def _category_has_children(category: str) -> bool:
+    parts = _category_parts(category)
+    if len(parts) == 1:
+        return bool(TAG_CATEGORY_TREE.get(parts[0]))
+    if len(parts) == 2:
+        return bool((TAG_CATEGORY_TREE.get(parts[0]) or {}).get(parts[1]))
+    return False
+
 METRIC_FILTER_GROUPS = {
     "好评率": ["好评率>=90%", "好评率80%-90%", "好评率70%-80%", "好评率<70%"],
     "品退率": ["品退率<2%", "品退率2%-5%", "品退率5%-10%", "品退率>=10%"],
@@ -1741,6 +1750,8 @@ def parse_input(
         _dedupe_strings(_split_csv(categories) + _library_categories(parsed_library_filters))
     )
     parsed_source_urls = _dedupe_strings(_split_csv(source_urls) + _library_source_urls(parsed_library_filters))
+    if parsed_collect_source == "rpa" and not sample_data and categories:
+        _validate_rpa_leaf_categories(categories)
     if parsed_collect_source == "rpa" and categories:
         parsed_source_urls = []
     normalized_max_items = min(MAX_ITEMS_PER_QUERY, max(1, max_items_per_query))
@@ -1922,6 +1933,34 @@ def _validate_category_paths(categories: Iterable[str]) -> List[str]:
     return _dedupe_strings(valid)
 
 
+def _validate_rpa_leaf_categories(categories: Iterable[str]) -> None:
+    non_leaf = [category for category in categories if _category_has_children(category)]
+    if not non_leaf:
+        return
+    first = non_leaf[0]
+    suggestions = _suggest_category_paths(f"{first}>", limit=8)
+    suggestion_text = f"可选下级类目：{'、'.join(suggestions[:6])}。" if suggestions else "请在页面类目树继续选择到最右侧类目。"
+    error = ServiceError(
+        f"{CATEGORY_PATH_INVALID_CODE}: 自动批量采集不能只选择上级类目：{first}。"
+        f"{suggestion_text}请选到最右侧叶子类目后再开始采集，避免把宽泛父类商品当成目标类目。"
+    )
+    error.data = {
+        "code": CATEGORY_PATH_INVALID_CODE,
+        "source": "category_dictionary",
+        "invalid_categories": [
+            {"category_path": category, "suggestions": _suggest_category_paths(f"{category}>", limit=8)}
+            for category in non_leaf
+        ],
+        "category_dictionary": {
+            "version": CATEGORY_DICTIONARY.get("version", ""),
+            "source": CATEGORY_DICTIONARY.get("source", ""),
+            "status": CATEGORY_DICTIONARY.get("status", ""),
+            "updated_at": CATEGORY_DICTIONARY.get("updated_at", ""),
+        },
+    }
+    raise error
+
+
 def _as_list(value: Any) -> List[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -2050,14 +2089,50 @@ def _category_match_terms(category: str) -> List[str]:
     if not parts:
         return []
     leaf = parts[-1]
-    terms = [leaf]
-    if len(parts) >= 2:
-        terms.append(parts[-2])
     return [
         _normalize_category_path_text(term)
-        for term in _dedupe_strings(terms)
+        for term in _dedupe_strings([leaf])
         if len(_normalize_category_path_text(term)) >= 2
     ]
+
+
+def _category_leaf_token_groups(category: str) -> List[List[str]]:
+    parts = _category_parts(category)
+    if not parts:
+        return []
+    leaf = parts[-1]
+    normalized = _normalize_category_path_text(leaf)
+    if len(normalized) < 4:
+        return []
+    groups: List[List[str]] = []
+    words = [
+        _normalize_category_path_text(word)
+        for word in re.split(r"[、/／,，\s\-]+", leaf)
+        if len(_normalize_category_path_text(word)) >= 2
+    ]
+    if len(words) >= 2:
+        groups.append(words)
+    for token in _category_leaf_terms(leaf)["priority"]:
+        if normalized.startswith(token):
+            rest = normalized[len(token):]
+            if len(rest) >= 2:
+                groups.append([token, rest])
+                if rest.endswith("裤") and len(rest[:-1]) >= 2:
+                    groups.append([token, rest[:-1], "内裤"])
+    if normalized.endswith("套装") and len(normalized[:-2]) >= 2:
+        groups.append([normalized[:-2], "套装"])
+    if len(normalized) == 4:
+        groups.append([normalized[:2], normalized[2:]])
+    generic = {"男装", "女装", "内衣", "类目", "商品", "用品", "套装"}
+    clean_groups: List[List[str]] = []
+    for group in groups:
+        clean = [
+            token for token in _dedupe_strings(group)
+            if len(token) >= 2 and token not in generic
+        ]
+        if len(clean) >= 2 and clean not in clean_groups:
+            clean_groups.append(clean)
+    return clean_groups
 
 
 def _product_matches_selected_category(product: Product, category_path: str) -> Tuple[bool, str]:
@@ -2065,8 +2140,10 @@ def _product_matches_selected_category(product: Product, category_path: str) -> 
         return True, "no_category_filter"
     stats = product.stats or {}
     evidence = " ".join(
+        [product.title or ""] + [
         str(stats.get(key) or "")
         for key in ("categoryListName", "categoryName", "rawText")
+        ]
     )
     evidence_norm = _normalize_category_path_text(evidence)
     if not evidence_norm:
@@ -2076,6 +2153,9 @@ def _product_matches_selected_category(product: Product, category_path: str) -> 
         return True, "no_category_terms"
     if any(term and term in evidence_norm for term in terms):
         return True, "matched_product_category_evidence"
+    for group in _category_leaf_token_groups(category_path):
+        if all(token in evidence_norm for token in group):
+            return True, "matched_product_category_leaf_tokens"
     return False, "product_category_mismatch"
 
 
@@ -3691,6 +3771,25 @@ def _score_product(stats: Dict[str, Any], tags: List[str]) -> Tuple[int, List[st
     return score, reasons, risks
 
 
+def _title_risk_flags(title: str, categories: Iterable[str], tags: Iterable[str]) -> List[str]:
+    text = _normalize_category_path_text(title)
+    if not text:
+        return []
+    risks: List[str] = []
+    hard_terms = ["情趣", "性感", "诱惑", "调情", "免脱"]
+    if any(term in text for term in hard_terms):
+        risks.append("成人/性感内容风险")
+    soft_terms = ["肚兜", "睡衣", "睡裙", "制服", "纯欲"]
+    soft_hits = [term for term in soft_terms if term in text]
+    category_text = _normalize_category_path_text(",".join(str(item or "") for item in categories))
+    target_text = _normalize_category_path_text(",".join(str(item or "") for item in tags))
+    if "微信小店" in target_text and "汉服套装" in category_text and soft_hits:
+        risks.append("汉服套装结果疑似偏成人/睡衣场景")
+    elif len(soft_hits) >= 2:
+        risks.append("商品标题含多项成人/睡衣敏感词")
+    return _dedupe_strings(risks)
+
+
 def _level(score: int) -> str:
     if score >= 80:
         return "P0"
@@ -4054,6 +4153,10 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
     stats = product.stats or {}
     title = _clean_product_title(product.title)
     score, reasons, risks = _score_product(stats, config.tags)
+    title_risks = _title_risk_flags(title, config.categories, config.tags)
+    if title_risks:
+        risks = _dedupe_strings([*risks, *title_risks])
+        score = min(score, 35)
     category_path = (
         stats.get("categoryListName")
         or stats.get("categoryName")

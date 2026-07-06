@@ -3253,7 +3253,7 @@ HTML_PAGE = r"""<!doctype html>
               <label class="collect-mode-card">
                 <input type="radio" name="collectModeChoice" value="rpa" checked />
                 <strong>自动批量采集（推荐）</strong>
-                <span>你在本页选类目、筛选和数量；系统复用采集 Chrome 登录态自动打开 1688、点击类目和筛选、翻页采集。</span>
+                <span>你在本页选到最右侧类目、筛选和数量；系统复用采集 Chrome 登录态自动打开 1688、点击类目和筛选、翻页采集。</span>
                 <em>主流程；遇到滑块会暂停给你人工处理</em>
               </label>
               <label class="collect-mode-card">
@@ -3281,7 +3281,7 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div class="browser-assist-steps">
                 <span id="browserStep1">1. 先点击“启动采集 Chrome”，在弹出的 Chrome 里登录 1688 并完成必要验证。</span>
-                <span id="browserStep2">2. 回到本页选择类目、关键词、筛选条件和采集数量。</span>
+                <span id="browserStep2">2. 回到本页选择到最右侧类目、关键词、筛选条件和采集数量。</span>
                 <span id="browserStep3">3. 点击“开始自动采集”，系统会自动进入 1688 执行类目/筛选/翻页，采集完成后导出真实数据。</span>
               </div>
               <div id="browserPageList" class="browser-page-list"></div>
@@ -3949,11 +3949,11 @@ HTML_PAGE = r"""<!doctype html>
       }
     }
 
-    function categoryRowHtml({value, label, kind, meta = "", current = false, selected = false, checked = false, path = ""}) {
+    function categoryRowHtml({value, label, kind, meta = "", current = false, selected = false, checked = false, path = "", selectable = true}) {
       return `
         <div class="category-row ${current ? "is-current" : ""} ${selected ? "is-selected" : ""}">
           <label class="category-check" title="复选${esc(label)}">
-            <input type="checkbox" data-kind="category" value="${esc(value)}" ${checked ? "checked" : ""} />
+            <input type="checkbox" data-kind="category" value="${esc(value)}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} title="${selectable ? `选择 ${esc(label)}` : "请继续选择右侧下级类目"}" />
           </label>
           <button class="category-row-button" type="button" data-category-nav="${esc(kind)}" data-category-path="${esc(path || value)}" title="${esc(path || value)}">
             <span class="category-row-title">${esc(label)}</span>
@@ -4012,7 +4012,8 @@ HTML_PAGE = r"""<!doctype html>
           meta: selectedCount ? `已选 ${selectedCount}` : `${entries.length} 个二级`,
           current: parent === state.activeCategoryParent,
           selected: state.selectedCategories.has(parent) || selectedCount > 0,
-          checked: state.selectedCategories.has(parent)
+          checked: state.selectedCategories.has(parent),
+          selectable: false
         });
       }).join("");
 
@@ -4027,7 +4028,8 @@ HTML_PAGE = r"""<!doctype html>
           meta: selectedCount ? `已选 ${selectedCount}` : `${grandchildren.length} 个三级`,
           current: child === state.activeCategoryChild,
           selected: state.selectedCategories.has(value) || selectedCount > 0,
-          checked: state.selectedCategories.has(value)
+          checked: state.selectedCategories.has(value),
+          selectable: grandchildren.length === 0
         });
       }).join("");
 
@@ -4073,7 +4075,7 @@ HTML_PAGE = r"""<!doctype html>
           </div>
           <div class="category-selected-bar">
             <div class="category-selected-title">已选类目</div>
-            <div class="category-selected-list">${selectedHtml || `<span class="category-empty-selection">未选择时默认全部类目</span>`}</div>
+            <div class="category-selected-list">${selectedHtml || `<span class="category-empty-selection">请选到最右侧类目后采集</span>`}</div>
           </div>
         </div>
       `;

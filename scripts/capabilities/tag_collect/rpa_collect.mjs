@@ -824,6 +824,69 @@ async function clickCategoryPart(page, needleSet, mode = "click") {
   }
 }
 
+async function clickCategoryLeafLink(page, parts) {
+  const result = await page.evaluate(({ parts }) => {
+    const compact = (value) => String(value || "")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/[\s、，,\/／|｜·•\-]+/g, "")
+      .trim();
+    const hrefOf = (node) => node.href || node.getAttribute?.("href") || "";
+    const expected = (Array.isArray(parts) ? parts : []).map(compact).filter(Boolean);
+    const leaf = expected[expected.length - 1] || "";
+    if (!leaf) return { ok: false, missing_text: "" };
+    let best = null;
+    const anchors = Array.from(document.querySelectorAll("a[href]"));
+    for (const anchor of anchors) {
+      const text = compact(anchor.innerText || anchor.textContent || anchor.getAttribute?.("title") || anchor.getAttribute?.("aria-label") || "");
+      const href = hrefOf(anchor);
+      if (!href || !/s\.1688\.com\/selloffer|offer_search|keywords=|categoryId=|catId=/i.test(href)) continue;
+      const exact = text === leaf;
+      const contains = leaf.length >= 2 && text.includes(leaf) && text.length <= Math.max(leaf.length + 12, 32);
+      if (!exact && !contains) continue;
+      const ancestors = [];
+      let current = anchor;
+      for (let depth = 0; current && depth < 8; depth += 1) {
+        ancestors.push(compact(current.innerText || current.textContent || ""));
+        current = current.parentElement;
+      }
+      const context = ancestors.join("");
+      const matchedParts = expected.filter((part) => part && context.includes(part));
+      if (matchedParts.length < Math.min(expected.length, 2)) continue;
+      const score = (exact ? 100 : 70) + matchedParts.length * 20 - Math.max(0, text.length - leaf.length);
+      if (!best || score > best.score) best = { text, href, score, matchedParts };
+    }
+    if (!best) return { ok: false, missing_text: leaf };
+    return {
+      ok: true,
+      matched_text: best.text || leaf,
+      href: best.href,
+      score: best.score,
+      mode: "direct_link",
+      diagnostics: {
+        page_url: location.href,
+        title: document.title || "",
+        matched_expected_parts: best.matchedParts,
+        hidden_leaf_link: true,
+      },
+    };
+  }, { parts }).catch((error) => ({
+    ok: false,
+    error: error.message || String(error),
+    missing_text: parts[parts.length - 1] || "",
+  }));
+  if (!result.ok || !result.href) return result;
+  try {
+    await page.goto(result.href, { waitUntil: "domcontentloaded", timeout: Math.min(pageTimeoutMs, 30000) });
+    return result;
+  } catch (error) {
+    return {
+      ...result,
+      ok: false,
+      error: error.message || String(error),
+    };
+  }
+}
+
 async function submitHumanSearch(page, query, sourceUrl) {
   await gotoWithTimeout(page, "https://www.1688.com/", query, sourceUrl, "1688 首页");
   await humanPause(page, pacing.afterGoto);
@@ -1056,7 +1119,33 @@ async function applyCategoryFilters(page, filters, query) {
           diagnostics: applied.diagnostics || {},
           message: applied.error || "",
         });
-        if (!applied.ok) break;
+        if (!applied.ok) {
+          const followed = await followCategoryClick(page, () => clickCategoryLeafLink(page, parts));
+          const leafApplied = followed.action_result || {};
+          categorySteps.push({
+            depth: parts.length,
+            expected_text: parts[parts.length - 1] || "",
+            needles: categoryNeedles(parts[parts.length - 1] || ""),
+            mode: "direct_link",
+            status: leafApplied.ok ? "clicked" : (leafApplied.error ? "click_failed" : "not_found"),
+            matched_text: normalizeText(leafApplied.matched_text || ""),
+            page_url: page.url(),
+            page_url_before: beforeUrl,
+            page_url_after: followed.page?.url?.() || page.url(),
+            href: leafApplied.href || "",
+            diagnostics: leafApplied.diagnostics || {},
+            message: leafApplied.error || "",
+          });
+          if (!leafApplied.ok) break;
+          clickedParts.splice(0, clickedParts.length, ...parts);
+          matchedTexts.splice(0, matchedTexts.length, parts.join(">"));
+          page = followed.page;
+          runtime.page = page;
+          await failIfStillBlocked(page, query, sourceUrl, false);
+          navigationState = await readCategoryPageState(page, parts);
+          applied = leafApplied;
+          break;
+        }
         clickedParts.push(parts[index] || needleSet[0] || "");
         matchedTexts.push(applied.matched_text || parts[index] || needleSet[0] || "");
         await humanPause(page, pacing.afterFilterClick);

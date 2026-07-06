@@ -683,6 +683,35 @@ def test_dirty_product_title_is_cleaned():
     _assert(row["title"] == "", "疑似乱码标题不应进入导出标题；真实采集入口会进一步过滤该商品")
 
 
+def test_wechat_hanfu_adult_title_is_not_publishable():
+    config = parse_input(
+        categories="女装、男装、内衣>新中式>汉服套装",
+        tags="微信小店",
+        sample_data=False,
+        collect_source="rpa",
+    )
+    row = product_to_export_row(
+        Product(
+            id="hanfu-risk-1",
+            title="新款古装大码汉服套装睡衣女性感古代肚兜制服雪纺纱睡裙古风纯欲",
+            price="9.3",
+            image="",
+            url="https://detail.1688.com/offer/hanfu-risk-1.html",
+            stats={
+                "last30DaysSales": 2000,
+                "last30DaysDropShippingSales": 1000,
+                "goodRates": 0.98,
+                "collectionRate24h": 0.96,
+            },
+        ),
+        "",
+        config,
+    )
+    _assert("汉服套装结果疑似偏成人/睡衣场景" in row["risk_flags"], "汉服成人/睡衣倾向标题应打风险")
+    _assert(row["recommendation_score"] <= 35, "标题风险应压低推荐分")
+    _assert(row["wechat_shop_suggestion"] == "不建议", "成人/睡衣倾向商品不能作为微信小店可铺候选")
+
+
 def test_search_keyword_encoding_error_context():
     error = ServiceError(
         "search_keyword_encoding_error: 1688 搜索词校验失败：期望搜索「雨衣」，"
@@ -729,6 +758,7 @@ def test_rpa_collect_uses_human_search_not_keyword_url():
     _assert("index < needleSets.length - 1" in script, "三级类目应先 hover 一级/二级，不能点击二级后跳成关键词结果")
     _assert("followCategoryClick" in script, "类目点击后应跟随新页或URL变化")
     _assert("collectCategoryDiagnostics" in script, "类目点击失败应返回页面可见类目诊断")
+    _assert("clickCategoryLeafLink" in script and 'mode: "direct_link"' in script, "1688 首页隐藏叶子类目链接应有兜底跳转")
     _assert("filter_results: categoryResults" in script, "类目点击后无商品卡片时也应返回类目执行记录")
     _assert("deferred_navigation" not in script, "多级类目不能用父级类目 href 兜底跳到关键词结果页")
     _assert("navigated_parent_href" not in script, "多级类目缺二级时不应跳父级关键词结果页")
@@ -810,6 +840,70 @@ def test_category_navigation_not_loaded_error_context():
     _assert(state["retryable"] is False, "类目导航失败不应自动高频重试")
     _assert(state["action"] == "manual_open_page", "类目导航失败应要求人工确认页面")
     _assert("类目" in state["suggestion"] and "商品列表" in state["suggestion"], "提示应说明人工确认类目商品列表")
+
+
+def test_rpa_requires_leaf_category_before_collect():
+    try:
+        parse_input(
+            categories="女装、男装、内衣",
+            sample_data=False,
+            collect_source="rpa",
+        )
+    except ServiceError as exc:
+        state = collect_error_state(exc)
+        _assert(state["code"] == "category_path_invalid", "真实自动采集不应允许只选一级类目")
+        _assert("最右侧" in state["message"] or "最右侧" in state["suggestion"], "提示应要求选到叶子类目")
+    else:
+        raise AssertionError("真实自动采集只选一级类目应在提交前阻断")
+
+    config = parse_input(
+        categories="女装、男装、内衣",
+        sample_data=True,
+        collect_source="rpa",
+    )
+    _assert(config.categories == ["女装、男装、内衣"], "样例模式仍允许一级类目做本地演示")
+
+
+def test_all_category_paths_leaf_gate():
+    tree = service.TAG_CATEGORY_TREE
+    total_paths = 0
+    leaf_paths = 0
+    blocked_non_leaf = 0
+    for parent, children in tree.items():
+        total_paths += 1
+        try:
+            parse_input(categories=parent, sample_data=False, collect_source="rpa")
+        except ServiceError as exc:
+            _assert(collect_error_state(exc)["code"] == "category_path_invalid", f"一级类目应被叶子门禁阻断：{parent}")
+            blocked_non_leaf += 1
+        else:
+            raise AssertionError(f"一级类目不应直接进入真实自动采集：{parent}")
+
+        for child, grandchildren in (children or {}).items():
+            child_path = f"{parent}>{child}"
+            total_paths += 1
+            if grandchildren:
+                try:
+                    parse_input(categories=child_path, sample_data=False, collect_source="rpa")
+                except ServiceError as exc:
+                    _assert(collect_error_state(exc)["code"] == "category_path_invalid", f"有下级的二级类目应被阻断：{child_path}")
+                    blocked_non_leaf += 1
+                else:
+                    raise AssertionError(f"有下级的二级类目不应直接进入真实自动采集：{child_path}")
+            else:
+                parsed = parse_input(categories=child_path, sample_data=False, collect_source="rpa")
+                _assert(parsed.categories == [child_path], f"无下级二级类目应可作为叶子类目：{child_path}")
+                leaf_paths += 1
+
+            for grandchild in grandchildren or []:
+                grand_path = f"{child_path}>{grandchild}"
+                total_paths += 1
+                parsed = parse_input(categories=grand_path, sample_data=False, collect_source="rpa")
+                _assert(parsed.categories == [grand_path], f"三级叶子类目应可进入真实自动采集：{grand_path}")
+                leaf_paths += 1
+
+    _assert(total_paths >= 1000, "全量类目门禁测试应覆盖当前同步字典的大部分路径")
+    _assert(leaf_paths > 0 and blocked_non_leaf > 0, "全量类目门禁应同时覆盖叶子和非叶子路径")
 
 
 def test_invalid_category_path_blocks_before_rpa():
@@ -1067,7 +1161,7 @@ def test_multi_category_rpa_runs_are_isolated():
     try:
         with _temporary_tag_data_dir():
             config = parse_input(
-                categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨",
+                categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨>雨衣雨披",
                 sample_data=False,
                 collect_source="rpa",
                 output_format="xlsx",
@@ -1103,11 +1197,19 @@ def test_category_products_require_item_level_evidence():
             "products": [
                 {
                     "id": "category-evidence-good",
-                    "title": "雨衣雨披 商品",
+                    "title": "厚款一次性雨衣全身雨披暴雨卡片式透明加厚男女成人长款便携雨披",
                     "price": "19.9",
                     "image": "",
                     "url": "https://detail.1688.com/offer/920000000001.html",
-                    "stats": {"rawText": "遮阳防雨 雨衣雨披 真实页面列表候选"},
+                    "stats": {"rawText": "真实页面列表候选"},
+                },
+                {
+                    "id": "category-parent-only",
+                    "title": "户外遮阳伞加厚防晒便携摆摊大伞",
+                    "price": "25.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/920000000003.html",
+                    "stats": {"rawText": "遮阳防雨 真实页面列表候选"},
                 },
                 {
                     "id": "category-evidence-bad",
@@ -1146,6 +1248,7 @@ def test_category_products_require_item_level_evidence():
         data = result["data"]
         ids = {row["item_id"] for row in data["rows"]}
         _assert("category-evidence-good" in ids, "商品级类目证据匹配时应保留")
+        _assert("category-parent-only" not in ids, "只命中上级类目词不能混入叶子类目")
         _assert("category-evidence-bad" not in ids, "商品级类目证据不匹配时不能混入目标类目")
         _assert(
             any(record.get("reason_code") == "product_category_mismatch" for record in data["rejection_records"]),
@@ -1897,7 +2000,7 @@ def test_web_token_and_sample_api():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装、男装、内衣"],
+                "categories": ["女装、男装、内衣>新中式>汉服套装"],
                 "tags": ["微信小店"],
                 "library_filters": {
                     "search_keyword": "连衣裙",
@@ -1938,7 +2041,7 @@ def test_web_token_and_sample_api():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装、男装、内衣"],
+                "categories": ["女装、男装、内衣>新中式>汉服套装"],
                 "tags": ["微信小店"],
                 "sample_data": True,
                 "auto_verify_details": True,
@@ -1982,7 +2085,7 @@ def test_web_token_and_sample_api():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装、男装、内衣"],
+                "categories": ["女装、男装、内衣>新中式>汉服套装"],
                 "tags": ["微信小店"],
                 "sample_data": False,
                 "collect_source": "rpa",
@@ -2020,7 +2123,7 @@ def test_web_security_verification_does_not_export():
             f"{base_url}/api/collect",
             {
                 "token": web.SERVER_TOKEN,
-                "categories": ["女装、男装、内衣"],
+                "categories": ["女装、男装、内衣>新中式>汉服套装"],
                 "tags": ["微信小店"],
                 "sample_data": False,
                 "collect_source": "rpa",
@@ -2071,6 +2174,8 @@ def main():
     test_start_chrome_script_canary_fallback_name()
     test_search_results_not_loaded_error_context()
     test_category_navigation_not_loaded_error_context()
+    test_rpa_requires_leaf_category_before_collect()
+    test_all_category_paths_leaf_gate()
     test_invalid_category_path_blocks_before_rpa()
     test_category_navigation_failure_blocks_export()
     test_partial_category_navigation_blocks_export()
