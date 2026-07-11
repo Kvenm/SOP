@@ -1261,6 +1261,78 @@ def test_category_products_require_item_level_evidence():
             sys.modules["capabilities.tag_collect.rpa"] = original_module
 
 
+def test_gender_style_leaf_category_matches_title_suffix():
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+    ):
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        return {
+            "products": [
+                {
+                    "id": "jeans-good",
+                    "title": "浅蓝色微喇牛仔裤女春季设计感美式高街显瘦小众高腰休闲马蹄裤子",
+                    "price": "29.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/930000000001.html",
+                    "stats": {"rawText": "真实页面列表候选"},
+                },
+                {
+                    "id": "shorts-bad",
+                    "title": "女士短裤夏季高腰宽松休闲裤",
+                    "price": "19.9",
+                    "image": "",
+                    "url": "https://detail.1688.com/offer/930000000002.html",
+                    "stats": {"rawText": "真实页面列表候选"},
+                },
+            ],
+            "filter_results": [{
+                "filter_key": category_filter.get("key", "category_path_1"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "query": query,
+                "page_url": "https://s.1688.com/selloffer/category-jeans.html",
+                "message": "已在1688页面按类目入口点击并进入商品结果页",
+            }],
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        with _temporary_tag_data_dir():
+            config = parse_input(
+                categories="女装、男装、内衣>下装裤>女式牛仔裤",
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+                target_publishable_count=2,
+            )
+            result = run_tag_collect(config)
+            data = result["data"]
+            ids = {row["item_id"] for row in data["rows"]}
+            _assert("jeans-good" in ids, "女式牛仔裤应兼容标题里的“牛仔裤女”表达")
+            _assert("shorts-bad" not in ids, "同为女装但非牛仔裤商品不能混入女式牛仔裤")
+            _assert(
+                any(record.get("item_id") == "shorts-bad" for record in data["rejection_records"]),
+                "非牛仔裤商品应留下拒绝记录",
+            )
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
 def test_sample_detail_verification():
     config = parse_input(
         categories="女装、男装、内衣,家用电器、数码电脑",

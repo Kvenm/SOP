@@ -42,5 +42,6 @@ tag_collect_*.json
 1688_*.json
 1688_detail_*.json
 .openclaw/
+.tmp/
 
 publish-clawhub.sh

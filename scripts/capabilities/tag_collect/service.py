@@ -2112,13 +2112,16 @@ def _category_leaf_token_groups(category: str) -> List[List[str]]:
     ]
     if len(words) >= 2:
         groups.append(words)
+    gender_aliases = {"男士": "男", "男式": "男", "女士": "女", "女式": "女"}
+    parent_text = _normalize_category_path_text(parts[-2] if len(parts) >= 2 else "")
     for token in _category_leaf_terms(leaf)["priority"]:
         if normalized.startswith(token):
             rest = normalized[len(token):]
             if len(rest) >= 2:
-                groups.append([token, rest])
-                if rest.endswith("裤") and len(rest[:-1]) >= 2:
-                    groups.append([token, rest[:-1], "内裤"])
+                for alias in _dedupe_strings([token, gender_aliases.get(token, "")]):
+                    groups.append([alias, rest])
+                    if "内裤" in parent_text and rest.endswith("裤") and len(rest[:-1]) >= 2:
+                        groups.append([alias, rest[:-1], "内裤"])
     if normalized.endswith("套装") and len(normalized[:-2]) >= 2:
         groups.append([normalized[:-2], "套装"])
     if len(normalized) == 4:
@@ -2128,7 +2131,7 @@ def _category_leaf_token_groups(category: str) -> List[List[str]]:
     for group in groups:
         clean = [
             token for token in _dedupe_strings(group)
-            if len(token) >= 2 and token not in generic
+            if (len(token) >= 2 or token in {"男", "女"}) and token not in generic
         ]
         if len(clean) >= 2 and clean not in clean_groups:
             clean_groups.append(clean)
