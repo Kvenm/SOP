@@ -188,6 +188,249 @@ function firstJsonValue(rawText, keys) {
   return "";
 }
 
+function normalizeOfficialCategoryId(value) {
+  const text = String(value || "").trim();
+  return /^\d{1,32}$/.test(text) ? text : "";
+}
+
+function extractCategoryId(...values) {
+  for (const value of values) {
+    const raw = String(value || "").trim();
+    if (!raw) continue;
+    const direct = normalizeOfficialCategoryId(raw);
+    if (direct) return direct;
+    const variants = [raw];
+    try {
+      variants.push(decodeURIComponent(raw));
+    } catch {
+      // Keep the raw value only.
+    }
+    for (const text of variants) {
+      try {
+        const parsed = new URL(text, "https://www.1688.com/");
+        for (const [key, candidate] of parsed.searchParams.entries()) {
+          if (["productcategoryid", "leafcategoryid", "categoryid", "catid", "cateid", "category_id", "cat_id", "cate_id"].includes(key.toLowerCase())) {
+            const normalized = normalizeOfficialCategoryId(candidate);
+            if (normalized) return normalized;
+          }
+        }
+      } catch {
+        // Non-URL values may still contain a category key below.
+      }
+      const match = text.match(/(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)[^0-9]{0,16}(\d{1,32})/i)
+        || text.match(/[?&#](?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)=(\d{1,32})/i);
+      if (match) return match[1];
+    }
+  }
+  return "";
+}
+
+function extractStructuredCategoryId(value) {
+  const text = String(value || "");
+  const dataAttribute = text.match(/\b(?:data-product-category-id|data-productcategoryid|data-category-id|data-categoryid|data-cat-id|data-catid|data-cate-id|data-cateid)\s*=\s*["']?(\d{1,32})["']?/i);
+  if (dataAttribute) return normalizeOfficialCategoryId(dataAttribute[1]);
+  const property = text.match(/(?:^|[\[{,;\s])(?:["']?(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)["']?)\s*[:=]\s*["']?(\d{1,32})["']?/i);
+  return property ? normalizeOfficialCategoryId(property[1]) : "";
+}
+
+function decodeStructuredString(value) {
+  return String(value || "")
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, code) => String.fromCharCode(Number.parseInt(code, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\n|\\r|\\t/g, " ")
+    .replace(/\\(["'])/g, "$1");
+}
+
+function cleanCategoryName(value) {
+  return decodeStructuredString(value)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&gt;|&rsaquo;|&raquo;/gi, ">")
+    .replace(/[\uE000-\uF8FF]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[>›»→|\-\s]+|[>›»→|\-\s]+$/g, "")
+    .trim()
+    .slice(0, 160);
+}
+
+function normalizeCategoryBreadcrumb(value) {
+  const items = Array.isArray(value) ? value : [];
+  const names = [];
+  for (const item of items) {
+    const rawName = typeof item === "string"
+      ? item
+      : (item?.name || item?.title || item?.text || item?.label || item?.item?.name || "");
+    const name = cleanCategoryName(rawName);
+    if (!name || /^(首页|1688|阿里巴巴|全部分类|商品详情)$/.test(name)) continue;
+    if (names[names.length - 1] !== name) names.push(name);
+  }
+  return names.slice(0, 10);
+}
+
+function categoryBreadcrumbFromPath(value) {
+  return normalizeCategoryBreadcrumb(
+    cleanCategoryName(value).split(/\s*(?:>|›|»|→)\s*/).filter(Boolean)
+  );
+}
+
+function normalizeCategoryPath(value) {
+  return categoryBreadcrumbFromPath(value).join(">");
+}
+
+function firstStructuredString(text, keys, maxLength = 480) {
+  const source = String(text || "");
+  for (const key of keys) {
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const doubleQuoted = source.match(new RegExp(`"${escaped}"\\s*:\\s*"((?:\\\\.|[^"\\\\]){1,${maxLength}})"`, "i"));
+    if (doubleQuoted) return decodeStructuredString(doubleQuoted[1]);
+    const singleQuoted = source.match(new RegExp(`'${escaped}'\\s*:\\s*'((?:\\\\.|[^'\\\\]){1,${maxLength}})'`, "i"));
+    if (singleQuoted) return decodeStructuredString(singleQuoted[1]);
+  }
+  return "";
+}
+
+function structuredCategoryBreadcrumb(text) {
+  const source = String(text || "");
+  const match = source.match(/["'](?:productCategoryBreadcrumb|categoryBreadcrumb|breadcrumbs?)["']\s*:\s*(\[[\s\S]{1,2400}?\])/i);
+  if (!match) return [];
+  try {
+    return normalizeCategoryBreadcrumb(JSON.parse(match[1]));
+  } catch {
+    const quoted = Array.from(match[1].matchAll(/["']((?:\\.|[^"']){1,160})["']/g)).map((item) => item[1]);
+    return normalizeCategoryBreadcrumb(quoted);
+  }
+}
+
+function emptyCategoryEvidence() {
+  return {
+    category_id: "",
+    category_path: "",
+    category_breadcrumb: [],
+    source: "",
+  };
+}
+
+function categoryEvidenceFromStructuredText(text, source = "structured_data", offerId = "") {
+  const sourceText = String(text || "");
+  const offerIndex = offerId ? sourceText.indexOf(String(offerId)) : -1;
+  const anchorMatch = /productCategoryPath|categoryPath|categoryListName|categoryBreadcrumb|productCategoryBreadcrumb|productCategoryName|leafCategoryName/i.exec(sourceText);
+  const anchorIndex = offerIndex >= 0 ? offerIndex : (anchorMatch?.index ?? -1);
+  const scopedText = anchorIndex >= 0
+    ? sourceText.slice(Math.max(0, anchorIndex - 1400), anchorIndex + 2400)
+    : sourceText;
+  let categoryId = extractStructuredCategoryId(scopedText);
+  const hasExplicitProductCategoryKey = /productCategoryId|productCategoryPath|productCategoryName|productCategoryBreadcrumb|leafCategoryId|leafCategoryName/i.test(scopedText);
+  const structuredPath = firstStructuredString(scopedText, [
+    "productCategoryPath",
+    "categoryPath",
+    "categoryListName",
+    "catPath",
+  ]);
+  const explicitProductName = firstStructuredString(scopedText, [
+    "productCategoryName",
+    "leafCategoryName",
+  ]);
+  const genericCategoryName = firstStructuredString(scopedText, [
+    "categoryName",
+    "catName",
+  ]);
+  let breadcrumb = structuredCategoryBreadcrumb(scopedText);
+  if (offerId && offerIndex < 0 && !hasExplicitProductCategoryKey && !structuredPath && !breadcrumb.length) {
+    categoryId = "";
+  }
+  const structuredName = explicitProductName || (categoryId ? genericCategoryName : "");
+  let categoryPath = normalizeCategoryPath(structuredPath);
+  if (!breadcrumb.length && categoryPath) breadcrumb = categoryBreadcrumbFromPath(categoryPath);
+  if (!categoryPath && breadcrumb.length) categoryPath = breadcrumb.join(">");
+  if (!categoryPath && structuredName) {
+    breadcrumb = normalizeCategoryBreadcrumb([structuredName]);
+    categoryPath = breadcrumb.join(">");
+  }
+  if (!categoryId && !categoryPath && !breadcrumb.length) return emptyCategoryEvidence();
+  return {
+    category_id: categoryId,
+    category_path: categoryPath,
+    category_breadcrumb: breadcrumb,
+    source,
+  };
+}
+
+function categoryEvidenceFromJsonLdHtml(html) {
+  const findBreadcrumbLists = (value, output = []) => {
+    if (!value || typeof value !== "object") return output;
+    if (Array.isArray(value)) {
+      value.forEach((item) => findBreadcrumbLists(item, output));
+      return output;
+    }
+    const type = String(value["@type"] || value.type || "");
+    if (/BreadcrumbList/i.test(type)) output.push(value);
+    Object.values(value).forEach((item) => findBreadcrumbLists(item, output));
+    return output;
+  };
+  const scripts = String(html || "").matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of scripts) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      for (const list of findBreadcrumbLists(parsed)) {
+        const elements = Array.isArray(list.itemListElement) ? list.itemListElement : [];
+        const sorted = [...elements].sort((a, b) => Number(a?.position || 0) - Number(b?.position || 0));
+        const categoryElements = [...sorted];
+        const productEntry = categoryElements[categoryElements.length - 1] || {};
+        const productEntryUrl = typeof productEntry.item === "string"
+          ? productEntry.item
+          : (productEntry.item?.["@id"] || productEntry.item?.url || productEntry.url || "");
+        if (/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(String(productEntryUrl || ""))) {
+          categoryElements.pop();
+        }
+        const breadcrumb = normalizeCategoryBreadcrumb(categoryElements.map((entry) => (
+          entry?.name || entry?.item?.name || entry?.item?.title || ""
+        )));
+        if (!breadcrumb.length) continue;
+        const last = categoryElements[categoryElements.length - 1] || {};
+        const itemUrl = typeof last.item === "string" ? last.item : (last.item?.["@id"] || last.item?.url || last.url || "");
+        return {
+          category_id: extractCategoryId(itemUrl),
+          category_path: breadcrumb.join(">"),
+          category_breadcrumb: breadcrumb,
+          source: "json_ld_breadcrumb",
+        };
+      }
+    } catch {
+      // Ignore malformed JSON-LD and continue with structured page data.
+    }
+  }
+  return emptyCategoryEvidence();
+}
+
+function mergeCategoryEvidence(...values) {
+  const candidates = values.filter((item) => item && (
+    item.category_id || item.category_path || (Array.isArray(item.category_breadcrumb) && item.category_breadcrumb.length)
+  ));
+  if (!candidates.length) return emptyCategoryEvidence();
+  const pathCandidate = candidates.find((item) => item.category_path || item.category_breadcrumb?.length) || candidates[0];
+  const idCandidate = candidates.find((item) => item.category_id);
+  const breadcrumb = normalizeCategoryBreadcrumb(
+    pathCandidate.category_breadcrumb?.length
+      ? pathCandidate.category_breadcrumb
+      : categoryBreadcrumbFromPath(pathCandidate.category_path)
+  );
+  return {
+    category_id: idCandidate?.category_id || "",
+    category_path: normalizeCategoryPath(pathCandidate.category_path) || breadcrumb.join(">"),
+    category_breadcrumb: breadcrumb,
+    source: pathCandidate.source || idCandidate?.source || "",
+  };
+}
+
+function categoryFieldsFromEvidence(evidence) {
+  if (!evidence || (!evidence.category_id && !evidence.category_path && !evidence.category_breadcrumb?.length)) return {};
+  return {
+    product_category_id: evidence.category_id || "",
+    product_category_path: evidence.category_path || "",
+    product_category_breadcrumb: evidence.category_breadcrumb || [],
+    category_evidence_source: evidence.source || "",
+  };
+}
+
 function extractDetailFieldsFromText(text, structuredText = "") {
   const combined = `${structuredText || ""} ${text || ""}`.replace(/\s+/g, " ").trim();
   const fields = {};
@@ -305,7 +548,14 @@ function extractDetailFieldsFromText(text, structuredText = "") {
 
 if (testHtml) {
   const plainText = testHtml.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
-  const fields = Object.fromEntries(Object.entries(extractDetailFieldsFromText(plainText, testHtml)).filter(([, value]) => value));
+  const categoryEvidence = mergeCategoryEvidence(
+    categoryEvidenceFromStructuredText(testHtml),
+    categoryEvidenceFromJsonLdHtml(testHtml)
+  );
+  const fields = Object.fromEntries(Object.entries({
+    ...extractDetailFieldsFromText(plainText, testHtml),
+    ...categoryFieldsFromEvidence(categoryEvidence),
+  }).filter(([, value]) => Array.isArray(value) ? value.length : value));
   console.log(JSON.stringify({ success: true, source: "test_html", fields }));
   process.exit(0);
 }
@@ -373,8 +623,8 @@ try {
   const structuredText = await page.evaluate(() => {
     const scripts = Array.from(document.querySelectorAll("script"))
       .map((script) => script.textContent || "")
-      .filter((content) => /shopName|sellerName|companyName|skuCount|refundRate|shipmentRate|collectionRate/i.test(content))
-      .slice(0, 8)
+      .filter((content) => /shopName|sellerName|companyName|skuCount|refundRate|shipmentRate|collectionRate|productCategory|leafCategory|categoryId|categoryPath|categoryListName|categoryBreadcrumb|catId|cateId/i.test(content))
+      .slice(0, 12)
       .join("\n");
     const meta = Array.from(document.querySelectorAll("[content], [title], [aria-label]"))
       .flatMap((node) => [node.getAttribute("content"), node.getAttribute("title"), node.getAttribute("aria-label")])
@@ -383,6 +633,147 @@ try {
     return `${scripts}\n${meta}`.slice(0, 300000);
   }).catch(() => "");
   const fields = extractDetailFieldsFromText(text, structuredText);
+  const pageCategoryEvidence = await page.evaluate(() => {
+    const normalizeId = (value) => {
+      const text = String(value || "").trim();
+      return /^\d{1,32}$/.test(text) ? text : "";
+    };
+    const categoryIdFromValue = (...values) => {
+      for (const value of values) {
+        const raw = String(value || "").trim();
+        if (!raw) continue;
+        const direct = normalizeId(raw);
+        if (direct) return direct;
+        try {
+          const parsed = new URL(raw, location.href);
+          for (const [key, candidate] of parsed.searchParams.entries()) {
+            if (["productcategoryid", "leafcategoryid", "categoryid", "catid", "cateid", "category_id", "cat_id", "cate_id"].includes(key.toLowerCase())) {
+              const normalized = normalizeId(candidate);
+              if (normalized) return normalized;
+            }
+          }
+        } catch {
+          // Non-URL values may still contain a category key below.
+        }
+        const match = raw.match(/(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)[^0-9]{0,16}(\d{1,32})/i)
+          || raw.match(/[?&#](?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)=(\d{1,32})/i);
+        if (match) return match[1];
+      }
+      return "";
+    };
+    const cleanName = (value) => String(value || "")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/^[>›»→|\-\s]+|[>›»→|\-\s]+$/g, "")
+      .trim()
+      .slice(0, 160);
+    const normalizeBreadcrumb = (values) => {
+      const names = [];
+      for (const value of Array.isArray(values) ? values : []) {
+        const rawName = typeof value === "string"
+          ? value
+          : (value?.name || value?.title || value?.text || value?.label || value?.item?.name || "");
+        const name = cleanName(rawName);
+        if (!name || /^(首页|1688|阿里巴巴|全部分类|商品详情)$/.test(name)) continue;
+        if (names[names.length - 1] !== name) names.push(name);
+      }
+      return names.slice(0, 10);
+    };
+    const visible = (node) => {
+      if (!node || typeof node.getBoundingClientRect !== "function") return false;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    };
+    const empty = () => ({ category_id: "", category_path: "", category_breadcrumb: [], source: "" });
+    const findBreadcrumbLists = (value, output = []) => {
+      if (!value || typeof value !== "object") return output;
+      if (Array.isArray(value)) {
+        value.forEach((item) => findBreadcrumbLists(item, output));
+        return output;
+      }
+      const type = String(value["@type"] || value.type || "");
+      if (/BreadcrumbList/i.test(type)) output.push(value);
+      Object.values(value).forEach((item) => findBreadcrumbLists(item, output));
+      return output;
+    };
+    for (const script of Array.from(document.querySelectorAll("script[type='application/ld+json']")).slice(0, 12)) {
+      try {
+        const parsed = JSON.parse(script.textContent || "null");
+        for (const list of findBreadcrumbLists(parsed)) {
+          const elements = Array.isArray(list.itemListElement) ? list.itemListElement : [];
+          const sorted = [...elements].sort((a, b) => Number(a?.position || 0) - Number(b?.position || 0));
+          const categoryElements = [...sorted];
+          const productEntry = categoryElements[categoryElements.length - 1] || {};
+          const productEntryUrl = typeof productEntry.item === "string"
+            ? productEntry.item
+            : (productEntry.item?.["@id"] || productEntry.item?.url || productEntry.url || "");
+          if (/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(String(productEntryUrl || ""))) {
+            categoryElements.pop();
+          }
+          const breadcrumb = normalizeBreadcrumb(categoryElements.map((entry) => (
+            entry?.name || entry?.item?.name || entry?.item?.title || ""
+          )));
+          if (!breadcrumb.length) continue;
+          const last = categoryElements[categoryElements.length - 1] || {};
+          const itemUrl = typeof last.item === "string" ? last.item : (last.item?.["@id"] || last.item?.url || last.url || "");
+          return {
+            category_id: categoryIdFromValue(itemUrl),
+            category_path: breadcrumb.join(">"),
+            category_breadcrumb: breadcrumb,
+            source: "json_ld_breadcrumb",
+          };
+        }
+      } catch {
+        // Ignore malformed JSON-LD and continue with visible breadcrumbs.
+      }
+    }
+    const roots = Array.from(document.querySelectorAll([
+      "nav[aria-label*='breadcrumb' i]",
+      "[class*='breadcrumb' i]",
+      "[class*='crumb' i]",
+      "[data-testid*='breadcrumb' i]",
+    ].join(", "))).filter(visible);
+    let best = null;
+    for (const root of roots) {
+      const nodes = Array.from(root.querySelectorAll("a[href], li, span, [itemprop='name']")).slice(0, 30);
+      const breadcrumbNodes = nodes.filter(visible).filter((node) => {
+        const href = String(node.href || node.getAttribute?.("href") || "");
+        return !/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(href);
+      });
+      const breadcrumb = normalizeBreadcrumb(breadcrumbNodes.map((node) => (
+        node.innerText || node.textContent || node.getAttribute?.("title") || ""
+      )));
+      const lastName = breadcrumb[breadcrumb.length - 1] || "";
+      if (lastName.length >= 18 && cleanName(document.title).includes(lastName)) breadcrumb.pop();
+      if (!breadcrumb.length) continue;
+      const categoryId = breadcrumbNodes.map((node) => categoryIdFromValue(
+        node.getAttribute?.("data-category-id"),
+        node.getAttribute?.("data-categoryid"),
+        node.getAttribute?.("data-cat-id"),
+        node.getAttribute?.("data-catid"),
+        node.getAttribute?.("data-cate-id"),
+        node.getAttribute?.("data-cateid"),
+        node.href,
+        node.getAttribute?.("href")
+      )).filter(Boolean).at(-1) || "";
+      const candidate = {
+        category_id: categoryId,
+        category_path: breadcrumb.join(">"),
+        category_breadcrumb: breadcrumb,
+        source: "dom_breadcrumb",
+      };
+      if (!best || candidate.category_breadcrumb.length > best.category_breadcrumb.length) best = candidate;
+    }
+    if (best) return best;
+    return empty();
+  }).catch(() => emptyCategoryEvidence());
+  const detailOfferId = itemId || (String(url || "").match(/offer\/(\d{8,})\.html/i)?.[1] || "");
+  const categoryEvidence = mergeCategoryEvidence(
+    categoryEvidenceFromStructuredText(structuredText, "structured_data", detailOfferId),
+    pageCategoryEvidence
+  );
+  Object.assign(fields, categoryFieldsFromEvidence(categoryEvidence));
   const shopInfo = await page.evaluate(() => {
     const normalizeUrl = (value) => {
       const text = String(value || "").trim();
