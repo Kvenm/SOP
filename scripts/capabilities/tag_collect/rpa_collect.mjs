@@ -339,6 +339,56 @@ function normalizeCategoryText(value) {
     .trim();
 }
 
+function normalizeOfficialCategoryId(value) {
+  const text = String(value || "").trim();
+  return /^\d{1,32}$/.test(text) ? text : "";
+}
+
+function extractOfficialCategoryId(...values) {
+  for (const value of values) {
+    const raw = String(value || "").trim();
+    if (!raw) continue;
+    const direct = normalizeOfficialCategoryId(raw);
+    if (direct) return direct;
+    const variants = [raw];
+    try {
+      variants.push(decodeURIComponent(raw));
+    } catch {
+      // Keep the raw value only.
+    }
+    for (const text of variants) {
+      try {
+        const parsed = new URL(text, "https://www.1688.com/");
+        for (const [key, candidate] of parsed.searchParams.entries()) {
+          if (["categoryid", "catid", "cateid", "category_id", "cat_id", "cate_id"].includes(key.toLowerCase())) {
+            const normalized = normalizeOfficialCategoryId(candidate);
+            if (normalized) return normalized;
+          }
+        }
+      } catch {
+        // Non-URL values may still contain a category key below.
+      }
+      const match = text.match(/(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)[^0-9]{0,12}(\d{1,32})/i)
+        || text.match(/[?&#](?:categoryId|catId|cateId|category_id|cat_id|cate_id)=(\d{1,32})/i);
+      if (match) return match[1];
+    }
+  }
+  return "";
+}
+
+function withOfficialCategoryId(result = {}) {
+  return {
+    ...result,
+    category_id: extractOfficialCategoryId(
+      result.category_id,
+      result.category_id_hint,
+      result.href,
+      result.page_url,
+      result.page_url_after
+    ),
+  };
+}
+
 async function gotoWithTimeout(page, url, query, sourceUrl, purpose) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageTimeoutMs });
@@ -649,6 +699,89 @@ async function readCategoryPageState(page, expectedParts = []) {
       .replace(/[\uE000-\uF8FF]/g, "")
       .replace(/[\s、，,\/／|｜·•\-]+/g, "")
       .trim();
+    const normalizeId = (value) => {
+      const text = String(value || "").trim();
+      return /^\d{1,32}$/.test(text) ? text : "";
+    };
+    const categoryIdFromValue = (...values) => {
+      for (const value of values) {
+        const raw = String(value || "").trim();
+        if (!raw) continue;
+        const direct = normalizeId(raw);
+        if (direct) return direct;
+        const variants = [raw];
+        try {
+          variants.push(decodeURIComponent(raw));
+        } catch {
+          // Keep the raw value only.
+        }
+        for (const text of variants) {
+          try {
+            const parsed = new URL(text, location.href);
+            for (const [key, candidate] of parsed.searchParams.entries()) {
+              if (["categoryid", "catid", "cateid", "category_id", "cat_id", "cate_id"].includes(key.toLowerCase())) {
+                const normalized = normalizeId(candidate);
+                if (normalized) return normalized;
+              }
+            }
+          } catch {
+            // Non-URL values may still contain a category key below.
+          }
+          const match = text.match(/(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)[^0-9]{0,12}(\d{1,32})/i)
+            || text.match(/[?&#](?:categoryId|catId|cateId|category_id|cat_id|cate_id)=(\d{1,32})/i);
+          if (match) return match[1];
+        }
+      }
+      return "";
+    };
+    const cleanBreadcrumbLabel = (value) => String(value || "")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/^[>›»/|\-\s]+|[>›»/|\-\s]+$/g, "")
+      .trim();
+    const visible = (el) => {
+      if (!el || typeof el.getBoundingClientRect !== "function") return false;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    };
+    const breadcrumbRoots = Array.from(document.querySelectorAll([
+      "nav[aria-label*='breadcrumb' i]",
+      "[class*='breadcrumb' i]",
+      "[class*='crumb' i]",
+      "[data-testid*='breadcrumb' i]",
+      "[data-spm*='breadcrumb' i]",
+    ].join(", "))).filter(visible);
+    const breadcrumbCandidates = breadcrumbRoots.map((root) => {
+      const nodes = Array.from(root.querySelectorAll("a[href], li, span, [itemprop='name']"));
+      const items = [];
+      const seen = new Set();
+      for (const node of nodes) {
+        if (!visible(node)) continue;
+        const name = cleanBreadcrumbLabel(
+          node.innerText
+          || node.textContent
+          || node.getAttribute?.("title")
+          || node.getAttribute?.("aria-label")
+          || ""
+        );
+        if (!name || name.length > 80 || /^(首页|1688|阿里巴巴|全部分类|商品详情)$/.test(name) || seen.has(name)) continue;
+        const href = String(node.getAttribute?.("href") || node.href || "");
+        const categoryId = categoryIdFromValue(
+          node.getAttribute?.("data-category-id"),
+          node.getAttribute?.("data-categoryid"),
+          node.getAttribute?.("data-cat-id"),
+          node.getAttribute?.("data-catid"),
+          node.getAttribute?.("data-cate-id"),
+          node.getAttribute?.("data-cateid"),
+          href
+        );
+        seen.add(name);
+        items.push({ name, category_id: categoryId, href });
+      }
+      return items.slice(0, 10);
+    }).filter((items) => items.length);
+    const breadcrumb = breadcrumbCandidates.sort((a, b) => b.length - a.length)[0] || [];
     const bodyText = compact(document.body?.innerText || "");
     const title = document.title || "";
     const url = location.href;
@@ -662,6 +795,25 @@ async function readCategoryPageState(page, expectedParts = []) {
     const leaf = expected[expected.length - 1] || "";
     const matchedExpectedParts = expected.filter((part) => part && (bodyText.includes(part) || compact(title).includes(part)));
     const anchors = Array.from(document.querySelectorAll(selector));
+    let structuredCategoryId = "";
+    if (leaf) {
+      const scripts = Array.from(document.querySelectorAll("script"))
+        .map((script) => script.textContent || "")
+        .filter((content) => content.includes(leaf) && /categoryId|catId|cateId|category_id/i.test(content))
+        .slice(0, 8);
+      for (const content of scripts) {
+        const leafIndex = content.indexOf(leaf);
+        const windowText = leafIndex >= 0
+          ? content.slice(Math.max(0, leafIndex - 1600), leafIndex + 1600)
+          : content.slice(0, 3200);
+        structuredCategoryId = categoryIdFromValue(windowText);
+        if (structuredCategoryId) break;
+      }
+    }
+    const urlCategoryId = categoryIdFromValue(url);
+    const breadcrumbCategoryId = [...breadcrumb].reverse().map((item) => item.category_id).find(Boolean) || "";
+    const categoryId = urlCategoryId || breadcrumbCategoryId || structuredCategoryId;
+    const categoryBreadcrumb = breadcrumb.map((item) => item.name);
     return {
       page_url: url,
       title,
@@ -669,6 +821,12 @@ async function readCategoryPageState(page, expectedParts = []) {
       leaf_in_url: leaf ? compact(decodedUrl).includes(leaf) : false,
       leaf_in_page: leaf ? bodyText.includes(leaf) || compact(title).includes(leaf) : false,
       matched_expected_parts: matchedExpectedParts,
+      category_id: categoryId,
+      category_path: categoryBreadcrumb.join(">"),
+      category_breadcrumb: categoryBreadcrumb,
+      category_source: categoryBreadcrumb.length
+        ? "result_page_breadcrumb"
+        : (urlCategoryId ? "result_page_url" : (structuredCategoryId ? "result_page_structured_data" : "")),
     };
   }, { expectedParts, selector: productCardSelector }).catch(() => ({
     page_url: page.url(),
@@ -677,6 +835,10 @@ async function readCategoryPageState(page, expectedParts = []) {
     leaf_in_url: false,
     leaf_in_page: false,
     matched_expected_parts: [],
+    category_id: "",
+    category_path: "",
+    category_breadcrumb: [],
+    category_source: "",
   }));
 }
 
@@ -717,6 +879,18 @@ async function clickCategoryPart(page, needleSet, mode = "click") {
       || ""
     );
     const hrefOf = (node) => node.href || node.getAttribute?.("href") || "";
+    const categoryIdHintOf = (node) => {
+      if (!node || typeof node.getAttribute !== "function") return "";
+      const values = [
+        node.getAttribute("data-category-id"),
+        node.getAttribute("data-categoryid"),
+        node.getAttribute("data-cat-id"),
+        node.getAttribute("data-catid"),
+        node.getAttribute("data-cate-id"),
+        node.getAttribute("data-cateid"),
+      ];
+      return values.map((value) => String(value || "").trim()).find((value) => /^\d{1,32}$/.test(value)) || "";
+    };
     const hoverTargetFor = (node) => node.closest?.("li, [class*='category'], [class*='cate'], [class*='menu'], [class*='industry'], [class*='cBox']") || node;
     const clickableFor = (node) => {
       if (mode === "hover") return hoverTargetFor(node);
@@ -754,7 +928,15 @@ async function clickCategoryPart(page, needleSet, mode = "click") {
           + (mode === "hover" && text.length > needle.length && text.includes(needle) ? 18 : 0)
           - Math.max(0, text.length - needle.length);
         if (!best || score > best.score) {
-          best = { node, clickable, href, text, needle, score };
+          best = {
+            node,
+            clickable,
+            href,
+            text,
+            needle,
+            score,
+            categoryIdHint: categoryIdHintOf(clickable) || categoryIdHintOf(node),
+          };
         }
       }
     }
@@ -787,6 +969,7 @@ async function clickCategoryPart(page, needleSet, mode = "click") {
       matched_text: best.text.slice(0, 80),
       matched_needle: best.needle,
       href: best.href || "",
+      category_id_hint: best.categoryIdHint || "",
       score: best.score,
       mode,
       selector: `[data-sop-category-candidate="${marker}"]`,
@@ -804,19 +987,20 @@ async function clickCategoryPart(page, needleSet, mode = "click") {
     missing_text: needleSet[0] || "",
     href: "",
   }));
-  if (!result.ok || !result.selector) return result;
-  const locator = page.locator(result.selector).first();
+  const enrichedResult = withOfficialCategoryId(result);
+  if (!enrichedResult.ok || !enrichedResult.selector) return enrichedResult;
+  const locator = page.locator(enrichedResult.selector).first();
   try {
     await locator.hover({ timeout: Math.min(pageTimeoutMs, 10000) });
     await page.waitForTimeout(jitter([220, 650]));
     if (mode === "click") {
       await locator.click({ timeout: Math.min(pageTimeoutMs, 10000) });
     }
-    return result;
+    return enrichedResult;
   } catch (error) {
     const diagnostics = await collectCategoryDiagnostics(page, needleSet);
     return {
-      ...result,
+      ...enrichedResult,
       ok: false,
       error: error.message || String(error),
       diagnostics,
@@ -831,6 +1015,17 @@ async function clickCategoryLeafLink(page, parts) {
       .replace(/[\s、，,\/／|｜·•\-]+/g, "")
       .trim();
     const hrefOf = (node) => node.href || node.getAttribute?.("href") || "";
+    const categoryIdHintOf = (node) => {
+      if (!node || typeof node.getAttribute !== "function") return "";
+      return [
+        node.getAttribute("data-category-id"),
+        node.getAttribute("data-categoryid"),
+        node.getAttribute("data-cat-id"),
+        node.getAttribute("data-catid"),
+        node.getAttribute("data-cate-id"),
+        node.getAttribute("data-cateid"),
+      ].map((value) => String(value || "").trim()).find((value) => /^\d{1,32}$/.test(value)) || "";
+    };
     const expected = (Array.isArray(parts) ? parts : []).map(compact).filter(Boolean);
     const leaf = expected[expected.length - 1] || "";
     if (!leaf) return { ok: false, missing_text: "" };
@@ -853,13 +1048,16 @@ async function clickCategoryLeafLink(page, parts) {
       const matchedParts = expected.filter((part) => part && context.includes(part));
       if (matchedParts.length < Math.min(expected.length, 2)) continue;
       const score = (exact ? 100 : 70) + matchedParts.length * 20 - Math.max(0, text.length - leaf.length);
-      if (!best || score > best.score) best = { text, href, score, matchedParts };
+      if (!best || score > best.score) {
+        best = { text, href, score, matchedParts, categoryIdHint: categoryIdHintOf(anchor) };
+      }
     }
     if (!best) return { ok: false, missing_text: leaf };
     return {
       ok: true,
       matched_text: best.text || leaf,
       href: best.href,
+      category_id_hint: best.categoryIdHint || "",
       score: best.score,
       mode: "direct_link",
       diagnostics: {
@@ -874,13 +1072,14 @@ async function clickCategoryLeafLink(page, parts) {
     error: error.message || String(error),
     missing_text: parts[parts.length - 1] || "",
   }));
-  if (!result.ok || !result.href) return result;
+  const enrichedResult = withOfficialCategoryId(result);
+  if (!enrichedResult.ok || !enrichedResult.href) return enrichedResult;
   try {
-    await page.goto(result.href, { waitUntil: "domcontentloaded", timeout: Math.min(pageTimeoutMs, 30000) });
-    return result;
+    await page.goto(enrichedResult.href, { waitUntil: "domcontentloaded", timeout: Math.min(pageTimeoutMs, 30000) });
+    return enrichedResult;
   } catch (error) {
     return {
-      ...result,
+      ...enrichedResult,
       ok: false,
       error: error.message || String(error),
     };
@@ -1071,6 +1270,7 @@ async function applyCategoryFilters(page, filters, query) {
       expected_depth: parts.length,
       matched_path: "",
       matched_depth: 0,
+      category_id: "",
       final_url: page.url(),
       category_steps: [],
       diagnostics: {},
@@ -1113,6 +1313,7 @@ async function applyCategoryFilters(page, filters, query) {
           mode: "hover",
           status: applied.ok ? "matched" : (applied.error ? "click_failed" : "not_found"),
           matched_text: normalizeText(applied.matched_text || ""),
+          category_id: applied.category_id || "",
           page_url: page.url(),
           page_url_before: beforeUrl,
           page_url_after: page.url(),
@@ -1129,6 +1330,7 @@ async function applyCategoryFilters(page, filters, query) {
             mode: "direct_link",
             status: leafApplied.ok ? "clicked" : (leafApplied.error ? "click_failed" : "not_found"),
             matched_text: normalizeText(leafApplied.matched_text || ""),
+            category_id: leafApplied.category_id || "",
             page_url: page.url(),
             page_url_before: beforeUrl,
             page_url_after: followed.page?.url?.() || page.url(),
@@ -1162,6 +1364,7 @@ async function applyCategoryFilters(page, filters, query) {
         mode: "click",
         status: applied.ok ? "clicked" : (applied.error ? "click_failed" : "not_found"),
         matched_text: normalizeText(applied.matched_text || ""),
+        category_id: applied.category_id || "",
         page_url: page.url(),
         page_url_before: beforeUrl,
         page_url_after: followed.page?.url?.() || page.url(),
@@ -1190,6 +1393,10 @@ async function applyCategoryFilters(page, filters, query) {
       || categorySteps.slice().reverse().find((step) => step.diagnostics && Object.keys(step.diagnostics).length)?.diagnostics
       || await collectCategoryDiagnostics(page, needleSets[clickedParts.length] || []);
     const confirmed = categoryNavigationConfirmed(navigationState, parts);
+    const resolvedCategoryId = navigationState.category_id
+      || applied.category_id
+      || categorySteps.slice().reverse().map((step) => step.category_id).find(Boolean)
+      || "";
     if (clickedParts.length) {
       applied = {
         ...applied,
@@ -1209,6 +1416,7 @@ async function applyCategoryFilters(page, filters, query) {
         matched_text: normalizeText(applied.matched_text),
         matched_path: normalizeText(applied.matched_text),
         matched_depth: clickedParts.length,
+        category_id: resolvedCategoryId,
         final_url: page.url(),
         category_steps: categorySteps,
         diagnostics: lastDiagnostics,
@@ -1228,6 +1436,7 @@ async function applyCategoryFilters(page, filters, query) {
         matched_text: normalizeText(applied.matched_text || ""),
         matched_path: normalizeText(matchedText || applied.matched_text || ""),
         matched_depth: clickedParts.length,
+        category_id: resolvedCategoryId,
         final_url: page.url(),
         category_steps: categorySteps,
         diagnostics: lastDiagnostics,
@@ -1251,6 +1460,375 @@ async function extractProductsFromCurrentPage(page, maxItems, pageIndex) {
       if (!text) return "";
       if (text.startsWith("//")) return `https:${text}`;
       return text;
+    };
+    const normalizeOfficialCategoryId = (value) => {
+      const text = String(value || "").trim();
+      return /^\d{1,32}$/.test(text) ? text : "";
+    };
+    const extractCategoryId = (...values) => {
+      for (const value of values) {
+        const raw = String(value || "").trim();
+        if (!raw) continue;
+        const direct = normalizeOfficialCategoryId(raw);
+        if (direct) return direct;
+        const variants = [raw];
+        try {
+          variants.push(decodeURIComponent(raw));
+        } catch {
+          // Keep the raw value only.
+        }
+        for (const text of variants) {
+          try {
+            const parsed = new URL(text, location.href);
+            for (const [key, candidate] of parsed.searchParams.entries()) {
+              if (["productcategoryid", "leafcategoryid", "categoryid", "catid", "cateid", "category_id", "cat_id", "cate_id"].includes(key.toLowerCase())) {
+                const normalized = normalizeOfficialCategoryId(candidate);
+                if (normalized) return normalized;
+              }
+            }
+          } catch {
+            // Non-URL values may still contain a category key below.
+          }
+          const match = text.match(/(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)[^0-9]{0,16}(\d{1,32})/i)
+            || text.match(/[?&#](?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)=(\d{1,32})/i);
+          if (match) return match[1];
+        }
+      }
+      return "";
+    };
+    const extractStructuredCategoryId = (value) => {
+      const text = String(value || "");
+      const dataAttribute = text.match(/\b(?:data-product-category-id|data-productcategoryid|data-category-id|data-categoryid|data-cat-id|data-catid|data-cate-id|data-cateid)\s*=\s*["']?(\d{1,32})["']?/i);
+      if (dataAttribute) return normalizeOfficialCategoryId(dataAttribute[1]);
+      const property = text.match(/(?:^|[\[{,;\s])(?:["']?(?:productCategoryId|leafCategoryId|categoryId|catId|cateId|category_id|cat_id|cate_id)["']?)\s*[:=]\s*["']?(\d{1,32})["']?/i);
+      return property ? normalizeOfficialCategoryId(property[1]) : "";
+    };
+    const decodeStructuredString = (value) => String(value || "")
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, code) => String.fromCharCode(Number.parseInt(code, 16)))
+      .replace(/\\\//g, "/")
+      .replace(/\\n|\\r|\\t/g, " ")
+      .replace(/\\(["'])/g, "$1");
+    const cleanCategoryName = (value) => decodeStructuredString(value)
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&gt;|&rsaquo;|&raquo;/gi, ">")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/^[>›»→|\-\s]+|[>›»→|\-\s]+$/g, "")
+      .trim()
+      .slice(0, 120);
+    const normalizeBreadcrumb = (value) => {
+      const rawItems = Array.isArray(value) ? value : [];
+      const names = [];
+      for (const item of rawItems) {
+        const rawName = typeof item === "string"
+          ? item
+          : (item?.name || item?.title || item?.text || item?.label || item?.item?.name || "");
+        const name = cleanCategoryName(rawName);
+        if (!name || /^(首页|1688|阿里巴巴|全部分类|商品详情)$/.test(name)) continue;
+        if (names[names.length - 1] !== name) names.push(name);
+      }
+      return names.slice(0, 10);
+    };
+    const breadcrumbFromPath = (value) => normalizeBreadcrumb(
+      cleanCategoryName(value).split(/\s*(?:>|›|»|→)\s*/).filter(Boolean)
+    );
+    const normalizeCategoryPath = (value) => breadcrumbFromPath(value).join(">");
+    const firstStructuredString = (text, keys, maxLength = 360) => {
+      const source = String(text || "");
+      for (const key of keys) {
+        const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const doubleQuoted = source.match(new RegExp(`"${escaped}"\\s*:\\s*"((?:\\\\.|[^"\\\\]){1,${maxLength}})"`, "i"));
+        if (doubleQuoted) return decodeStructuredString(doubleQuoted[1]);
+        const singleQuoted = source.match(new RegExp(`'${escaped}'\\s*:\\s*'((?:\\\\.|[^'\\\\]){1,${maxLength}})'`, "i"));
+        if (singleQuoted) return decodeStructuredString(singleQuoted[1]);
+      }
+      return "";
+    };
+    const structuredBreadcrumb = (text) => {
+      const source = String(text || "");
+      const match = source.match(/["'](?:productCategoryBreadcrumb|categoryBreadcrumb|breadcrumbs?)["']\s*:\s*(\[[\s\S]{1,2400}?\])/i);
+      if (!match) return [];
+      try {
+        return normalizeBreadcrumb(JSON.parse(match[1]));
+      } catch {
+        const quoted = Array.from(match[1].matchAll(/["']((?:\\.|[^"']){1,120})["']/g)).map((item) => item[1]);
+        return normalizeBreadcrumb(quoted);
+      }
+    };
+    const emptyCategoryEvidence = () => ({
+      category_id: "",
+      category_path: "",
+      category_breadcrumb: [],
+      source: "",
+    });
+    const categoryEvidenceFromText = (text, source) => {
+      const sourceText = String(text || "");
+      const categoryId = extractStructuredCategoryId(sourceText);
+      const structuredPath = firstStructuredString(text, [
+        "productCategoryPath",
+        "categoryPath",
+        "categoryListName",
+        "catPath",
+      ]);
+      const explicitProductName = firstStructuredString(text, [
+        "productCategoryName",
+        "leafCategoryName",
+      ]);
+      const genericCategoryName = firstStructuredString(text, [
+        "categoryName",
+        "catName",
+      ]);
+      const structuredName = explicitProductName || (categoryId ? genericCategoryName : "");
+      let breadcrumb = structuredBreadcrumb(text);
+      let categoryPath = normalizeCategoryPath(structuredPath);
+      if (!breadcrumb.length && categoryPath) breadcrumb = breadcrumbFromPath(categoryPath);
+      if (!categoryPath && breadcrumb.length) categoryPath = breadcrumb.join(">");
+      if (!categoryPath && structuredName) {
+        breadcrumb = normalizeBreadcrumb([structuredName]);
+        categoryPath = breadcrumb.join(">");
+      }
+      if (!categoryId && !categoryPath && !breadcrumb.length) return emptyCategoryEvidence();
+      return {
+        category_id: categoryId,
+        category_path: categoryPath,
+        category_breadcrumb: breadcrumb,
+        source,
+      };
+    };
+    const mergeCategoryEvidence = (...values) => {
+      const candidates = values.filter((item) => item && (
+        item.category_id || item.category_path || (Array.isArray(item.category_breadcrumb) && item.category_breadcrumb.length)
+      ));
+      if (!candidates.length) return emptyCategoryEvidence();
+      const primary = candidates.find((item) => item.category_path || item.category_breadcrumb?.length) || candidates[0];
+      const idCandidate = candidates.find((item) => item.category_id);
+      const pathCandidate = candidates.find((item) => item.category_path || item.category_breadcrumb?.length) || primary;
+      const breadcrumb = normalizeBreadcrumb(
+        pathCandidate.category_breadcrumb?.length
+          ? pathCandidate.category_breadcrumb
+          : breadcrumbFromPath(pathCandidate.category_path)
+      );
+      return {
+        category_id: idCandidate?.category_id || "",
+        category_path: normalizeCategoryPath(pathCandidate.category_path) || breadcrumb.join(">"),
+        category_breadcrumb: breadcrumb,
+        source: primary.source || idCandidate?.source || "",
+      };
+    };
+    const categoryEvidenceFromElement = (root) => {
+      if (!root || typeof root.querySelectorAll !== "function") return emptyCategoryEvidence();
+      const scoped = [root, ...Array.from(root.querySelectorAll([
+        "[data-category-id]",
+        "[data-categoryid]",
+        "[data-cat-id]",
+        "[data-catid]",
+        "[data-cate-id]",
+        "[data-cateid]",
+        "[data-category-path]",
+        "[data-categorypath]",
+        "[data-category-name]",
+        "[data-categoryname]",
+        "[data-product-category-id]",
+        "[data-productcategoryid]",
+        "[data-product-category-path]",
+        "[data-productcategorypath]",
+        "[data-product-category-name]",
+        "[data-productcategoryname]",
+      ].join(", "))).slice(0, 40)];
+      let directId = "";
+      let directPath = "";
+      let directName = "";
+      const serializedValues = [];
+      for (const node of scoped) {
+        directId ||= extractCategoryId(
+          node.getAttribute?.("data-category-id"),
+          node.getAttribute?.("data-categoryid"),
+          node.getAttribute?.("data-cat-id"),
+          node.getAttribute?.("data-catid"),
+          node.getAttribute?.("data-cate-id"),
+          node.getAttribute?.("data-cateid"),
+          node.getAttribute?.("data-product-category-id"),
+          node.getAttribute?.("data-productcategoryid")
+        );
+        directPath ||= node.getAttribute?.("data-category-path")
+          || node.getAttribute?.("data-categorypath")
+          || node.getAttribute?.("data-product-category-path")
+          || node.getAttribute?.("data-productcategorypath")
+          || "";
+        directName ||= node.getAttribute?.("data-category-name")
+          || node.getAttribute?.("data-categoryname")
+          || node.getAttribute?.("data-product-category-name")
+          || node.getAttribute?.("data-productcategoryname")
+          || "";
+        for (const attribute of Array.from(node.attributes || [])) {
+          if (/trace|log/i.test(attribute.name)) continue;
+          const explicitCategoryAttribute = /^(?:data[-_:])?(?:product[-_:]?)?(?:category(?:[-_:]?(?:id|path|name|breadcrumb))?|cat[-_:]?id|cate[-_:]?id)$/i.test(attribute.name);
+          const explicitProductAttribute = /^(?:data[-_:])?(?:product|offer)(?:[-_:]|$)/i.test(attribute.name);
+          const structuredCategoryValue = /productCategoryId|productCategoryPath|productCategoryName|productCategoryBreadcrumb|leafCategoryId|leafCategoryName|categoryId|categoryPath|categoryName|categoryBreadcrumb|catId|cateId/i.test(attribute.value);
+          if (explicitCategoryAttribute || (explicitProductAttribute && structuredCategoryValue)) {
+            serializedValues.push(attribute.value);
+          }
+        }
+      }
+      const directBreadcrumb = breadcrumbFromPath(directPath || directName);
+      const directEvidence = (directId || directBreadcrumb.length)
+        ? {
+          category_id: directId,
+          category_path: directBreadcrumb.join(">"),
+          category_breadcrumb: directBreadcrumb,
+          source: "card_data_attribute",
+        }
+        : emptyCategoryEvidence();
+      let hrefEvidence = emptyCategoryEvidence();
+      const categoryAnchors = Array.from(root.querySelectorAll(
+        "a[href*='categoryId' i], a[href*='catId' i], a[href*='cateId' i], a[href*='category_id' i], a[href*='cat_id' i]"
+      )).slice(0, 12);
+      for (const anchor of categoryAnchors) {
+        const href = anchor.href || anchor.getAttribute?.("href") || "";
+        const categoryId = extractCategoryId(href);
+        if (!categoryId) continue;
+        if (/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(href)) continue;
+        let parsedHref = null;
+        try {
+          parsedHref = new URL(href, location.href);
+        } catch {
+          parsedHref = null;
+        }
+        const linkSemantics = [
+          anchor.getAttribute?.("class"),
+          anchor.getAttribute?.("id"),
+          anchor.getAttribute?.("aria-label"),
+          anchor.getAttribute?.("data-testid"),
+          anchor.getAttribute?.("data-role"),
+          anchor.getAttribute?.("rel"),
+        ].filter(Boolean).join(" ");
+        const categoryPathLink = parsedHref
+          ? /\/(?:category|catalog|cate)(?:\/|\.|$)/i.test(parsedHref.pathname)
+          : false;
+        const categorySearchLink = parsedHref
+          ? parsedHref.hostname === "s.1688.com" && /selloffer|offer_search/i.test(parsedHref.pathname)
+          : false;
+        const semanticCategoryLink = /category|breadcrumb|crumb|(?:^|[-_:\s])cate(?:[-_:\s]|$)/i.test(linkSemantics);
+        if (!categoryPathLink && !categorySearchLink && !semanticCategoryLink) continue;
+        const name = cleanCategoryName(anchor.innerText || anchor.textContent || anchor.getAttribute?.("title") || anchor.getAttribute?.("aria-label") || "");
+        if (!name || name.length > 60 || /^(更多|查看更多|全部|进入|搜索|商品|详情)$/.test(name)) continue;
+        const breadcrumb = normalizeBreadcrumb(name ? [name] : []);
+        if (!breadcrumb.length) continue;
+        hrefEvidence = {
+          category_id: categoryId,
+          category_path: breadcrumb.join(">"),
+          category_breadcrumb: breadcrumb,
+          source: "card_category_href",
+        };
+        break;
+      }
+      const serializedEvidence = serializedValues
+        .map((value) => categoryEvidenceFromText(value, "card_structured_data"))
+        .find((item) => item.category_id || item.category_path || item.category_breadcrumb.length)
+        || emptyCategoryEvidence();
+      return mergeCategoryEvidence(directEvidence, hrefEvidence, serializedEvidence);
+    };
+    const structuredScripts = Array.from(document.querySelectorAll("script"))
+      .map((script) => script.textContent || "")
+      .filter((content) => /categoryId|catId|cateId|categoryPath|categoryListName|categoryBreadcrumb/i.test(content))
+      .slice(0, 24);
+    const structuredCategoryForOffer = (offerId, source = "card_structured_data") => {
+      if (!offerId) return emptyCategoryEvidence();
+      for (const content of structuredScripts) {
+        let index = content.indexOf(offerId);
+        let attempts = 0;
+        while (index >= 0 && attempts < 3) {
+          const windowText = content.slice(Math.max(0, index - 1400), index + 1800);
+          const evidence = categoryEvidenceFromText(windowText, source);
+          if (evidence.category_id || evidence.category_path || evidence.category_breadcrumb.length) return evidence;
+          index = content.indexOf(offerId, index + offerId.length);
+          attempts += 1;
+        }
+      }
+      return emptyCategoryEvidence();
+    };
+    const jsonLdBreadcrumbEvidence = () => {
+      const findBreadcrumbLists = (value, output = []) => {
+        if (!value || typeof value !== "object") return output;
+        if (Array.isArray(value)) {
+          value.forEach((item) => findBreadcrumbLists(item, output));
+          return output;
+        }
+        const type = String(value["@type"] || value.type || "");
+        if (/BreadcrumbList/i.test(type)) output.push(value);
+        Object.values(value).forEach((item) => findBreadcrumbLists(item, output));
+        return output;
+      };
+      for (const script of Array.from(document.querySelectorAll("script[type='application/ld+json']")).slice(0, 12)) {
+        try {
+          const parsed = JSON.parse(script.textContent || "null");
+          for (const list of findBreadcrumbLists(parsed)) {
+            const elements = Array.isArray(list.itemListElement) ? list.itemListElement : [];
+            const sorted = [...elements].sort((a, b) => Number(a?.position || 0) - Number(b?.position || 0));
+            const categoryElements = [...sorted];
+            const productEntry = categoryElements[categoryElements.length - 1] || {};
+            const productEntryUrl = typeof productEntry.item === "string"
+              ? productEntry.item
+              : (productEntry.item?.["@id"] || productEntry.item?.url || productEntry.url || "");
+            if (/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(String(productEntryUrl || ""))) {
+              categoryElements.pop();
+            }
+            const breadcrumb = normalizeBreadcrumb(categoryElements.map((entry) => (
+              entry?.name || entry?.item?.name || entry?.item?.title || ""
+            )));
+            if (!breadcrumb.length) continue;
+            const last = categoryElements[categoryElements.length - 1] || {};
+            const itemUrl = typeof last.item === "string" ? last.item : (last.item?.["@id"] || last.item?.url || last.url || "");
+            return {
+              category_id: extractCategoryId(itemUrl),
+              category_path: breadcrumb.join(">"),
+              category_breadcrumb: breadcrumb,
+              source: "detail_json_ld_breadcrumb",
+            };
+          }
+        } catch {
+          // Ignore malformed JSON-LD and continue with visible DOM evidence.
+        }
+      }
+      return emptyCategoryEvidence();
+    };
+    const domBreadcrumbEvidence = () => {
+      const roots = Array.from(document.querySelectorAll([
+        "nav[aria-label*='breadcrumb' i]",
+        "[class*='breadcrumb' i]",
+        "[class*='crumb' i]",
+        "[data-testid*='breadcrumb' i]",
+      ].join(", "))).filter((node) => visible(node));
+      let best = null;
+      for (const root of roots) {
+        const nodes = Array.from(root.querySelectorAll("a[href], li, span, [itemprop='name']")).slice(0, 30);
+        const breadcrumbNodes = nodes.filter(visible).filter((node) => {
+          const href = String(node.href || node.getAttribute?.("href") || "");
+          return !/detail\.(m\.)?1688\.com|\/offer\/\d+/i.test(href);
+        });
+        const breadcrumb = normalizeBreadcrumb(breadcrumbNodes.map((node) => (
+          node.innerText || node.textContent || node.getAttribute?.("title") || ""
+        )));
+        const lastName = breadcrumb[breadcrumb.length - 1] || "";
+        if (lastName.length >= 18 && cleanCategoryName(document.title).includes(lastName)) breadcrumb.pop();
+        if (!breadcrumb.length) continue;
+        const categoryId = breadcrumbNodes.map((node) => extractCategoryId(
+          node.getAttribute?.("data-category-id"),
+          node.getAttribute?.("data-categoryid"),
+          node.getAttribute?.("data-cat-id"),
+          node.getAttribute?.("data-catid"),
+          node.href,
+          node.getAttribute?.("href")
+        )).filter(Boolean).at(-1) || "";
+        const candidate = {
+          category_id: categoryId,
+          category_path: breadcrumb.join(">"),
+          category_breadcrumb: breadcrumb,
+          source: "detail_dom_breadcrumb",
+        };
+        if (!best || candidate.category_breadcrumb.length > best.category_breadcrumb.length) best = candidate;
+      }
+      return best || emptyCategoryEvidence();
     };
     const looksLikeMojibake = (value) => {
       const text = String(value || "");
@@ -1340,6 +1918,11 @@ async function extractProductsFromCurrentPage(page, maxItems, pageIndex) {
 
     if (detailId && /detail\.(m\.)?1688\.com/.test(pageUrl)) {
       const bodyText = normalize(document.body?.innerText || "");
+      const productCategoryEvidence = mergeCategoryEvidence(
+        jsonLdBreadcrumbEvidence(),
+        domBreadcrumbEvidence(),
+        structuredCategoryForOffer(detailId, "detail_structured_data")
+      );
       const titleNode = document.querySelector("h1, [class*='title'], [title]");
       const title = cleanTitle(
         titleNode?.getAttribute?.("title")
@@ -1358,7 +1941,13 @@ async function extractProductsFromCurrentPage(page, maxItems, pageIndex) {
         stats: {
           rawText: bodyText.slice(0, 500),
           rawHref: pageUrl,
-          categoryListName: "",
+          categoryId: productCategoryEvidence.category_id,
+          categoryName: productCategoryEvidence.category_breadcrumb.at(-1) || "",
+          categoryListName: productCategoryEvidence.category_path,
+          productCategoryId: productCategoryEvidence.category_id,
+          productCategoryPath: productCategoryEvidence.category_path,
+          productCategoryBreadcrumb: productCategoryEvidence.category_breadcrumb,
+          productCategorySource: productCategoryEvidence.source,
           pageIndex,
         },
       });
@@ -1407,6 +1996,10 @@ async function extractProductsFromCurrentPage(page, maxItems, pageIndex) {
       if (!title || title.length < 4) continue;
 
       const rawHref = normalizeUrl(hrefCandidates.find((item) => /detail|offerId|offerIds|offer\//i.test(String(item))) || "");
+      const productCategoryEvidence = mergeCategoryEvidence(
+        categoryEvidenceFromElement(root),
+        structuredCategoryForOffer(id)
+      );
       seen.add(id);
       rows.push({
         id,
@@ -1417,7 +2010,13 @@ async function extractProductsFromCurrentPage(page, maxItems, pageIndex) {
         stats: {
           rawText: normalize(rootText).slice(0, 500),
           rawHref,
-          categoryListName: "",
+          categoryId: productCategoryEvidence.category_id,
+          categoryName: productCategoryEvidence.category_breadcrumb.at(-1) || "",
+          categoryListName: productCategoryEvidence.category_path,
+          productCategoryId: productCategoryEvidence.category_id,
+          productCategoryPath: productCategoryEvidence.category_path,
+          productCategoryBreadcrumb: productCategoryEvidence.category_breadcrumb,
+          productCategorySource: productCategoryEvidence.source,
           pageIndex,
         },
       });
@@ -1591,6 +2190,7 @@ try {
         expected_depth: parts.length,
         matched_path: "",
         matched_depth: 0,
+        category_id: "",
         final_url: page.url(),
         status: "manual_skipped",
         message: "人工页面读取模式不自动点击 1688 类目；请确认当前 1688 页面已由人工进入对应类目。",
@@ -1648,6 +2248,9 @@ try {
     : {};
   const collectResult = await collectProductsAcrossPages(page, limit, query, sourceUrl, categoryContext);
   const products = collectResult.products;
+  const navigationCategoryId = categoryResults
+    .map((record) => String(record.category_id || record.navigation_state?.category_id || "").trim())
+    .find(Boolean) || "";
 
   const latestText = await readBodyText(page, pageText);
   if (looksLikeBlockedPage(latestText, page.url())) {
@@ -1675,6 +2278,7 @@ try {
     query,
     source_url: sourceUrl,
     page_url: page.url(),
+    category_id: navigationCategoryId,
     max_pages: maxResultPages,
     page_meta: collectResult.page_meta,
     filter_results: filterResults,

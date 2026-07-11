@@ -79,6 +79,9 @@ VERIFICATION_STATUS_VERIFIED = "verified"
 VERIFICATION_STATUS_PARTIAL = "partial_verified"
 VERIFICATION_STATUS_FAILED = "failed"
 VERIFICATION_STATUS_FILTERED_OUT = "filtered_out"
+CATEGORY_MATCH_MATCHED = "matched"
+CATEGORY_MATCH_MISMATCHED = "mismatched"
+CATEGORY_MATCH_UNKNOWN = "unknown"
 SECURITY_BLOCK_CODE = "security_verification_required"
 LOGIN_REQUIRED_CODE = "login_required"
 SEARCH_KEYWORD_ENCODING_CODE = "search_keyword_encoding_error"
@@ -546,6 +549,14 @@ def _rejection_record(
         "url": row.get("url", ""),
         "title": row.get("title", ""),
         "category_path": row.get("category_path", ""),
+        "selected_category_id": row.get("selected_category_id", ""),
+        "selected_category_path": row.get("selected_category_path", ""),
+        "product_category_id": row.get("product_category_id", ""),
+        "product_category_path": row.get("product_category_path", ""),
+        "category_match_status": row.get("category_match_status", ""),
+        "category_match_reason": row.get("category_match_reason", ""),
+        "category_match_source": row.get("category_match_source", ""),
+        "category_match_evidence": row.get("category_match_evidence", {}),
         "reason_code": reason_code,
         "reason_text": reason_text,
         "target_platform": target_platform,
@@ -2138,28 +2149,312 @@ def _category_leaf_token_groups(category: str) -> List[List[str]]:
     return clean_groups
 
 
-def _product_matches_selected_category(product: Product, category_path: str) -> Tuple[bool, str]:
-    if not category_path:
-        return True, "no_category_filter"
-    stats = product.stats or {}
-    evidence = " ".join(
-        [product.title or ""] + [
-        str(stats.get(key) or "")
-        for key in ("categoryListName", "categoryName", "rawText")
-        ]
+def _category_evidence_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ">".join(str(item or "").strip() for item in value if str(item or "").strip())
+    if isinstance(value, dict):
+        return ">".join(str(item or "").strip() for item in value.values() if str(item or "").strip())
+    return str(value or "").strip()
+
+
+def _official_category_id(value: Any) -> str:
+    """只接受 1688 页面上的数字类目 ID，排除本地字典 l1_... 节点 ID。"""
+    text = html_lib.unescape(_category_evidence_value(value))
+    if not text or text.lower().startswith("l1_"):
+        return ""
+    if re.fullmatch(r"\d+", text):
+        return text
+    match = re.search(
+        r"(?:categoryId|category_id|catId|cateId)(?:\s*[=:]\s*|%3[Dd])['\"]?(\d+)",
+        text,
+        flags=re.I,
     )
-    evidence_norm = _normalize_category_path_text(evidence)
+    return match.group(1) if match else ""
+
+
+def _first_category_stat(stats: Dict[str, Any], keys: Iterable[str]) -> str:
+    for key in keys:
+        value = _category_evidence_value(stats.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _product_category_evidence(stats: Dict[str, Any]) -> Dict[str, str]:
+    product_category_id = ""
+    for key in (
+        "productCategoryId",
+        "product_category_id",
+        "categoryId",
+        "category_id",
+        "catId",
+        "cateId",
+    ):
+        product_category_id = _official_category_id(stats.get(key))
+        if product_category_id:
+            break
+    product_category_path = _first_category_stat(stats, (
+        "productCategoryPath",
+        "product_category_path",
+        "categoryPath",
+        "category_path",
+        "categoryListName",
+        "categoryName",
+    ))
+    breadcrumb = _first_category_stat(stats, (
+        "productCategoryBreadcrumb",
+        "product_category_breadcrumb",
+        "categoryBreadcrumb",
+        "category_breadcrumb",
+    ))
+    if not product_category_path:
+        product_category_path = breadcrumb
+    source = _first_category_stat(stats, (
+        "productCategorySource",
+        "categoryEvidenceSource",
+        "category_evidence_source",
+    ))
+    if not source:
+        source = "product_category_id" if product_category_id else ("product_category_path" if product_category_path else "")
+    return {
+        "product_category_id": product_category_id,
+        "product_category_path": product_category_path,
+        "product_category_breadcrumb": breadcrumb,
+        "product_category_source": source,
+    }
+
+
+def _category_segment_tokens(value: Any) -> List[str]:
+    return _dedupe_strings(
+        _normalize_category_path_text(part)
+        for part in re.split(r"[、/／,，|｜]+", str(value or ""))
+        if _normalize_category_path_text(part)
+    )
+
+
+def _category_segments_match(left: Any, right: Any) -> bool:
+    left_text = _normalize_category_path_text(left)
+    right_text = _normalize_category_path_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    left_tokens = _category_segment_tokens(left)
+    right_tokens = _category_segment_tokens(right)
+    for left_token in left_tokens or [left_text]:
+        for right_token in right_tokens or [right_text]:
+            if left_token == right_token:
+                return True
+            shorter = left_token if len(left_token) <= len(right_token) else right_token
+            longer = right_token if shorter == left_token else left_token
+            if len(shorter) >= 2 and shorter in longer:
+                return True
+    compact_left = re.sub(r"[>、/／,，|｜]", "", left_text)
+    compact_right = re.sub(r"[>、/／,，|｜]", "", right_text)
+    shorter = compact_left if len(compact_left) <= len(compact_right) else compact_right
+    longer = compact_right if shorter == compact_left else compact_left
+    return len(shorter) >= 4 and shorter in longer
+
+
+def _compare_structured_category_paths(selected_category_path: str, product_category_path: str) -> Optional[bool]:
+    selected_parts = _category_parts(selected_category_path)
+    product_parts = _category_parts(product_category_path)
+    if not selected_parts or not product_parts:
+        return None
+    if _category_segments_match(selected_parts[-1], product_parts[-1]):
+        return True
+    if len(selected_parts) == 1 and _category_segments_match(selected_parts[0], product_parts[0]):
+        return True
+    prefix_size = min(len(selected_parts), len(product_parts))
+    prefix_matches = all(
+        _category_segments_match(selected_parts[index], product_parts[index])
+        for index in range(prefix_size)
+    )
+    if prefix_matches:
+        if len(selected_parts) <= len(product_parts):
+            return True
+        return None
+    if len(product_parts) < len(selected_parts) and any(
+        _category_segments_match(product_parts[-1], selected_part)
+        for selected_part in selected_parts[:-1]
+    ):
+        return None
+    return False
+
+
+def _title_matches_selected_category(title: str, category_path: str) -> Tuple[bool, str]:
+    evidence_norm = _normalize_category_path_text(title)
     if not evidence_norm:
         return False, "missing_product_category_evidence"
     terms = _category_match_terms(category_path)
-    if not terms:
-        return True, "no_category_terms"
     if any(term and term in evidence_norm for term in terms):
-        return True, "matched_product_category_evidence"
+        return True, "matched_product_category_title"
     for group in _category_leaf_token_groups(category_path):
         if all(token in evidence_norm for token in group):
             return True, "matched_product_category_leaf_tokens"
-    return False, "product_category_mismatch"
+    return False, "missing_product_category_evidence"
+
+
+def _evaluate_product_category(
+    product: Product,
+    selected_category_path: str,
+    selected_category_id: str = "",
+) -> Dict[str, Any]:
+    stats = product.stats or {}
+    selected_path = str(selected_category_path or "").strip()
+    selected_id = _official_category_id(selected_category_id)
+    product_evidence = _product_category_evidence(stats)
+    product_id = product_evidence["product_category_id"]
+    product_path = product_evidence["product_category_path"]
+    evidence = {
+        "selected_category_id": selected_id,
+        "selected_category_path": selected_path,
+        "product_category_id": product_id,
+        "product_category_path": product_path,
+        "product_category_breadcrumb": product_evidence["product_category_breadcrumb"],
+        "product_category_source": product_evidence["product_category_source"],
+        "title": product.title or "",
+    }
+
+    def result(status: str, reason: str, source: str, confidence: str) -> Dict[str, Any]:
+        return {
+            "status": status,
+            "reason": reason,
+            "source": source,
+            "confidence": confidence,
+            "selected_category_id": selected_id,
+            "selected_category_path": selected_path,
+            "product_category_id": product_id,
+            "product_category_path": product_path,
+            "product_category_breadcrumb": product_evidence["product_category_breadcrumb"],
+            "evidence": evidence,
+        }
+
+    if not selected_path and not selected_id:
+        return result(CATEGORY_MATCH_MATCHED, "no_category_filter", "none", "high")
+    id_conflict = bool(selected_id and product_id and selected_id != product_id)
+    path_match = (
+        _compare_structured_category_paths(selected_path, product_path)
+        if selected_path and product_path
+        else None
+    )
+    if selected_id and product_id:
+        if selected_id == product_id:
+            if path_match is False:
+                return result(CATEGORY_MATCH_UNKNOWN, "conflicting_category_id_and_path", "path", "low")
+            return result(CATEGORY_MATCH_MATCHED, "matched_product_category_id", "id", "high")
+    if path_match is not None:
+        if path_match is True:
+            reason = "matched_product_category_path_despite_id_conflict" if id_conflict else "matched_product_category_path"
+            return result(CATEGORY_MATCH_MATCHED, reason, "path", "high")
+        if path_match is False:
+            return result(CATEGORY_MATCH_MISMATCHED, "product_category_mismatch", "path", "high")
+    if id_conflict:
+        return result(CATEGORY_MATCH_UNKNOWN, "conflicting_category_ids_require_path", "id", "low")
+    if selected_path:
+        title_match, title_reason = _title_matches_selected_category(product.title or "", selected_path)
+        if title_match:
+            return result(CATEGORY_MATCH_MATCHED, title_reason, "title", "medium")
+        if _category_has_children(selected_path):
+            return result(CATEGORY_MATCH_MATCHED, "broad_category_filter", "none", "low")
+    return result(CATEGORY_MATCH_UNKNOWN, "missing_product_category_evidence", "none", "low")
+
+
+def _product_matches_selected_category(product: Product, category_path: str) -> Tuple[bool, str]:
+    """兼容旧调用；新采集链使用三态 evaluator，unknown 不再等同 mismatch。"""
+    evaluation = _evaluate_product_category(product, category_path)
+    return evaluation["status"] == CATEGORY_MATCH_MATCHED, str(evaluation["reason"])
+
+
+def _selected_category_for_product(categories: List[str], product: Product) -> str:
+    stats = product.stats or {}
+    explicit = _first_category_stat(stats, ("selectedCategoryPath", "selected_category_path"))
+    if explicit:
+        return explicit
+    product_path = _product_category_evidence(stats)["product_category_path"]
+    if product_path:
+        for category in categories:
+            if _compare_structured_category_paths(category, product_path) is True:
+                return category
+    for category in categories:
+        if _title_matches_selected_category(product.title or "", category)[0]:
+            return category
+    return categories[0] if categories else ""
+
+
+def _selected_category_id_for_product(product: Product) -> str:
+    stats = product.stats or {}
+    for key in (
+        "selectedCategoryId",
+        "selected_category_id",
+        "navigationCategoryId",
+        "navigation_category_id",
+    ):
+        category_id = _official_category_id(stats.get(key))
+        if category_id:
+            return category_id
+    return ""
+
+
+def _apply_category_evaluation_to_row(
+    row: Dict[str, Any],
+    evaluation: Dict[str, Any],
+    stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    stats = stats or {}
+    status = str(evaluation.get("status") or CATEGORY_MATCH_UNKNOWN)
+    product_path = str(evaluation.get("product_category_path") or "")
+    selected_path = str(evaluation.get("selected_category_path") or "")
+    row.update({
+        "selected_category_id": str(evaluation.get("selected_category_id") or ""),
+        "selected_category_path": selected_path,
+        "navigation_category_id": _first_category_stat(stats, ("navigationCategoryId", "navigation_category_id")),
+        "navigation_category_path": _first_category_stat(stats, ("navigationCategoryPath", "navigation_category_path")) or selected_path,
+        "navigation_category_url": _first_category_stat(stats, ("navigationCategoryUrl", "navigation_category_url")),
+        "product_category_id": str(evaluation.get("product_category_id") or ""),
+        "product_category_path": product_path,
+        "product_category_breadcrumb": str(evaluation.get("product_category_breadcrumb") or ""),
+        "category_match_status": status,
+        "category_match_reason": str(evaluation.get("reason") or ""),
+        "category_match_source": str(evaluation.get("source") or "none"),
+        "category_match_confidence": str(evaluation.get("confidence") or "low"),
+        "category_match_evidence": evaluation.get("evidence") if isinstance(evaluation.get("evidence"), dict) else {},
+    })
+    if product_path:
+        row["category_path"] = product_path
+        row["category_path_source"] = "product_category_evidence"
+    elif status == CATEGORY_MATCH_MATCHED and selected_path:
+        row["category_path"] = selected_path
+        row["category_path_source"] = "selected_category_inferred"
+    else:
+        row["category_path"] = ""
+        row["category_path_source"] = "missing_product_category_evidence"
+    if status == CATEGORY_MATCH_UNKNOWN:
+        row["data_gap_risk"] = "商品类目待详情页核验"
+    elif status == CATEGORY_MATCH_MISMATCHED:
+        row["data_gap_risk"] = "商品类目与所选类目不匹配"
+    return row
+
+
+def _category_match_record(row: Dict[str, Any], *, stage: str) -> Dict[str, Any]:
+    return {
+        "item_id": row.get("item_id", ""),
+        "title": row.get("title", ""),
+        "url": row.get("url", ""),
+        "stage": stage,
+        "status": row.get("category_match_status", CATEGORY_MATCH_UNKNOWN),
+        "reason": row.get("category_match_reason", ""),
+        "source": row.get("category_match_source", "none"),
+        "confidence": row.get("category_match_confidence", "low"),
+        "selected_category_id": row.get("selected_category_id", ""),
+        "selected_category_path": row.get("selected_category_path", ""),
+        "product_category_id": row.get("product_category_id", ""),
+        "product_category_path": row.get("product_category_path", ""),
+        "category_verification_status": row.get("category_verification_status", ""),
+        "category_verification_attempts": row.get("category_verification_attempts", 0),
+        "evidence": row.get("category_match_evidence", {}),
+        "evaluated_at": _now_iso(),
+    }
 
 
 def _category_native_filter(category: str, index: int) -> Dict[str, Any]:
@@ -2800,6 +3095,8 @@ def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, sour
             "expected_depth",
             "matched_depth",
             "final_url",
+            "category_id",
+            "navigation_state",
             "missing_text",
             "category_steps",
             "diagnostics",
@@ -2837,6 +3134,55 @@ def _normalize_filter_results(results: Any, filter_plan: Dict[str, Any], *, sour
         for spec in missing
     ])
     return [record for record in normalized if record.get("filter_key") or record.get("label") or planned_keys]
+
+
+def _category_id_from_filter_record(record: Dict[str, Any]) -> str:
+    category_id = _official_category_id(record.get("category_id"))
+    if category_id:
+        return category_id
+    steps = record.get("category_steps")
+    if isinstance(steps, list):
+        for step in reversed(steps):
+            if not isinstance(step, dict):
+                continue
+            for key in ("category_id", "href", "url"):
+                category_id = _official_category_id(step.get(key))
+                if category_id:
+                    return category_id
+    for key in ("final_url", "page_url"):
+        category_id = _official_category_id(record.get(key))
+        if category_id:
+            return category_id
+    return ""
+
+
+def _category_navigation_evidence(
+    filter_results: List[Dict[str, Any]],
+    fallback_path: str,
+) -> Dict[str, str]:
+    candidates = [
+        record for record in filter_results
+        if isinstance(record, dict) and (
+            record.get("source") == "1688_category_navigation"
+            or record.get("matched_path")
+            or record.get("expected_path")
+        )
+    ]
+    record = candidates[-1] if candidates else {}
+    matched_path = str(
+        record.get("matched_path")
+        or record.get("expected_path")
+        or fallback_path
+        or ""
+    ).strip()
+    navigation_url = str(record.get("final_url") or record.get("page_url") or "")
+    return {
+        "selected_category_id": _category_id_from_filter_record(record),
+        "selected_category_path": matched_path,
+        "navigation_category_id": _category_id_from_filter_record(record),
+        "navigation_category_path": matched_path,
+        "navigation_category_url": navigation_url,
+    }
 
 
 def _blocking_category_result(filter_results: List[Dict[str, Any]], filter_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2903,6 +3249,11 @@ def _row_pending_detail_fields(row: Dict[str, Any], fields: Optional[Iterable[st
 
 def is_publishable_row(row: Dict[str, Any], *, include_cautious: bool = False) -> bool:
     suggestions = PUBLISHABLE_CANDIDATE_SUGGESTIONS if include_cautious else PUBLISHABLE_SUGGESTIONS
+    category_status = str(row.get("category_match_status") or "")
+    if category_status in (CATEGORY_MATCH_UNKNOWN, CATEGORY_MATCH_MISMATCHED):
+        return False
+    if row.get("selected_category_path") and category_status != CATEGORY_MATCH_MATCHED:
+        return False
     if row.get("wechat_shop_suggestion") not in suggestions:
         return False
     if row.get("filter_verification_status") == "filtered_out":
@@ -2979,6 +3330,9 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     candidate_scan_limit = _candidate_scan_limit(config)
     seen: set[str] = set()
     rows: List[Dict[str, Any]] = []
+    category_unknown_rows: List[Dict[str, Any]] = []
+    category_match_records: List[Dict[str, Any]] = []
+    category_excluded_rows: List[Dict[str, Any]] = []
     filter_results: List[Dict[str, Any]] = []
     rejected_records: List[Dict[str, Any]] = []
     skipped_rejected_records: List[Dict[str, Any]] = []
@@ -3034,8 +3388,19 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                     blocking_category = _blocking_category_result(current_filter_results, job_plan)
                     if blocking_category:
                         _raise_category_navigation_failed(blocking_category)
+                navigation_evidence = _category_navigation_evidence(current_filter_results, job_category_path)
                 for item in raw_products if isinstance(raw_products, list) else []:
-                    stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+                    stats = dict(item.get("stats")) if isinstance(item.get("stats"), dict) else {}
+                    if navigation_evidence["selected_category_path"]:
+                        stats.setdefault("selectedCategoryPath", navigation_evidence["selected_category_path"])
+                    if navigation_evidence["selected_category_id"]:
+                        stats.setdefault("selectedCategoryId", navigation_evidence["selected_category_id"])
+                    if navigation_evidence["navigation_category_path"]:
+                        stats.setdefault("navigationCategoryPath", navigation_evidence["navigation_category_path"])
+                    if navigation_evidence["navigation_category_id"]:
+                        stats.setdefault("navigationCategoryId", navigation_evidence["navigation_category_id"])
+                    if navigation_evidence["navigation_category_url"]:
+                        stats.setdefault("navigationCategoryUrl", navigation_evidence["navigation_category_url"])
                     product = Product(
                         id=str(item.get("id", "")),
                         title=_clean_product_title(item.get("title", "")),
@@ -3046,16 +3411,11 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                     )
                     if not product.id.strip() or not product.title:
                         continue
-                    matches_category, category_reason = _product_matches_selected_category(product, job_category_path)
-                    if not matches_category:
-                        rejected_records.append(_rejection_record(
-                            product_to_export_row(product, job_query, config),
-                            reason_code=category_reason,
-                            reason_text="商品级类目证据未匹配所选1688类目",
-                            filter_signature=filter_signature,
-                            target_platform=target_platform,
-                        ))
-                        continue
+                    stats["_categoryMatchEvaluation"] = _evaluate_product_category(
+                        product,
+                        navigation_evidence["selected_category_path"] or job_category_path,
+                        navigation_evidence["selected_category_id"],
+                    )
                     products.append(product)
         for product in products:
             product_id = _canonical_item_id(product.id, product.url)
@@ -3073,7 +3433,33 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
             if historical_rejected:
                 skipped_rejected_records.append(_skip_record_from_product(product, historical_rejected))
                 continue
-            row = product_to_export_row(product, query, config)
+            stats = product.stats if isinstance(product.stats, dict) else {}
+            evaluation = stats.get("_categoryMatchEvaluation") if isinstance(stats.get("_categoryMatchEvaluation"), dict) else None
+            if not evaluation:
+                selected_category_path = "" if config.sample_data else _selected_category_for_product(config.categories, product)
+                evaluation = _evaluate_product_category(
+                    product,
+                    selected_category_path,
+                    _selected_category_id_for_product(product),
+                )
+            row = product_to_export_row(product, query, config, category_evaluation=evaluation)
+            category_match_records.append(_category_match_record(row, stage="list"))
+            if row.get("category_match_status") == CATEGORY_MATCH_MISMATCHED:
+                row["filter_verification_status"] = "filtered_out"
+                row["filter_verification_note"] = "商品级结构化类目证据与所选1688类目不一致"
+                row["verification_status"] = VERIFICATION_STATUS_FILTERED_OUT
+                row["manual_review_status"] = "系统剔除"
+                row["manual_wechat_shop_suggestion"] = "不建议"
+                row["exclusion_type"] = "category_mismatch"
+                category_excluded_rows.append(row)
+                rejected_records.append(_rejection_record(
+                    row,
+                    reason_code="product_category_mismatch",
+                    reason_text=row["filter_verification_note"],
+                    filter_signature=filter_signature,
+                    target_platform=target_platform,
+                ))
+                continue
             keep_by_filters, post_records = _evaluate_post_filters(row, filter_plan.get("post_filters", []))
             row["filter_match_records"] = post_records
             if not keep_by_filters:
@@ -3094,14 +3480,20 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
                     target_platform=target_platform,
                 ))
                 continue
-            rows.append(row)
+            if row.get("category_match_status") == CATEGORY_MATCH_UNKNOWN:
+                category_unknown_rows.append(row)
+            else:
+                rows.append(row)
             if len(_publishable_rows(rows)) >= config.target_publishable_count:
                 break
         if len(_publishable_rows(rows)) >= config.target_publishable_count:
             break
 
     ranked = sorted(rows, key=lambda item: item["recommendation_score"], reverse=True)
+    ranked_unknown = sorted(category_unknown_rows, key=lambda item: item["recommendation_score"], reverse=True)
     for index, row in enumerate(ranked, 1):
+        row["seq"] = index
+    for index, row in enumerate(ranked_unknown, 1):
         row["seq"] = index
     filter_plan["filter_results"] = filter_results
     filter_plan["filter_warnings"] = [
@@ -3119,6 +3511,11 @@ def collect_products(config: TagCollectInput) -> Tuple[List[Dict[str, Any]], Lis
     filter_plan["candidate_scan_limit"] = candidate_scan_limit
     filter_plan["rejection_records"] = rejected_records
     filter_plan["rejected_count"] = len(rejected_records)
+    filter_plan["category_unknown_rows"] = ranked_unknown
+    filter_plan["category_unknown_count"] = len(ranked_unknown)
+    filter_plan["category_match_records"] = category_match_records
+    filter_plan["filter_excluded_rows"] = category_excluded_rows
+    filter_plan["filter_excluded_count"] = len(category_excluded_rows)
     filter_plan["skipped_rejected_records"] = skipped_rejected_records
     filter_plan["skipped_rejected_count"] = len(skipped_rejected_records)
     filter_plan["persistent_excluded_count"] = len(skipped_rejected_records)
@@ -3622,6 +4019,93 @@ def _refresh_metric_buckets(row: Dict[str, Any]) -> None:
     row["monthly_dropship_orders_bucket"] = metric_bucket("monthly_dropship_orders", row.get("monthly_dropship_orders", ""))
 
 
+def _reconcile_category_rows_after_verification(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    matched_rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+    unknown_rows = [row for row in payload.get("category_unknown_rows", []) if isinstance(row, dict)]
+    candidates: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in [*matched_rows, *unknown_rows]:
+        item_id = _canonical_item_id(row.get("item_id"), row.get("url"))
+        if item_id and item_id in seen_ids:
+            continue
+        if item_id:
+            seen_ids.add(item_id)
+        candidates.append(row)
+
+    kept_rows: List[Dict[str, Any]] = []
+    pending_rows: List[Dict[str, Any]] = []
+    existing_excluded = [row for row in payload.get("filter_excluded_rows", []) if isinstance(row, dict)]
+    existing_ids = {
+        _canonical_item_id(row.get("item_id"), row.get("url"))
+        for row in existing_excluded
+    }
+    newly_excluded: List[Dict[str, Any]] = []
+    persistent_records: List[Dict[str, Any]] = []
+    filter_signature = str(payload.get("filter_signature") or _filter_signature_for_payload(payload))
+    target_platform = str(payload.get("target_platform") or _target_platform_from_tags(payload.get("tags") or []))
+
+    for row in candidates:
+        status = str(row.get("category_match_status") or CATEGORY_MATCH_UNKNOWN)
+        if status == CATEGORY_MATCH_MATCHED:
+            kept_rows.append(row)
+            continue
+        if status == CATEGORY_MATCH_UNKNOWN:
+            row["data_gap_risk"] = "商品类目待详情页核验"
+            apply_auto_review_status(row)
+            pending_rows.append(row)
+            continue
+
+        row["filter_verification_status"] = "filtered_out"
+        row["filter_verification_note"] = "详情页类目证据确认商品与所选1688类目不一致"
+        row["verification_status"] = VERIFICATION_STATUS_FILTERED_OUT
+        row["data_gap_risk"] = "详情核验后确认类目不匹配"
+        row["manual_review_status"] = "样例剔除" if payload.get("sample_data") else "系统剔除"
+        row["manual_wechat_shop_suggestion"] = "不建议"
+        row["exclusion_type"] = "category_mismatch"
+        item_id = _canonical_item_id(row.get("item_id"), row.get("url"))
+        if item_id not in existing_ids:
+            existing_ids.add(item_id)
+            newly_excluded.append(row)
+        if not payload.get("sample_data"):
+            persistent_records.append(_rejection_record(
+                row,
+                reason_code="product_category_mismatch",
+                reason_text=row["filter_verification_note"],
+                filter_signature=filter_signature,
+                target_platform=target_platform,
+                source_run_id=str(payload.get("run_id", "")),
+            ))
+
+    kept_rows = sorted(kept_rows, key=lambda item: item.get("recommendation_score", 0), reverse=True)
+    pending_rows = sorted(pending_rows, key=lambda item: item.get("recommendation_score", 0), reverse=True)
+    for index, row in enumerate(kept_rows, 1):
+        row["seq"] = index
+    for index, row in enumerate(pending_rows, 1):
+        row["seq"] = index
+    payload["rows"] = kept_rows
+    payload["row_count"] = len(kept_rows)
+    payload["category_unknown_rows"] = pending_rows
+    payload["category_unknown_count"] = len(pending_rows)
+    payload["filter_excluded_rows"] = [*existing_excluded, *newly_excluded]
+    payload["filter_excluded_count"] = len(payload["filter_excluded_rows"])
+    if persistent_records:
+        _append_rejected_products(persistent_records)
+        existing_rejections = [record for record in payload.get("rejection_records", []) if isinstance(record, dict)]
+        existing_keys = {
+            (str(record.get("item_id") or ""), str(record.get("reason_code") or ""))
+            for record in existing_rejections
+        }
+        payload["rejection_records"] = [
+            *existing_rejections,
+            *[
+                record for record in persistent_records
+                if (str(record.get("item_id") or ""), str(record.get("reason_code") or "")) not in existing_keys
+            ],
+        ]
+        payload["rejected_count"] = len(payload["rejection_records"])
+    return newly_excluded
+
+
 def _apply_detail_filter_exclusions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows = payload.get("rows", [])
     if not isinstance(rows, list):
@@ -3671,6 +4155,7 @@ def _apply_detail_filter_exclusions(payload: Dict[str, Any]) -> List[Dict[str, A
             *(payload.get("rejection_records") or []),
             *persistent_records,
         ]
+        payload["rejected_count"] = len(payload["rejection_records"])
     return newly_excluded
 
 
@@ -3817,6 +4302,10 @@ def _split_risks(value: Any) -> List[str]:
 
 def _auto_review_blocking_reasons(row: Dict[str, Any]) -> List[str]:
     reasons: List[str] = []
+    if row.get("category_match_status") == CATEGORY_MATCH_UNKNOWN:
+        reasons.append("商品类目缺少结构化证据，待详情页核验")
+    elif row.get("category_match_status") == CATEGORY_MATCH_MISMATCHED:
+        reasons.append("商品类目与所选类目不匹配")
     if row.get("filter_verification_status") == "filtered_out":
         reasons.append("详情筛选未通过")
     if _row_has_pending_filter(row) or row.get("filter_verification_status") == "needs_review":
@@ -4152,7 +4641,12 @@ def _default_platform_suggestion(target: str, tags: List[str]) -> str:
     return "待人工复核" if target in tags else ""
 
 
-def product_to_export_row(product: Product, query: str, config: TagCollectInput) -> Dict[str, Any]:
+def product_to_export_row(
+    product: Product,
+    query: str,
+    config: TagCollectInput,
+    category_evaluation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     stats = product.stats or {}
     title = _clean_product_title(product.title)
     score, reasons, risks = _score_product(stats, config.tags)
@@ -4160,10 +4654,15 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
     if title_risks:
         risks = _dedupe_strings([*risks, *title_risks])
         score = min(score, 35)
-    category_path = (
-        stats.get("categoryListName")
-        or stats.get("categoryName")
-        or _match_category_from_config(config.categories, title)
+    selected_category_path = _selected_category_for_product(config.categories, product)
+    evaluation = category_evaluation or _evaluate_product_category(
+        product,
+        selected_category_path,
+        _selected_category_id_for_product(product),
+    )
+    product_category_path = str(evaluation.get("product_category_path") or "")
+    category_path = product_category_path or (
+        selected_category_path if evaluation.get("status") == CATEGORY_MATCH_MATCHED else ""
     )
     row: Dict[str, Any] = {
         "seq": 0,
@@ -4255,6 +4754,7 @@ def product_to_export_row(product: Product, query: str, config: TagCollectInput)
     row["wechat_shop_suggestion"] = _wechat_suggestion(row, risks)
     if any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
         row["data_gap_risk"] = "关键字段待详情页核验"
+    _apply_category_evaluation_to_row(row, evaluation, stats)
     _refresh_metric_buckets(row)
     apply_auto_review_status(row)
     return row
@@ -4339,6 +4839,8 @@ def _build_verification_evidence(
 
 def _queue_reason(row: Dict[str, Any]) -> str:
     reasons = []
+    if row.get("category_match_status") == CATEGORY_MATCH_UNKNOWN:
+        reasons.append("商品类目待详情页核验")
     if row.get("recommendation_level") in DETAIL_VERIFICATION_LEVELS:
         reasons.append(f"{row.get('recommendation_level')} 高潜商品")
     if row.get("list_source") in ("rpa", "manual_url", "url_direct"):
@@ -4353,12 +4855,29 @@ def _queue_reason(row: Dict[str, Any]) -> str:
 def build_verification_queue(rows: List[Dict[str, Any]], max_items: int = 20) -> List[Dict[str, Any]]:
     queue: List[Dict[str, Any]] = []
     for row in rows:
-        if row.get("verification_status") not in ("", VERIFICATION_STATUS_UNVERIFIED):
+        category_pending = row.get("category_match_status") == CATEGORY_MATCH_UNKNOWN
+        category_attempt_status = str(row.get("category_verification_status") or "")
+        detail_status = str(row.get("verification_status") or "")
+        if category_pending and category_attempt_status in ("inconclusive", "failed_no_evidence"):
             continue
-        if row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS and row.get("list_source") not in ("rpa", "manual_url", "url_direct"):
+        if category_pending and not category_attempt_status:
+            if detail_status in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+                continue
+            if detail_status == VERIFICATION_STATUS_FAILED and not _should_stop_detail_verification(row):
+                continue
+        if not category_pending and row.get("verification_status") not in ("", VERIFICATION_STATUS_UNVERIFIED):
             continue
-        if not any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
+        if not category_pending and row.get("recommendation_level") not in DETAIL_VERIFICATION_LEVELS and row.get("list_source") not in ("rpa", "manual_url", "url_direct"):
             continue
+        if not category_pending and not any(row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验") for key in DETAIL_ONLY_FIELDS):
+            continue
+        pending_fields = [
+            {"key": key, "label": _field_label(key)}
+            for key in sorted(DETAIL_ONLY_FIELDS)
+            if row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验")
+        ]
+        if category_pending:
+            pending_fields.insert(0, {"key": "product_category_path", "label": "商品类目证据"})
         queue.append({
             "seq": row.get("seq"),
             "item_id": row.get("item_id", ""),
@@ -4368,11 +4887,7 @@ def build_verification_queue(rows: List[Dict[str, Any]], max_items: int = 20) ->
             "recommendation_score": row.get("recommendation_score", ""),
             "wechat_shop_suggestion": row.get("wechat_shop_suggestion", ""),
             "reason": _queue_reason(row),
-            "pending_fields": [
-                {"key": key, "label": _field_label(key)}
-                for key in sorted(DETAIL_ONLY_FIELDS)
-                if row.get(key) in ("", DETAIL_VERIFICATION_PENDING, "待品退率核验")
-            ],
+            "pending_fields": pending_fields,
         })
         if len(queue) >= max_items:
             break
@@ -4457,6 +4972,39 @@ def _apply_verified_fields(
     return evidence
 
 
+def _apply_detail_category_evidence(row: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(fields, dict):
+        return None
+    detail_stats = {
+        "productCategoryId": fields.get("product_category_id") or fields.get("productCategoryId"),
+        "productCategoryPath": fields.get("product_category_path") or fields.get("productCategoryPath"),
+        "productCategoryBreadcrumb": fields.get("product_category_breadcrumb") or fields.get("productCategoryBreadcrumb"),
+        "productCategorySource": fields.get("category_evidence_source") or fields.get("productCategorySource") or "1688_detail_page_rpa",
+    }
+    if not any(_category_evidence_value(value) for key, value in detail_stats.items() if key != "productCategorySource"):
+        return None
+    product = Product(
+        id=str(row.get("item_id", "")),
+        title=str(row.get("title", "")),
+        price=str(row.get("wholesale_price", "")),
+        image=str(row.get("image_url", "")),
+        url=str(row.get("url", "")),
+        stats=detail_stats,
+    )
+    evaluation = _evaluate_product_category(
+        product,
+        str(row.get("selected_category_path") or ""),
+        str(row.get("selected_category_id") or ""),
+    )
+    if evaluation.get("source") in ("id", "path") or row.get("category_match_status") == CATEGORY_MATCH_UNKNOWN:
+        _apply_category_evaluation_to_row(row, evaluation, {
+            "navigationCategoryId": row.get("navigation_category_id", ""),
+            "navigationCategoryPath": row.get("navigation_category_path", ""),
+            "navigationCategoryUrl": row.get("navigation_category_url", ""),
+        })
+    return evaluation
+
+
 def _sample_verify_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     item_id = str(row.get("item_id", ""))
     fields = SAMPLE_DETAIL_VERIFICATIONS.get(item_id)
@@ -4470,6 +5018,7 @@ def _sample_verify_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             mode="sample",
             fail_reason="样例详情库未覆盖该商品",
         )
+    _apply_detail_category_evidence(row, fields)
     return _apply_verified_fields(
         row,
         fields,
@@ -4506,6 +5055,7 @@ def _real_verify_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             fail_reason="真实详情页未提取到关键字段",
         )
 
+    _apply_detail_category_evidence(row, fields)
     return _apply_verified_fields(
         row,
         fields,
@@ -4532,12 +5082,34 @@ def _should_stop_detail_verification(row: Dict[str, Any]) -> bool:
     )
 
 
+def _record_category_verification_attempt(row: Dict[str, Any], previous_status: str) -> None:
+    if previous_status != CATEGORY_MATCH_UNKNOWN:
+        return
+    row["category_verification_attempts"] = int(row.get("category_verification_attempts") or 0) + 1
+    row["category_last_verified_at"] = _now_iso()
+    current_status = str(row.get("category_match_status") or CATEGORY_MATCH_UNKNOWN)
+    if current_status != CATEGORY_MATCH_UNKNOWN:
+        row["category_verification_status"] = "resolved"
+        return
+    if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
+        row["category_verification_status"] = "inconclusive"
+    elif _should_stop_detail_verification(row):
+        row["category_verification_status"] = "retryable_blocked"
+    else:
+        row["category_verification_status"] = "failed_no_evidence"
+
+
 def _automation_state(
     payload: Dict[str, Any],
     *,
     verification_stopped_reason: str = "",
 ) -> Dict[str, Any]:
     rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+    category_unknown_rows = [
+        row for row in payload.get("category_unknown_rows", [])
+        if isinstance(row, dict)
+    ]
+    verification_rows = [*rows, *category_unknown_rows]
     queue = payload.get("verification_queue", [])
     queue_count = len(queue) if isinstance(queue, list) else 0
     stopped_reason = verification_stopped_reason or str(payload.get("verification_stopped_reason") or "")
@@ -4547,14 +5119,14 @@ def _automation_state(
         VERIFICATION_STATUS_VERIFIED,
         VERIFICATION_STATUS_PARTIAL,
     }
-    verified_count = len([row for row in rows if row.get("verification_status") in verified_statuses])
-    failed_count = len([row for row in rows if row.get("verification_status") == VERIFICATION_STATUS_FAILED])
-    partial_count = len([row for row in rows if row.get("verification_status") == VERIFICATION_STATUS_PARTIAL])
+    verified_count = len([row for row in verification_rows if row.get("verification_status") in verified_statuses])
+    failed_count = len([row for row in verification_rows if row.get("verification_status") == VERIFICATION_STATUS_FAILED])
+    partial_count = len([row for row in verification_rows if row.get("verification_status") == VERIFICATION_STATUS_PARTIAL])
     target_publishable_count = int(payload.get("target_publishable_count") or 0)
     publishable_count = len(_publishable_rows(rows))
     shortfall_reason = str(payload.get("shortfall_reason") or "")
 
-    if not rows:
+    if not verification_rows:
         status = "empty"
         stage = "list_collect"
         action = "adjust_filters"
@@ -4578,6 +5150,11 @@ def _automation_state(
             if target_publishable_count
             else "列表字段仅完成初筛，仍有高潜商品等待进入详情页核验。"
         )
+    elif category_unknown_rows:
+        status = "partial"
+        stage = "export_ready"
+        action = "manual_review"
+        message = f"仍有 {len(category_unknown_rows)} 个商品缺少可确认的类目证据，已停止自动重复访问并保留人工复核。"
     elif partial_count or failed_count:
         status = "partial"
         stage = "export_ready"
@@ -4611,6 +5188,7 @@ def _automation_state(
         "action_label": AUTOMATION_ACTION_LABELS.get(action, action),
         "message": message,
         "row_count": len(rows),
+        "category_unknown_count": len(category_unknown_rows),
         "queue_count": queue_count,
         "verified_count": verified_count,
         "failed_count": failed_count,
@@ -4639,6 +5217,9 @@ def refresh_run_artifacts(payload: Dict[str, Any]) -> Dict[str, Any]:
     rows = payload.get("rows", [])
     if isinstance(rows, list):
         apply_auto_review_statuses(rows)
+    category_unknown_rows = payload.get("category_unknown_rows", [])
+    if isinstance(category_unknown_rows, list):
+        apply_auto_review_statuses(category_unknown_rows)
     excluded_rows = payload.get("filter_excluded_rows", [])
     if isinstance(excluded_rows, list):
         apply_auto_review_statuses(excluded_rows)
@@ -4667,7 +5248,15 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
     if not isinstance(rows, list):
         rows = []
         payload["rows"] = rows
-    queue = build_verification_queue(rows, max_items=max_items)
+    category_unknown_rows = payload.get("category_unknown_rows", [])
+    if not isinstance(category_unknown_rows, list):
+        category_unknown_rows = []
+        payload["category_unknown_rows"] = category_unknown_rows
+    verification_candidates = [
+        row for row in [*rows, *category_unknown_rows]
+        if isinstance(row, dict)
+    ]
+    queue = build_verification_queue(verification_candidates, max_items=max_items)
     evidence: List[Dict[str, Any]] = list(payload.get("verification_records") or [])
     filter_plan = payload.get("filter_plan") or {}
     filter_reevaluation_records: List[Dict[str, Any]] = []
@@ -4675,15 +5264,23 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
     verified_count = 0
     failed_count = 0
     stopped_reason = ""
-    row_by_id = {str(row.get("item_id", "")): row for row in rows if isinstance(row, dict)}
+    category_match_records: List[Dict[str, Any]] = []
+    row_by_id = {
+        str(row.get("item_id", "")): row
+        for row in verification_candidates
+        if isinstance(row, dict)
+    }
 
     for item in queue:
         item_id = str(item.get("item_id", ""))
         row = row_by_id.get(item_id)
         if not row:
             continue
+        previous_category_status = str(row.get("category_match_status") or CATEGORY_MATCH_UNKNOWN)
         records = _sample_verify_row(row) if sample_data else _real_verify_row(row)
+        _record_category_verification_attempt(row, previous_category_status)
         evidence.extend(records)
+        category_match_records.append(_category_match_record(row, stage="detail"))
         filter_records = reevaluate_row_filters_after_verification(row, filter_plan)
         if row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL):
             rescore_records.append(rescore_row_after_detail(row))
@@ -4710,10 +5307,19 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
         *(payload.get("rescore_records") or []),
         *rescore_records,
     ]
-    excluded_rows = _apply_detail_filter_exclusions(payload)
+    payload["category_match_records"] = [
+        *(payload.get("category_match_records") or []),
+        *category_match_records,
+    ]
+    category_excluded_rows = _reconcile_category_rows_after_verification(payload)
+    detail_filter_excluded_rows = _apply_detail_filter_exclusions(payload)
+    excluded_rows = [*category_excluded_rows, *detail_filter_excluded_rows]
     rows = payload.get("rows", [])
     if isinstance(rows, list):
         apply_auto_review_statuses(rows)
+    category_unknown_rows = payload.get("category_unknown_rows", [])
+    if isinstance(category_unknown_rows, list):
+        apply_auto_review_statuses(category_unknown_rows)
     non_publishable_rejections = _persist_non_publishable_rejections(payload)
     rows = payload.get("rows", [])
     publishable_count = len(_publishable_rows(rows))
@@ -4727,13 +5333,17 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
         collection_stop_reason=str(payload.get("collection_stop_reason") or "source_exhausted_or_filters_too_strict"),
         skipped_rejected_count=int(payload.get("skipped_rejected_count") or 0),
     )
-    payload["verification_queue"] = build_verification_queue(rows, max_items=max_items)
+    verification_candidates = [
+        row for row in [*rows, *(payload.get("category_unknown_rows", []) or [])]
+        if isinstance(row, dict)
+    ]
+    payload["verification_queue"] = build_verification_queue(verification_candidates, max_items=max_items)
     payload["verified_count"] = len([
-        row for row in rows
+        row for row in verification_candidates
         if isinstance(row, dict) and row.get("verification_status") in (VERIFICATION_STATUS_SAMPLE, VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_PARTIAL)
     ])
     payload["verification_failed_count"] = len([
-        row for row in rows
+        row for row in verification_candidates
         if isinstance(row, dict) and row.get("verification_status") == VERIFICATION_STATUS_FAILED
     ])
     payload["verification_field_failed_count"] = len([
@@ -4767,6 +5377,9 @@ def verify_run_details(run_id: str, *, sample_data: bool = True, max_items: int 
             "non_publishable_rejected_count": len(non_publishable_rejections),
             "row_count": len(rows),
             "rows": rows,
+            "category_unknown_rows": payload.get("category_unknown_rows", []),
+            "category_unknown_count": payload.get("category_unknown_count", 0),
+            "category_match_records": payload.get("category_match_records", []),
             "filter_excluded_rows": payload.get("filter_excluded_rows", []),
             "verification_queue": payload["verification_queue"],
             "verification_records": evidence,
@@ -4879,19 +5492,24 @@ def _styles_xml() -> str:
 def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[Dict[str, Any]] = None) -> str:
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
     payload = payload or {}
+    category_unknown_rows = payload.get("category_unknown_rows", [])
+    if not isinstance(category_unknown_rows, list):
+        category_unknown_rows = []
     excluded_rows = payload.get("filter_excluded_rows", [])
     if not isinstance(excluded_rows, list):
         excluded_rows = []
-    truth_summary = _normalize_export_truth_metadata([*rows, *excluded_rows], payload)
+    truth_summary = _normalize_export_truth_metadata([*rows, *category_unknown_rows, *excluded_rows], payload)
     has_sample_rows = truth_summary["has_sample_rows"]
     has_unknown_rows = truth_summary["has_unknown_rows"]
     apply_auto_review_statuses(rows)
+    apply_auto_review_statuses(category_unknown_rows)
     apply_auto_review_statuses(excluded_rows)
     keys = [key for key, _ in EXPORT_COLUMNS]
     labels = [label for _, label in EXPORT_COLUMNS]
     result_rows = [labels] + [[row.get(key, "") for key in keys] for row in rows]
     review_summary = _manual_review_summary([
         *rows,
+        *category_unknown_rows,
         *excluded_rows,
     ])
     field_rows = [["编号", "分组", "字段", "字段键", "来源", "是否必须核验"]] + [
@@ -4953,6 +5571,7 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["核验失败商品数", payload.get("verification_failed_count", 0)],
         ["核验失败字段数", payload.get("verification_field_failed_count", 0)],
         ["详情筛选剔除商品数", payload.get("filter_excluded_count", 0)],
+        ["类目待核验商品数", payload.get("category_unknown_count", len(category_unknown_rows))],
         ["待详情核验商品数", len(payload.get("verification_queue", []) or [])],
         ["系统预通过数量", review_summary["system_preapproved"]],
         ["系统不建议数量", review_summary["system_not_recommended"]],
@@ -5050,6 +5669,18 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ["用途", "仅用于开发回归、字段映射和导出格式检查"],
         ["验收要求", "正式验收必须关闭样例模式，使用真实 Chrome 登录态或真实 URL 采集"],
     ]
+    category_pending_extra_labels = ["类目匹配状态", "类目判定原因", "所选类目", "商品真实类目", "证据来源", "置信度"]
+    category_pending_rows = [labels + category_pending_extra_labels] + [
+        [row.get(key, "") for key in keys] + [
+            row.get("category_match_status", ""),
+            row.get("category_match_reason", ""),
+            row.get("selected_category_path", ""),
+            row.get("product_category_path", ""),
+            row.get("category_match_source", ""),
+            row.get("category_match_confidence", ""),
+        ]
+        for row in category_unknown_rows
+    ]
 
     sheets = [
         ("选品结果", result_rows),
@@ -5059,6 +5690,8 @@ def export_xlsx(rows: List[Dict[str, Any]], output_path: str, payload: Optional[
         ("核验记录", verification_rows),
         ("筛选执行记录", filter_rows),
     ]
+    if category_unknown_rows:
+        sheets.append(("类目待核验", category_pending_rows))
     if payload.get("sample_data") or has_sample_rows:
         sheets.append(("样例说明", sample_notice_rows))
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -5138,12 +5771,23 @@ def get_export_path(run_id: str) -> Optional[str]:
 
 def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
     rows, queries, filter_plan = collect_products(config)
+    category_unknown_rows = [
+        row for row in filter_plan.get("category_unknown_rows", [])
+        if isinstance(row, dict)
+    ]
+    initial_excluded_rows = [
+        row for row in filter_plan.get("filter_excluded_rows", [])
+        if isinstance(row, dict)
+    ]
     now = datetime.now()
     run_id = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
-    for row in rows:
+    for row in [*rows, *category_unknown_rows, *initial_excluded_rows]:
         row["run_id"] = run_id
     apply_auto_review_statuses(rows)
-    auto_verify_limit = _auto_verify_limit(config, rows) if config.auto_verify_details else config.auto_verify_max_items
+    apply_auto_review_statuses(category_unknown_rows)
+    apply_auto_review_statuses(initial_excluded_rows)
+    verification_candidates = [*rows, *category_unknown_rows]
+    auto_verify_limit = _auto_verify_limit(config, verification_candidates) if config.auto_verify_details else config.auto_verify_max_items
     ext = "csv" if config.output_format == "csv" else "xlsx"
     output_path = os.path.join(get_tag_collect_data_dir(), f"tag_collect_{run_id}.{ext}")
     payload = {
@@ -5185,12 +5829,15 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
         "target_platform": filter_plan.get("target_platform", _target_platform_from_tags(config.tags)),
         "output_path": output_path,
         "rows": rows,
-        "verification_queue": build_verification_queue(rows, max_items=auto_verify_limit or 20),
+        "category_unknown_rows": category_unknown_rows,
+        "category_unknown_count": len(category_unknown_rows),
+        "category_match_records": filter_plan.get("category_match_records", []),
+        "verification_queue": build_verification_queue(verification_candidates, max_items=auto_verify_limit or 20),
         "verification_records": [],
         "filter_reevaluation_records": [],
         "rescore_records": [],
-        "filter_excluded_rows": [],
-        "filter_excluded_count": 0,
+        "filter_excluded_rows": initial_excluded_rows,
+        "filter_excluded_count": len(initial_excluded_rows),
         "verified_count": 0,
         "verification_failed_count": 0,
         "verification_field_failed_count": 0,
@@ -5260,6 +5907,9 @@ def run_tag_collect(config: TagCollectInput) -> Dict[str, Any]:
             "columns": [label for _, label in EXPORT_COLUMNS],
             "top_items": payload.get("rows", rows)[:10],
             "rows": payload.get("rows", rows),
+            "category_unknown_rows": payload.get("category_unknown_rows", []),
+            "category_unknown_count": payload.get("category_unknown_count", 0),
+            "category_match_records": payload.get("category_match_records", []),
             "filter_excluded_rows": payload.get("filter_excluded_rows", []),
             "filter_excluded_count": payload.get("filter_excluded_count", 0),
             "filter_plan": filter_plan,
@@ -5311,6 +5961,8 @@ def build_markdown(payload: Dict[str, Any], snapshot_path: str) -> str:
             f"（{category_dictionary.get('status', '')}）"
         )
     lines.append(f"- 商品数：{payload['row_count']}")
+    if payload.get("category_unknown_count"):
+        lines.append(f"- 类目待核验：{payload.get('category_unknown_count', 0)}（不计入可铺结果）")
     if payload.get("target_publishable_count"):
         lines.append(
             "- 可铺目标："

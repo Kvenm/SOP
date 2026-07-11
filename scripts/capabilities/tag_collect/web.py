@@ -10,7 +10,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.error import URLError
 from urllib.request import urlopen
 from urllib.parse import parse_qs, urlparse
@@ -187,6 +187,37 @@ def _csv_join(values: Any) -> str:
     return str(values or "")
 
 
+def _bool_value(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _normalized_web_task_scope(payload: Dict[str, Any]) -> tuple[List[str], Dict[str, Any], bool]:
+    raw_categories = payload.get("categories")
+    if isinstance(raw_categories, list):
+        categories = [str(item).strip() for item in raw_categories if str(item).strip()]
+    else:
+        categories = [item.strip() for item in str(raw_categories or "").replace("，", ",").split(",") if item.strip()]
+    library_filters = dict(payload.get("library_filters") or {})
+    raw_library_paths = library_filters.get("category_paths")
+    if isinstance(raw_library_paths, list):
+        library_paths = [str(item).strip() for item in raw_library_paths if str(item).strip()]
+    else:
+        library_paths = [item.strip() for item in str(raw_library_paths or "").replace("，", ",").split(",") if item.strip()]
+    multi_category_mode = _bool_value(payload.get("multi_category_mode"), default=True)
+    if not multi_category_mode:
+        selected = (categories or library_paths)[-1:]  # Set/数组末项是当前任务最后选择的类目。
+        categories = selected
+        if selected:
+            library_filters["category_paths"] = selected
+        else:
+            library_filters.pop("category_paths", None)
+    return categories, library_filters, multi_category_mode
+
+
 def _parse_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     length = int(handler.headers.get("Content-Length") or 0)
     raw = handler.rfile.read(length) if length else b"{}"
@@ -336,6 +367,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             auto_verify_details = payload.get("auto_verify_details", "").lower() in ("1", "true", "yes", "on")
         if collect_source in ("url_direct", "direct_url", "http_url") and not sample_data:
             auto_verify_details = False
+        task_categories, task_library_filters, multi_category_mode = _normalized_web_task_scope(payload)
 
         if not sample_data:
             if not ALLOW_REAL_COLLECT:
@@ -356,7 +388,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
 
         try:
             config = parse_input(
-                categories=_csv_join(payload.get("categories")),
+                categories=_csv_join(task_categories),
                 tags=_csv_join(payload.get("tags")),
                 keywords=_csv_join(payload.get("keywords")),
                 source_urls=_csv_join(payload.get("source_urls")),
@@ -367,7 +399,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 sample_data=sample_data,
                 output_format=str(payload.get("output_format") or "xlsx"),
                 collect_source=collect_source,
-                library_filters=payload.get("library_filters") or {},
+                library_filters=task_library_filters,
                 auto_verify_details=auto_verify_details,
                 auto_verify_max_items=int(payload.get("auto_verify_max_items") or 0),
             )
@@ -375,6 +407,8 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             data = dict(result["data"])
             data["rows"] = get_run_payload(data["run_id"]).get("rows", [])
             data["download_url"] = f"/download?run_id={data['run_id']}"
+            data["task_categories"] = config.categories
+            data["multi_category_mode"] = multi_category_mode
             self._send_json(200, {"success": result["success"], "markdown": result["markdown"], "data": data})
         except Exception as exc:
             error_state = collect_error_state(exc)
@@ -384,14 +418,15 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 filter_results = []
             error_snapshot_path = save_error_payload({
                 "request": {
-                    "categories": payload.get("categories") or [],
+                    "categories": task_categories,
                     "tags": payload.get("tags") or [],
                     "keywords": payload.get("keywords") or "",
                     "source_urls": payload.get("source_urls") or "",
                     "collect_source": collect_source,
                     "sample_data": sample_data,
                     "max_items_per_query": payload.get("max_items_per_query"),
-                    "library_filters": payload.get("library_filters") or {},
+                    "library_filters": task_library_filters,
+                    "multi_category_mode": multi_category_mode,
                 },
                 "error_state": error_state,
                 "error_data": detail,
@@ -1398,7 +1433,7 @@ HTML_PAGE = r"""<!doctype html>
     .summary {
       display: grid;
       gap: 8px;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       margin-top: 12px;
     }
     .metric {
@@ -1572,6 +1607,15 @@ HTML_PAGE = r"""<!doctype html>
     .badge.p1 { background: var(--accent-soft); color: #0753a2; }
     .badge.p2 { background: #fff3df; color: var(--amber); }
     .badge.no { background: #f1f2f4; color: var(--muted); }
+    .category-cell {
+      align-items: flex-start;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .badge.category-matched { background: #eaf7f0; color: var(--green); }
+    .badge.category-unknown { background: #fff3df; color: var(--amber); }
+    .badge.category-mismatched { background: #fff0f0; color: var(--danger); }
     .field-grid {
       display: grid;
       gap: 10px;
@@ -1988,8 +2032,16 @@ HTML_PAGE = r"""<!doctype html>
     .category-tools {
       display: grid;
       gap: 8px;
-      grid-template-columns: minmax(180px, 280px) auto;
+      grid-template-columns: minmax(180px, 280px) auto minmax(220px, 1fr);
       margin-bottom: 8px;
+    }
+    .category-task-mode {
+      align-items: center;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      font-size: 12px;
+      gap: 8px;
     }
     .search-grid,
     .url-grid,
@@ -3321,7 +3373,13 @@ HTML_PAGE = r"""<!doctype html>
               <div id="categoryPanel" class="category-picker">
                 <div class="category-tools">
                   <input id="categorySearch" type="text" placeholder="搜索类目" />
-                  <span class="status-pill">可复选一级 / 二级 / 三级</span>
+                  <label class="chip" title="默认关闭：选择新叶子类目会替换上一个任务的类目">
+                    <input id="multiCategoryMode" type="checkbox" />多类目任务
+                  </label>
+                  <div class="category-task-mode">
+                    <span id="categoryTaskModeBadge" class="status-pill">单类目任务</span>
+                    <span id="categoryTaskModeHint">选择新类目会替换上一个类目，防止任务串入</span>
+                  </div>
                 </div>
                 <div id="categoryTree"></div>
               </div>
@@ -3456,6 +3514,7 @@ HTML_PAGE = r"""<!doctype html>
             <div class="metric"><span>结果商品</span><strong id="rowCount">0</strong></div>
             <div class="metric"><span>P0/P1</span><strong id="highCount">0</strong></div>
             <div class="metric"><span>达标可铺</span><strong id="suggestCount">0</strong></div>
+            <div class="metric"><span>类目待核验</span><strong id="categoryUnknownCount">0</strong></div>
           </div>
           </div>
         </div>
@@ -3566,6 +3625,8 @@ HTML_PAGE = r"""<!doctype html>
       filterPlan: {},
       filterResults: [],
       filterWarnings: [],
+      categoryUnknownCount: 0,
+      collecting: false,
       reviewMode: false,
       debugSampleMode: false,
       debugViewMode: false,
@@ -3897,6 +3958,55 @@ HTML_PAGE = r"""<!doctype html>
       updateSelectedSummary();
     }
 
+    function multiCategoryModeEnabled() {
+      return Boolean($("multiCategoryMode")?.checked);
+    }
+
+    function setCategorySelection(value, selected) {
+      const path = String(value || "").trim();
+      if (!path) return;
+      if (!selected) {
+        state.selectedCategories.delete(path);
+        return;
+      }
+      if (!multiCategoryModeEnabled() && !state.selectedCategories.has(path)) {
+        state.selectedCategories.clear();
+      }
+      state.selectedCategories.add(path);
+    }
+
+    function normalizeCategorySelectionMode() {
+      if (multiCategoryModeEnabled() || state.selectedCategories.size <= 1) return;
+      const lastSelected = [...state.selectedCategories].slice(-1)[0] || "";
+      state.selectedCategories.clear();
+      if (lastSelected) state.selectedCategories.add(lastSelected);
+    }
+
+    function updateCategoryTaskMode() {
+      const multiple = multiCategoryModeEnabled();
+      if ($("categoryTaskModeBadge")) $("categoryTaskModeBadge").textContent = multiple ? "多类目任务" : "单类目任务";
+      if ($("categoryTaskModeHint")) {
+        $("categoryTaskModeHint").textContent = multiple
+          ? "当前任务会同时采集所有已选类目"
+          : "选择新类目会替换上一个类目，防止任务串入";
+      }
+    }
+
+    function setCollecting(active) {
+      state.collecting = Boolean(active);
+      ["runBtn", "stickyRunBtn", "readCurrentPageBtn"].forEach(id => {
+        if ($(id)) $(id).disabled = state.collecting;
+      });
+      if (state.collecting) {
+        if ($("runBtn")) $("runBtn").textContent = "读取中";
+        if ($("stickyRunBtn")) $("stickyRunBtn").textContent = "读取中";
+        if ($("readCurrentPageBtn")) $("readCurrentPageBtn").textContent = "读取中";
+      } else {
+        updateRunButtonLabels();
+        if ($("readCurrentPageBtn")) $("readCurrentPageBtn").textContent = "读取当前页兜底";
+      }
+    }
+
     function rowKey(row, index) {
       return String(row.item_id || row.url || `${row.title || "row"}-${index}`);
     }
@@ -4119,6 +4229,14 @@ HTML_PAGE = r"""<!doctype html>
       }[value] || value || "-";
     }
 
+    function categoryMatchStatusLabel(value) {
+      return {
+        matched: "类目匹配",
+        unknown: "类目待核验",
+        mismatched: "类目不匹配"
+      }[String(value || "").toLowerCase()] || "";
+    }
+
     function statusBadge(status) {
       return `<span class="field-status ${esc(status || "reserved")}">${esc(statusLabel(status))}</span>`;
     }
@@ -4180,6 +4298,32 @@ HTML_PAGE = r"""<!doctype html>
           </div>
         </div>
       `).join("");
+      restoreLibraryFilterValues();
+    }
+
+    function restoreLibraryFilterValues(filters = state.selectedLibrary || {}) {
+      document.querySelectorAll("[data-library-list]").forEach(input => {
+        const selected = filters[input.dataset.libraryList];
+        input.checked = Array.isArray(selected) ? selected.includes(input.value) : selected === input.value;
+      });
+      document.querySelectorAll("[data-library-bool]").forEach(input => {
+        input.checked = Boolean(filters[input.dataset.libraryBool]);
+      });
+      document.querySelectorAll("[data-library-radio]").forEach(input => {
+        const expected = filters[input.dataset.libraryRadio] || "不限";
+        input.checked = input.value === expected;
+      });
+      document.querySelectorAll("[data-library-select]").forEach(input => {
+        const value = filters[input.dataset.librarySelect];
+        input.value = value == null ? (input.dataset.defaultValue || "") : String(value);
+      });
+      document.querySelectorAll("[data-library-text]").forEach(input => {
+        input.value = String(filters[input.dataset.libraryText] || "");
+      });
+      document.querySelectorAll("[data-library-range]").forEach(input => {
+        const key = `${input.dataset.libraryRange}_${input.dataset.bound}`;
+        input.value = filters[key] == null ? "" : String(filters[key]);
+      });
     }
 
     function renderLibrarySectionFields(section) {
@@ -4462,6 +4606,16 @@ HTML_PAGE = r"""<!doctype html>
         const cls = value === "sample_verified" || value === "verified" ? "p0" : value === "partial_verified" ? "p1" : value === "failed" ? "no" : "p2";
         return `<span class="badge ${cls}">${esc(verificationStatusLabel(value))}</span>`;
       }
+      if (key === "category_path") {
+        const status = String(row.category_match_status || "").toLowerCase();
+        const label = categoryMatchStatusLabel(status);
+        const categoryPath = value || row.product_category_path || row.selected_category_path || "-";
+        const reason = row.category_match_reason || row.category_match_source || "";
+        const badge = label
+          ? `<span class="badge category-${esc(status)}"${reason ? ` title="${esc(reason)}"` : ""}>${esc(label)}</span>`
+          : "";
+        return `<div class="category-cell"><span>${esc(categoryPath)}</span>${badge}</div>`;
+      }
       return esc(value);
     }
 
@@ -4472,7 +4626,7 @@ HTML_PAGE = r"""<!doctype html>
       const verification = $("verificationFilter").value;
       const suggest = $("suggestFilter").value;
       return state.rows.filter(row => {
-        const haystack = `${row.title || ""} ${row.category_path || ""} ${row.risk_flags || ""}`.toLowerCase();
+        const haystack = `${row.title || ""} ${row.category_path || ""} ${row.risk_flags || ""} ${categoryMatchStatusLabel(row.category_match_status)}`.toLowerCase();
         return (!text || haystack.includes(text))
           && Number(row.recommendation_score || 0) >= minScore
           && (!level || row.recommendation_level === level)
@@ -4491,6 +4645,7 @@ HTML_PAGE = r"""<!doctype html>
       state.filterPlan = {};
       state.filterResults = [];
       state.filterWarnings = [];
+      state.categoryUnknownCount = 0;
       state.selectedRows.clear();
       $("downloadLink").hidden = true;
       $("downloadLink").removeAttribute("href");
@@ -4533,10 +4688,16 @@ HTML_PAGE = r"""<!doctype html>
       state.filterPlan = data.filter_plan || state.filterPlan || {};
       state.filterResults = data.filter_results || state.filterResults || [];
       state.filterWarnings = data.filter_warnings || state.filterWarnings || [];
+      const explicitCategoryUnknownCount = data.category_unknown_count
+        ?? (Array.isArray(data.category_unknown_rows) ? data.category_unknown_rows.length : null);
+      if (explicitCategoryUnknownCount != null) {
+        state.categoryUnknownCount = Number(explicitCategoryUnknownCount || 0);
+      }
       $("runId").textContent = data.run_id || "-";
       $("rowCount").textContent = String(state.rows.length);
       $("highCount").textContent = String(state.rows.filter(row => ["P0", "P1"].includes(row.recommendation_level)).length);
       $("suggestCount").textContent = String(data.publishable_count ?? state.rows.filter(row => row.wechat_shop_suggestion === "可铺").length);
+      $("categoryUnknownCount").textContent = String(state.categoryUnknownCount);
       $("queueCount").textContent = String(state.verificationQueue.length);
       $("verifiedCount").textContent = String(state.rows.filter(row => ["sample_verified", "verified", "partial_verified"].includes(row.verification_status)).length);
       $("recordCount").textContent = String(state.verificationRecords.length);
@@ -4619,8 +4780,11 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function runCollect() {
-      $("runBtn").disabled = true;
-      $("runBtn").textContent = "读取中";
+      if (state.collecting) {
+        showNotice("已有采集任务正在执行，请等待当前任务完成后再启动新任务。", false, "paused");
+        return;
+      }
+      setCollecting(true);
       try {
         const sourceMode = $("collectSource").value;
         if (!state.debugSampleMode && sourceMode === "url_direct" && !$("sourceUrls").value.trim()) {
@@ -4636,14 +4800,18 @@ HTML_PAGE = r"""<!doctype html>
           const ready = await ensureChromeRuntimeReady();
           if (!ready) return;
         }
+        normalizeCategorySelectionMode();
+        const taskCategories = [...state.selectedCategories];
         const sourceUrlsForPayload = effectiveSourceUrls();
+        const libraryFilters = collectLibraryFilters();
         const payload = {
-          categories: [...state.selectedCategories],
+          categories: taskCategories,
           tags: [...state.selectedTags],
           keywords: $("keywords").value,
           source_urls: sourceUrlsForPayload,
           exclude_tags: $("excludeTags").value,
-          library_filters: collectLibraryFilters(),
+          library_filters: libraryFilters,
+          multi_category_mode: multiCategoryModeEnabled(),
           max_queries: Number($("maxQueries").value || 20),
           max_items_per_query: Number($("maxItems").value || 5),
           target_publishable_count: Number($("maxItems").value || 5),
@@ -4654,6 +4822,12 @@ HTML_PAGE = r"""<!doctype html>
           sample_data: state.debugSampleMode,
           token: state.options.token
         };
+        clearRunState();
+        showNotice(
+          `正在执行新任务：${taskCategories.length ? taskCategories.join("、") : "未限定类目"}。旧任务结果已清空。`,
+          false,
+          "paused"
+        );
         const response = await fetch("/api/collect", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
@@ -4711,8 +4885,7 @@ HTML_PAGE = r"""<!doctype html>
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
       } finally {
-        $("runBtn").disabled = false;
-        updateRunButtonLabels();
+        setCollecting(false);
       }
     }
 
@@ -4771,12 +4944,14 @@ HTML_PAGE = r"""<!doctype html>
     document.addEventListener("change", (event) => {
       const target = event.target;
       if (!target.matches("input[type='checkbox'][data-kind]")) return;
-      const set = target.dataset.kind === "category" ? state.selectedCategories : state.selectedTags;
-      target.checked ? set.add(target.value) : set.delete(target.value);
       if (target.dataset.kind === "category") {
+        collectLibraryFilters();
+        setCategorySelection(target.value, target.checked);
         const parts = target.value.split(">");
         if (parts[0]) state.activeCategoryParent = parts[0];
         if (parts[1]) state.activeCategoryChild = parts[1];
+      } else {
+        target.checked ? state.selectedTags.add(target.value) : state.selectedTags.delete(target.value);
       }
       target.dataset.kind === "category" ? renderCategories() : renderFilterGroups();
       if (target.dataset.kind === "category") renderLibraryFilters();
@@ -4807,7 +4982,8 @@ HTML_PAGE = r"""<!doctype html>
     document.addEventListener("click", (event) => {
       const remove = event.target.closest("[data-category-remove]");
       if (remove) {
-        state.selectedCategories.delete(remove.dataset.categoryRemove);
+        collectLibraryFilters();
+        setCategorySelection(remove.dataset.categoryRemove, false);
         renderCategories();
         renderLibraryFilters();
         updateSelectedSummary();
@@ -4815,6 +4991,7 @@ HTML_PAGE = r"""<!doctype html>
       }
       const nav = event.target.closest("[data-category-nav]");
       if (!nav) return;
+      collectLibraryFilters();
       const parts = (nav.dataset.categoryPath || "").split(">");
       const path = nav.dataset.categoryPath || "";
       if (nav.dataset.categoryNav === "parent" && parts[0]) {
@@ -4827,12 +5004,12 @@ HTML_PAGE = r"""<!doctype html>
         const hasGrandchildren = categoryEntries(parts[0]).some(([child, grandchildren]) => (
           child === parts[1] && Array.isArray(grandchildren) && grandchildren.length
         ));
-        if (!hasGrandchildren && path) state.selectedCategories.add(path);
+        if (!hasGrandchildren && path) setCategorySelection(path, true);
       }
       if (nav.dataset.categoryNav === "grand" && parts[0]) {
         state.activeCategoryParent = parts[0];
         state.activeCategoryChild = parts[1] || "";
-        if (path) state.selectedCategories.add(path);
+        if (path) setCategorySelection(path, true);
       }
       renderCategories();
       renderLibraryFilters();
@@ -4873,11 +5050,26 @@ HTML_PAGE = r"""<!doctype html>
       panel.classList.toggle("is-open");
       $("toggleCategoryPanel").textContent = panel.classList.contains("is-open") ? "收起类目" : "选择类目";
     });
+    $("multiCategoryMode").addEventListener("change", () => {
+      collectLibraryFilters();
+      const before = state.selectedCategories.size;
+      normalizeCategorySelectionMode();
+      renderCategories();
+      renderLibraryFilters();
+      updateCategoryTaskMode();
+      updateSelectedSummary();
+      if (!multiCategoryModeEnabled() && before > 1) {
+        showNotice("已切回单类目任务，仅保留最后选择的类目。", true);
+      }
+    });
     $("clearCategories").addEventListener("click", () => {
+      collectLibraryFilters();
       state.selectedCategories.clear();
       state.activeCategoryParent = "";
       state.activeCategoryChild = "";
       renderCategories();
+      renderLibraryFilters();
+      updateSelectedSummary();
     });
     $("resetBtn").addEventListener("click", () => {
       state.selectedCategories.clear();
@@ -4886,6 +5078,7 @@ HTML_PAGE = r"""<!doctype html>
       state.selectedTags.clear();
       state.selectedLibrary = {};
       state.selectedRows.clear();
+      if ($("multiCategoryMode")) $("multiCategoryMode").checked = false;
       ["keywords", "sourceUrls", "excludeTags", "historyKeyword", "templateName", "titleFilter"].forEach(id => {
         if ($(id)) $(id).value = "";
       });
@@ -4907,8 +5100,10 @@ HTML_PAGE = r"""<!doctype html>
         input.value = input.dataset.defaultValue || "";
       });
       renderCategories();
+      renderLibraryFilters();
       renderFilterGroups();
       renderTable();
+      updateCategoryTaskMode();
       updateCollectModeUI();
       updateSelectedSummary();
       showNotice("筛选条件已重置。", true);
@@ -4972,6 +5167,7 @@ HTML_PAGE = r"""<!doctype html>
       updateSummary({});
       renderChromeRuntime();
       updateCollectModeUI(true);
+      updateCategoryTaskMode();
       updateSelectedSummary();
     }
 
