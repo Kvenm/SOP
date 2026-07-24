@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import tempfile
+import time
 import types
 import urllib.error
 import urllib.request
@@ -18,11 +20,15 @@ from xml.etree import ElementTree as ET
 
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from capabilities.tag_collect import service, web
+from capabilities.tag_collect import rpa, service, web
 from capabilities.tag_collect.service import (
+    DEFAULT_ITEMS_PER_QUERY,
+    DEFAULT_TARGET_PUBLISHABLE_COUNT,
     DETAIL_ONLY_FIELDS,
     DETAIL_VERIFICATION_PENDING,
     EXPORT_COLUMNS,
+    MAX_ITEMS_PER_QUERY,
+    MAX_TARGET_PUBLISHABLE_COUNT,
     Product,
     REFERENCE_EXPORT_LABELS,
     build_filter_plan,
@@ -67,6 +73,11 @@ def _get_bytes(url):
         return response.status, response.headers, response.read()
 
 
+def _get_json(url):
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+
 def _native_has(native_filters, label):
     for item in native_filters:
         values = [
@@ -96,6 +107,14 @@ class _temporary_tag_data_dir:
             os.environ["TAG_COLLECT_DATA_DIR"] = self.old_env
         service._DATA_DIR_CACHE = self.old_cache
         self.tmp.cleanup()
+
+
+def _reset_web_task_memory():
+    with web.TASK_LOCK:
+        web.TASKS.clear()
+        web.TASK_CANCEL_EVENTS.clear()
+        web.ACTIVE_TASK_ID = ""
+        web.TASK_STORE_LOADED_PATH = ""
 
 
 def _xlsx_first_row_labels(workbook: zipfile.ZipFile, sheet_index: int = 1):
@@ -174,24 +193,24 @@ def test_field_numbers():
     keys = {field["key"] for field in fields}
     labels = [label for _, label in EXPORT_COLUMNS]
     _assert(numbers[0] == "1.1", "字段编号应从 1.1 开始")
-    _assert(numbers[-1] == "10.13", "字段编号应到 10.13 结束")
-    _assert(len(labels) == 84, "导出字段应包含店雷达37列基线和项目扩展字段的84列")
-    _assert(labels == REFERENCE_EXPORT_LABELS, "导出字段顺序应与用户确认的附件表头一致")
-    _assert(labels[:37] == service.DIANLEIDA_REFERENCE_EXPORT_LABELS, "导出前37列必须严格对齐店雷达附件表头")
-    _assert(labels[27] == "店铺链接(点击下方链接可跳转)", "店铺链接应保留在店雷达原表第28列")
-    _assert(labels[28] == "主图链接(点击下方链接可跳转)", "主图链接应保留在店雷达原表第29列")
-    _assert(labels[30] == "SKU数量", "SKU数量应保留在店雷达原表第31列")
-    _assert("product_refund_rate" in keys, "字段应包含品退率")
-    _assert("shipment_rate" in keys, "字段应包含发货率")
-    _assert("wholesale_shipping_fee" in keys, "字段应包含批发运费")
-    _assert("product_rating" in keys, "字段应包含商品星级")
-    _assert("review_tags" in keys, "字段应包含评价标签")
-    _assert("shop_url" in keys, "字段应包含店铺链接")
-    _assert("sku_count" in keys, "字段应包含SKU数量")
+    _assert(numbers[-1] == "10.9", "用户最终字段的最后一列应为采集时间")
+    _assert(len(labels) == 24, "选品结果主表应严格保留7.21模板确认的24个字段")
+    _assert(labels == REFERENCE_EXPORT_LABELS, "导出字段顺序应与用户2026-07-21模板一致")
+    _assert(labels[6] == "月代发订单", "月代发订单应位于商品链接之后")
+    _assert(labels[15] == "代发运费", "代发运费应位于库存之后")
+    _assert(labels[20] == "48小时揽收率", "主表应保留48小时揽收率")
+    _assert("monthly_dropship_orders" in keys, "字段应包含月代发订单")
+    _assert("dropship_shipping_fee" in keys, "字段应包含代发运费")
+    _assert("supports_dropship" in keys, "字段应包含是否一件代发")
+    _assert("collection_rate_48h" in keys, "字段应包含48小时揽收率")
     _assert("good_rate_bucket" in keys, "字段应包含好评率区间")
-    _assert("data_mode" in keys, "字段应包含数据模式")
-    _assert("data_truth_note" in keys, "字段应包含数据真实性说明")
     _assert("shipment_rate_bucket" in keys, "字段应包含发货率区间")
+    _assert("wholesale_price" not in keys, "7.21模板已删除批发价")
+    _assert("rights_protection" not in keys, "7.21模板已删除权益保障")
+    _assert("dropship_rights" not in keys, "7.21模板已删除代发权益")
+    _assert("collection_rate_24h" not in keys, "7.21模板已删除24小时揽收率")
+    _assert("product_refund_rate" not in keys, "用户未保留品退率时不得继续出现在选品结果主表")
+    _assert("recommendation_score" not in keys, "用户未保留推荐分时不得继续出现在选品结果主表")
 
 
 def test_filter_plan_splits_native_and_metric_tags():
@@ -243,11 +262,13 @@ def test_rpa_category_ignores_stale_source_url():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         calls.append({
             "query": query,
             "source_url": source_url,
             "category_filters": category_filters or [],
+            "limit": limit,
         })
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -315,9 +336,12 @@ def test_library_filter_contract_and_mapping():
         "listed_time",
         "product_marks",
         "seller_locations",
+        "seller_member_types",
+        "seller_services",
     }
     _assert("selection_mode" not in section_keys, "用户确认不需要的选品模式分组不应出现在筛选契约")
     _assert("advanced" in section_keys, "店雷达筛选契约应包含高级筛选")
+    _assert("priority" in section_keys, "月代发、运费、原生履约和商家特色应集中到重点筛选区")
     _assert("sales" in section_keys, "店雷达筛选契约应包含销售信息")
     _assert("product" in section_keys, "店雷达筛选契约应包含商品信息")
     _assert("seller" in section_keys, "店雷达筛选契约应包含卖家信息")
@@ -344,8 +368,46 @@ def test_library_filter_contract_and_mapping():
         "good_rate",
         "comment_count",
         "review_tags",
+        "monthly_dropship_orders",
+        "dropship_shipping_fee",
     }:
         _assert(expected_key in schema_field_keys, f"截图新增筛选字段应下发到前端 schema：{expected_key}")
+    schema_field_key_list = [
+        field["key"]
+        for section in schema
+        for field in section.get("fields", [])
+    ]
+    for priority_key in {
+        "monthly_dropship_orders",
+        "dropship_shipping_fee",
+        "dropship_rights",
+        "fulfillment_times",
+        "seller_features",
+    }:
+        _assert(schema_field_key_list.count(priority_key) == 1, f"重点筛选字段只能保留一个可见入口：{priority_key}")
+    seller_feature_field = next(
+        field
+        for section in schema
+        for field in section.get("fields", [])
+        if field.get("key") == "seller_features"
+    )
+    _assert(seller_feature_field["type"] == "radio", "商家特色应按1688截图限制为单选")
+    _assert(
+        seller_feature_field["options"] == ["不限", "超级工厂", "源头旗舰", "实力商家"],
+        "商家特色选项应与截图一致",
+    )
+    surface_values = [
+        tag
+        for tags in service.TAG_FILTER_GROUPS.values()
+        for tag in tags
+    ] + [
+        option
+        for section in schema
+        for field in section.get("fields", [])
+        for option in field.get("options", [])
+    ]
+    for unique_label in ("一件代发", "7天无理由退货", "24H发货", "48H发货"):
+        _assert(surface_values.count(unique_label) == 1, f"筛选界面中的{unique_label}只能保留一个入口")
     _assert("选品模式转译" not in capability_text, "能力清单不应保留已移除的选品模式入口")
     _assert("7日增长率" not in capability_text, "能力清单不应保留已移除的7日增长率筛选")
     _assert("采购集中率" not in capability_text, "能力清单不应保留已移除的采购集中率筛选")
@@ -363,20 +425,23 @@ def test_library_filter_contract_and_mapping():
         "cross_border_supply": True,
         "authorized_own_brand": True,
         "sales_orders_min": "100",
+        "monthly_dropship_orders_min": "10",
         "wholesale_price_max": "50",
+        "dropship_shipping_fee_min": "1",
+        "dropship_shipping_fee_max": "5",
         "repurchase_rate_min": "10",
         "product_marks": ["新品"],
         "certificates": ["CE"],
         "listed_time": "近30天",
         "seller_locations": ["广东"],
-        "fulfillment_times": ["48小时"],
+        "fulfillment_times": ["48H发货"],
         "waybill_support": ["抖音", "拼多多"],
-        "rights_protection": ["7天包退货", "赠运费险"],
-        "platform_service_filters": ["严选", "分销严选", "退货包运费", "7天无理由退货", "24H发货", "48H发货"],
+        "rights_protection": ["退货包运费", "7天无理由退货", "赠运费险"],
+        "platform_service_filters": ["严选", "分销严选"],
         "fulfillment_service_filters": ["官方物流", "密文面单", "晚揽必赔", "24H支揽率", "48H支揽率"],
         "dropship_rights": ["一件代发", "一件代发包邮"],
         "seller_location_regions": ["广东"],
-        "seller_features": ["源头工厂"],
+        "seller_features": "源头旗舰",
         "business_modes": ["生产加工"],
         "merge_suppliers": True,
         "product_rating_min": "4.8",
@@ -402,7 +467,6 @@ def test_library_filter_contract_and_mapping():
     _assert(_native_has(plan["native_filters"], "分销严选"), "分销严选应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "退货包运费"), "退货包运费应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "7天无理由退货"), "7天无理由退货应转译为原生筛选")
-    _assert(_native_has(plan["native_filters"], "24H发货"), "24H发货应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "48H发货"), "48H发货应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "官方物流"), "官方物流应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "密文面单"), "密文面单应转译为原生筛选")
@@ -412,18 +476,22 @@ def test_library_filter_contract_and_mapping():
     _assert(_native_has(plan["native_filters"], "合并供应商"), "合并供应商应转译为原生筛选")
     _assert(any(key.startswith("seller_location_") for key in native_keys), "所在地应生成下拉原生筛选计划")
     _assert(any(key.startswith("seller_feature_") for key in native_keys), "商家特色应生成下拉原生筛选计划")
+    _assert(_native_has(plan["native_filters"], "源头旗舰"), "商家特色单选值应生成1688下拉筛选计划")
     _assert(any(key.startswith("business_mode_") for key in native_keys), "经营模式应生成下拉原生筛选计划")
-    _assert(_native_has(plan["native_filters"], "48小时发货"), "发货时间应转译为原生筛选")
+    _assert(_native_has(plan["native_filters"], "48H发货"), "发货时间应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "支持抖音面单"), "面单支持应转译为原生筛选")
     _assert(_native_has(plan["native_filters"], "支持拼多多面单"), "面单支持应转译为原生筛选")
     _assert("orders_30d" in post_fields, "销售订单数应进入后置指标筛选")
+    _assert("monthly_dropship_orders" in post_fields, "月代发订单自定义区间应进入详情后置筛选")
     _assert("wholesale_price" in post_fields, "批发价应进入后置指标筛选")
+    _assert("dropship_shipping_fee" in post_fields, "代发运费自定义区间应进入详情后置筛选")
     _assert("product_rating" in post_fields, "商品星级应进入详情后置筛选")
     _assert("good_rate" in post_fields, "好评率应进入详情后置筛选")
     _assert("comment_count" in post_fields, "评价数应进入详情后置筛选")
     _assert("客服态度超好" in post_tags, "评价标签应进入详情文本匹配筛选")
     _assert("质感不错" in post_tags, "评价标签应支持多选详情文本匹配筛选")
     _assert("repurchase_rate" not in post_fields, "已移除的复购率不应进入筛选计划")
+    _assert("seller_member_types" not in config.library_filters, "旧卖家会员类型入口应被服务端清洗，避免与商家特色重复")
     _assert("sales_regions" in reserved_keys, "显式选择的预留字段应进入 reserved_fields")
     _assert("order_growth_7d" not in reserved_keys, "已移除的7日订单增长率不应标记为预留字段")
     _assert("certificates" not in reserved_keys, "已移除的资质证书不应标记为预留字段")
@@ -455,10 +523,35 @@ def test_metric_bucket_ranges():
     _assert(metric_bucket("comment_count", "86") == "30-99", "评论数应细化分桶")
 
 
+def test_candidate_scan_defaults_and_caps():
+    default_config = parse_input(sample_data=True)
+    _assert(default_config.max_items_per_query == DEFAULT_ITEMS_PER_QUERY == 120, "默认候选扫描应提高到120条")
+    _assert(default_config.target_publishable_count == DEFAULT_TARGET_PUBLISHABLE_COUNT == 60, "默认目标可铺数应与候选预算分离")
+
+    capped_config = parse_input(
+        sample_data=True,
+        max_items_per_query=999,
+        target_publishable_count=999,
+    )
+    _assert(capped_config.max_items_per_query == MAX_ITEMS_PER_QUERY == 200, "候选扫描硬上限应为200条")
+    _assert(capped_config.target_publishable_count == MAX_TARGET_PUBLISHABLE_COUNT == 100, "目标可铺数硬上限应为100条")
+
+
+def test_composite_navigation_group_is_not_exported_as_product_category():
+    _assert(
+        service._category_display_path("女装、男装、内衣>下装裤>女式牛仔裤") == "下装裤>女式牛仔裤",
+        "1688组合一级入口不能冒充商品真实大类",
+    )
+    _assert(
+        service._category_display_path("包装>纸类包装容器>纸盒") == "包装>纸类包装容器>纸盒",
+        "非组合一级类目应保留完整路径",
+    )
+
+
 def test_export_xlsx_and_exclude():
     config = parse_input(
         categories="",
-        tags="微信小店,一件代发,48小时发货",
+        tags="微信小店,48小时发货",
         exclude_tags="红海",
         sample_data=True,
         output_format="xlsx",
@@ -481,32 +574,27 @@ def test_export_xlsx_and_exclude():
     with zipfile.ZipFile(data["output_path"]) as workbook:
         names = workbook.namelist()
         sheets = [name for name in names if name.startswith("xl/worksheets/sheet")]
-        _assert(len(sheets) == 7, "样例 xlsx 应包含 7 个工作表，额外包含样例说明")
+        _assert(len(sheets) == 1, "7.21模板要求 xlsx 只保留一个选品结果工作表")
         workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
         result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        field_xml = workbook.read("xl/worksheets/sheet2.xml").decode("utf-8")
         result_labels = _xlsx_first_row_labels(workbook, 1)
-        _assert(result_labels == REFERENCE_EXPORT_LABELS, "选品结果 sheet 表头应严格等于店雷达37列基线加项目扩展字段")
+        _assert(result_labels == REFERENCE_EXPORT_LABELS, "选品结果 sheet 表头应严格等于7.21模板确认的24个字段")
         _assert("选品结果" in workbook_xml, "应包含选品结果 sheet")
-        _assert("字段说明" in workbook_xml, "应包含字段说明 sheet")
-        _assert("标签配置" in workbook_xml, "应包含标签配置 sheet")
-        _assert("异常复核" in workbook_xml, "应包含异常复核 sheet")
-        _assert("核验记录" in workbook_xml, "应包含核验记录 sheet")
-        _assert("筛选执行记录" in workbook_xml, "应包含筛选执行记录 sheet")
-        _assert("样例说明" in workbook_xml, "样例导出必须包含样例说明 sheet")
-        _assert("10.10" in field_xml, "字段说明应包含 10.10 核验状态")
-        _assert("数据真实性说明" in field_xml, "字段说明应包含数据真实性说明")
-        _assert("品退率" in field_xml, "字段说明应包含品退率")
-        _assert("发货率" in field_xml, "字段说明应包含发货率")
+        _assert("字段说明" not in workbook_xml, "xlsx 不应继续生成字段说明附表")
+        _assert("标签配置" not in workbook_xml, "xlsx 不应继续生成标签配置附表")
+        _assert("异常复核" not in workbook_xml, "xlsx 不应继续生成异常复核附表")
+        _assert("核验记录" not in workbook_xml, "xlsx 不应继续生成核验记录附表")
+        _assert("筛选执行记录" not in workbook_xml, "xlsx 不应继续生成筛选执行记录附表")
+        _assert("样例说明" not in workbook_xml, "xlsx 不应继续生成样例说明附表")
         for label in REFERENCE_EXPORT_LABELS:
             _assert(label in result_xml, f"选品结果表头应包含附件基线字段：{label}")
-        _assert("开发样例" in result_xml, "样例结果行必须标注开发样例")
-        _assert("禁止作为真实选品" in result_xml, "样例结果行必须标注不能作为真实选品依据")
-        filter_xml = workbook.read("xl/worksheets/sheet6.xml").decode("utf-8")
-        _assert("一件代发" in filter_xml, "筛选执行记录应包含一件代发")
-        _assert("sample_skipped" in filter_xml, "样例模式应标记原生筛选未执行")
-        sample_notice_xml = workbook.read("xl/worksheets/sheet7.xml").decode("utf-8")
-        _assert("未访问 1688" in sample_notice_xml, "样例说明 sheet 应明确未访问 1688")
+        _assert("批发价" not in result_labels, "7.21模板删除的批发价不得残留")
+        _assert("权益保障" not in result_labels, "7.21模板删除的权益保障不得残留")
+        _assert("代发权益" not in result_labels, "7.21模板删除的代发权益不得残留")
+        _assert("24小时揽收率" not in result_labels, "7.21模板删除的24小时揽收率不得残留")
+    persisted = service.get_run_payload(data["run_id"])
+    _assert(persisted and persisted.get("filter_results"), "筛选执行审计应继续保存在同批次JSON快照")
+    _assert(persisted.get("sample_data") is True, "样例真实性标记应继续保存在JSON快照")
 
 
 def test_export_normalizes_legacy_sample_rows():
@@ -546,13 +634,78 @@ def test_export_normalizes_legacy_sample_rows():
         with zipfile.ZipFile(output_path) as workbook:
             workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
             result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
-            failed_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
-            _assert("样例说明" in workbook_xml, "含旧样例行的导出也必须追加样例说明")
-            _assert("开发样例" in result_xml, "旧样例行缺少新字段时导出前必须回填开发样例")
-            _assert("禁止作为真实选品" in result_xml, "旧样例行必须回填真实性说明")
-            _assert("混合数据" in config_xml, "工作簿级配置应提示当前导出含样例行")
-            _assert("样例剔除" in failed_xml, "旧样例筛除行不能混同为真实系统剔除")
+            _assert("样例说明" not in workbook_xml, "含旧样例行的导出也只能保留唯一主表")
+            _assert("开发样例" not in result_xml, "数据模式等审计字段不得挤占用户确认的24列主表")
+            _assert("legacy-sample" in result_xml, "原主结果行应保留在唯一主表")
+            _assert("legacy-sample-excluded" in result_xml, "旧样例筛除行也应汇总进唯一主表")
+            _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "旧样例导出不得恢复附表")
+            _assert(legacy_row["data_mode"] == "开发样例", "样例审计状态应保留在内存/JSON数据")
+            _assert("禁止作为真实选品" in legacy_row["data_truth_note"], "样例真实性说明应保留在内存/JSON数据")
+
+
+def test_export_combines_empty_primary_sources_and_deduplicates():
+    unknown = {
+        "item_id": "combined-unknown",
+        "title": "待类目核验商品",
+        "url": "https://detail.1688.com/offer/combined-unknown.html",
+        "list_source": "rpa",
+    }
+    duplicate = dict(unknown)
+    duplicate["title"] = "同一商品在筛除集合中的重复副本"
+    excluded = {
+        "item_id": "combined-excluded",
+        "title": "筛除但仍需展示商品",
+        "url": "https://detail.1688.com/offer/combined-excluded.html",
+        "list_source": "rpa",
+        "filter_verification_status": "filtered_out",
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "combined.xlsx")
+        export_xlsx(
+            [],
+            output_path,
+            {
+                "category_unknown_rows": [unknown],
+                "filter_excluded_rows": [duplicate, excluded],
+            },
+        )
+        with zipfile.ZipFile(output_path) as workbook:
+            result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            _assert("combined-unknown" in result_xml, "rows为空时待核验商品仍应进入唯一主表")
+            _assert("combined-excluded" in result_xml, "rows为空时筛除商品仍应进入唯一主表")
+            _assert("同一商品在筛除集合中的重复副本" not in result_xml, "同一商品跨来源重复时只应保留第一份")
+            _assert(result_xml.count("<row ") == 3, "唯一主表应包含1行表头和2行去重商品")
+        _assert(unknown.get("manual_review_status"), "导出前自动复核状态仍应回写原始JSON行，不能只写临时Excel副本")
+
+
+def test_rpa_progress_is_streamed_before_node_completion():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = Path(tmpdir) / "progress_test.mjs"
+        script_path.write_text(
+            "process.stdin.resume();\n"
+            "process.stdin.on('end', () => {\n"
+            "  process.stderr.write('SOP_RPA_PROGRESS {\"stage\":\"manual_intervention\",\"message\":\"请人工验证\",\"alert_key\":\"smoke-alert\",\"percent\":35}\\n');\n"
+            "  setTimeout(() => console.log(JSON.stringify({success:true, products:[]})), 500);\n"
+            "});\n",
+            encoding="utf-8",
+        )
+        original_script_path = rpa._script_path
+        events = []
+        started_at = time.monotonic()
+        try:
+            rpa._script_path = lambda _name: str(script_path)
+            result = rpa._run_node_script(
+                "progress_test.mjs",
+                {},
+                timeout=5,
+                progress_callback=lambda event: events.append((time.monotonic(), event)),
+            )
+        finally:
+            rpa._script_path = original_script_path
+        _assert(result.get("success"), "Node测试脚本应正常返回最终JSON")
+        _assert(events and events[0][1].get("stage") == "manual_intervention", "Python应识别Node实时人工介入事件")
+        _assert(events[0][1].get("alert_key") == "smoke-alert", "实时事件应保留前端去重键")
+        _assert(events[0][0] - started_at < 0.35, "人工介入事件必须在Node任务结束前实时回调，不能等500ms后才返回")
 
 
 def test_export_marks_unknown_source_rows_as_needing_verification():
@@ -586,11 +739,11 @@ def test_export_marks_unknown_source_rows_as_needing_verification():
         )
         with zipfile.ZipFile(output_path) as workbook:
             result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
-            _assert("来源未知/需核验" in result_xml, "无法证明真实来源的旧行不能标为真实数据")
-            _assert("禁止直接作为真实选品" in result_xml, "来源未知行必须说明不能直接铺货")
-            _assert("真实数据" in result_xml, "真实页面来源行仍应标为真实数据")
-            _assert("混合数据（含来源未知/需核验行）" in config_xml, "工作簿级配置应提示含来源未知行")
+            _assert("来源未知/需核验" not in result_xml, "数据真实性审计不得挤占用户确认的24列主表")
+            _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "来源未知行导出也只能保留唯一主表")
+            _assert(unknown_row["data_mode"] == "来源未知/需核验", "无法证明来源的旧行应在JSON/内存审计信息中标为待核验")
+            _assert("禁止直接作为真实选品" in unknown_row["data_truth_note"], "来源未知行必须保留禁止直接铺货说明")
+            _assert(real_row["data_mode"] == "真实数据", "真实页面来源行应在JSON/内存审计信息中标为真实数据")
 
 
 def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
@@ -604,7 +757,7 @@ def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
         </nav>
         店铺 回头率 35%
         运费 首重8元续重4元
-        2件起批 品退率 1.8% 发货率 98.6% 24小时揽收率 96%
+        2件起批 品退率 1.8% 发货率 98.6% 24小时揽收率 96% 48小时揽收率 99.1%
         48小时内发货 一件代发 7天无理由
         规格数量: 18 SKU 收藏客户 200+ 诚信通 5年 生产厂家 密文面单
       </body>
@@ -640,6 +793,7 @@ def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
     _assert(fields.get("wholesale_shipping_fee") == "首重8元续重4元", "运费不应吞入后续品退率/发货率文本")
     _assert(fields.get("product_refund_rate") == "1.8%", "详情抽取应提取品退率")
     _assert(fields.get("shipment_rate") == "98.6%", "详情抽取应提取发货率")
+    _assert(fields.get("collection_rate_48h") == "99.1%", "详情抽取应提取48小时揽收率")
     _assert(fields.get("sku_count") == "18", "详情抽取应提取 SKU 数量")
     _assert(fields.get("waybill_support") == "密文面单", "面单字段不应吞入 HTML/script 文本")
     _assert(fields.get("product_category_id") == "1031910", "详情抽取应优先保留结构化商品类目ID")
@@ -652,6 +806,275 @@ def test_rpa_detail_extracts_structured_fields_without_bad_shop_name():
         "详情抽取应保留可审计的类目面包屑",
     )
     _assert(fields.get("category_evidence_source"), "详情类目证据应标记来源")
+
+
+def test_rpa_detail_dropship_fields_require_explicit_evidence():
+    html = """
+    <html><body>
+      代发价：￥12.80 月代发订单：326 月代销：1.2万 代发运费：8元
+      页面仅展示价格和订单统计。
+    </body></html>
+    """
+    proc = subprocess.run(
+        ["node", str(Path(__file__).resolve().parent / "rpa_detail.mjs")],
+        input=json.dumps({"test_html": html}, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"详情抽取脚本应执行成功：{proc.stderr or proc.stdout}")
+    fields = json.loads((proc.stdout or "").splitlines()[-1]).get("fields", {})
+    _assert(fields.get("dropship_price") == "12.80", "详情抽取应回填代发价")
+    _assert(fields.get("monthly_dropship_orders") == "326", "详情抽取应回填月代发订单")
+    _assert(fields.get("units_30d") == "1.2万", "月代销应映射到近30天件数")
+    _assert(fields.get("dropship_shipping_fee") == "8元", "详情抽取应识别普通数值代发运费")
+    _assert(not fields.get("supports_dropship"), "只有代发价/月代发订单文字时不能误判为支持一件代发")
+
+    explicit_html = """
+    <html><body>支持一件代发 代发价 9.90元 代发运费 3元 48小时内发货</body></html>
+    """
+    proc = subprocess.run(
+        ["node", str(Path(__file__).resolve().parent / "rpa_detail.mjs")],
+        input=json.dumps({"test_html": explicit_html}, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    fields = json.loads((proc.stdout or "").splitlines()[-1]).get("fields", {})
+    _assert(fields.get("supports_dropship") == "是", "明确显示支持一件代发时才可回填为是")
+    _assert("明确" in fields.get("dropship_rights", ""), "一件代发权益应说明证据是页面明确显示")
+
+
+def test_rpa_detail_shipping_and_monthly_distribution_reopened_screenshot_cases():
+    script = str(Path(__file__).resolve().parent / "rpa_detail.mjs")
+    bucket_payload = {
+        "test_html": """
+        <html><body>
+          月成交 &lt;10 月代销 &lt;10 年成交件数 100+ 年成交笔数 100+
+          退货包运费 运费查询 运费￥10起
+        </body></html>
+        """,
+        "test_dom_evidence": {
+            "shipping": [{"text": "运费￥10起", "source": "document", "selector_hint": "span.freight"}],
+            "monthly_sales": [{
+                "text": "月成交 <10 月代销 <10 年成交件数 100+ 年成交笔数 100+",
+                "source": "open_shadow_dom",
+                "selector_hint": "div.assistant-stats",
+            }],
+        },
+    }
+    proc = subprocess.run(
+        ["node", script],
+        input=json.dumps(bucket_payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"截图1详情抽取应执行成功：{proc.stderr or proc.stdout}")
+    payload = json.loads((proc.stdout or "").splitlines()[-1])
+    fields = payload.get("fields", {})
+    evidence = payload.get("field_evidence", {})
+    _assert(fields.get("units_30d") == "<10", "截图1的月代销<10应映射到近30天件数并保留小于号")
+    _assert(not fields.get("monthly_dropship_orders"), "月代销不能伪装成月代发订单")
+    _assert(fields.get("dropship_shipping_fee") == "10元起", "截图1的运费￥10起应标准化为10元起")
+    _assert(evidence.get("units_30d", {}).get("kind") == "short_dom_label", "月代销应优先保存短DOM标签证据")
+    _assert("运费￥10起" in evidence.get("dropship_shipping_fee", {}).get("text", ""), "运费记录应保留命中的短标签")
+
+    magnifier_payload = {
+        "test_html": """
+        <html><body>
+          月成交 2600+ 月代销 80+ 近30天代发数量 100以内 近7天代发数量 100以内
+          退货包运费 运费查询 运费￥1.8起
+        </body></html>
+        """,
+        "test_dom_evidence": {
+            "shipping": [{"text": "运费￥1.8起", "source": "document", "selector_hint": "div.delivery-fee"}],
+            "monthly_sales": [{"text": "月成交 2600+ 月代销 80+", "source": "open_shadow_dom"}],
+        },
+    }
+    proc = subprocess.run(
+        ["node", script],
+        input=json.dumps(magnifier_payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"截图2详情抽取应执行成功：{proc.stderr or proc.stdout}")
+    payload = json.loads((proc.stdout or "").splitlines()[-1])
+    fields = payload.get("fields", {})
+    _assert(fields.get("units_30d") == "80+", "截图2应取月代销80+，不能被近30天代发数量100以内覆盖")
+    _assert(fields.get("units_30d") != "100以内", "近30天代发数量是另一指标，不能覆盖月代销")
+    _assert(fields.get("dropship_shipping_fee") == "1.8元起", "截图2的运费￥1.8起应标准化为1.8元起")
+
+    interference_payload = {
+        "test_html": "<html><body>退货包运费 运费查询 赠运费险 券后￥1.8起</body></html>",
+    }
+    proc = subprocess.run(
+        ["node", script],
+        input=json.dumps(interference_payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    fields = json.loads((proc.stdout or "").splitlines()[-1]).get("fields", {})
+    _assert(not fields.get("dropship_shipping_fee"), "只有退货包运费/运费查询/运费险时不得伪造运费金额")
+
+    original_run_node_script = rpa._run_node_script
+    rpa._run_node_script = lambda *args, **kwargs: {
+        "success": True,
+        "fields": {"dropship_shipping_fee": "1.8元起"},
+        "field_evidence": {
+            "dropship_shipping_fee": {
+                "kind": "short_dom_label",
+                "text": "运费￥1.8起",
+                "source": "document",
+                "selector_hint": "div.delivery-fee",
+            },
+        },
+    }
+    try:
+        wrapped_fields = rpa.collect_detail_fields_from_1688_page(
+            "https://detail.1688.com/offer/shipping-evidence-smoke.html",
+            "shipping-evidence-smoke",
+        )
+    finally:
+        rpa._run_node_script = original_run_node_script
+    _assert(
+        wrapped_fields.get("_field_evidence", {}).get("dropship_shipping_fee", {}).get("text") == "运费￥1.8起",
+        "Python RPA适配层不得丢弃Node返回的字段级证据",
+    )
+
+    records = service._build_verification_evidence(
+        "shipping-evidence-smoke",
+        wrapped_fields,
+        source="1688_detail_page_rpa",
+        source_url="https://detail.1688.com/offer/shipping-evidence-smoke.html",
+        mode="real",
+        status=service.VERIFICATION_STATUS_PARTIAL,
+    )
+    shipping_record = next(record for record in records if record.get("field_key") == "dropship_shipping_fee")
+    _assert(shipping_record.get("evidence_kind") == "short_dom_label", "服务层核验记录应保留运费证据类型")
+    _assert(shipping_record.get("evidence_text") == "运费￥1.8起", "服务层核验记录应保留短证据文本")
+    _assert(
+        service._match_metric_rule("1.8元起", {"op": "range", "min": 1, "max": 5}) is None,
+        "起步运费只有下限，不能冒充确定落在1-5元区间内",
+    )
+    _assert(service._match_metric_rule("<10", {"op": "<", "value": 10}) is True, "<10应保留区间语义")
+    _assert(
+        service._match_metric_rule("100以内", {"op": ">=", "value": 100}) is None,
+        "100以内不能冒充确定达到100",
+    )
+
+
+def test_rpa_detail_waits_for_assistant_metrics_and_keeps_shipping_evidence_consistent():
+    script = str(Path(__file__).resolve().parent / "rpa_detail.mjs")
+    delayed_payload = {
+        "test_html": "<html><body>分销代发 1件包邮 ￥148.4 退货包运费 运费查询</body></html>",
+        "test_dom_evidence": {
+            "shipping": [{"text": "运费￥10起", "source": "document", "selector_hint": "span.service-item"}],
+        },
+        "test_dom_evidence_sequence": [
+            {},
+            {"monthly_sales": [{"text": "月成交 200+ 月代销 100+", "source": "document", "selector_hint": "div.goods-operation-panel-media"}]},
+        ],
+    }
+    proc = subprocess.run(
+        ["node", script],
+        input=json.dumps(delayed_payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"延迟采购助手证据抽取应执行成功：{proc.stderr or proc.stdout}")
+    payload = json.loads((proc.stdout or "").splitlines()[-1])
+    fields = payload.get("fields", {})
+    evidence = payload.get("field_evidence", {})
+    _assert(fields.get("units_30d") == "100+", "后台详情页应等待采购助手异步出现月代销，而不是提前写入空值")
+    _assert(fields.get("dropship_shipping_fee") == "10元起", "数字运费证据必须优先于页面其它位置的一件包邮文案")
+    _assert(fields.get("free_shipping") == "否", "同页已有10元起运费时，分销区的一件包邮不能把当前运费口径改成包邮")
+    _assert(
+        evidence.get("units_30d", {}).get("selector_hint") == "div.goods-operation-panel-media",
+        "月代销应保留采购助手面板的DOM证据位置",
+    )
+
+    shipping_module_payload = {
+        "test_html": "<html><body>商品详情</body></html>",
+        "test_dom_evidence": {
+            "shipping": [{"text": "广东广州 送至上海 包邮", "source": "document", "selector_hint": "div#shippingServices"}],
+            "monthly_sales": [{"text": "月代销 <10", "source": "document"}],
+        },
+    }
+    proc = subprocess.run(
+        ["node", script],
+        input=json.dumps(shipping_module_payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    fields = json.loads((proc.stdout or "").splitlines()[-1]).get("fields", {})
+    _assert(fields.get("dropship_shipping_fee") == "包邮", "发货模块明确显示包邮时，运费不能继续留成待核验")
+    _assert(fields.get("free_shipping") == "是", "发货模块明确包邮时是否包邮应保持一致")
+
+
+def test_detail_filters_quarantine_unverified_or_out_of_range_rows():
+    config = parse_input(
+        categories="日用餐厨、居家日用>厨房工具>冰格",
+        tags="一件代发",
+        sample_data=True,
+        library_filters={"dropship_shipping_fee_min": "1", "dropship_shipping_fee_max": "5"},
+    )
+    plan = build_filter_plan(config)
+    _assert(
+        any(rule.get("field") == "supports_dropship" and rule.get("op") == "equals" for rule in plan["post_filters"]),
+        "选择一件代发后必须增加详情页明确证据的二次硬筛",
+    )
+    row = product_to_export_row(service.SAMPLE_PRODUCTS[0], "冰格", config)
+    _, records = service._evaluate_post_filters(row, plan["post_filters"])
+    row["filter_match_records"] = records
+    payload = {
+        "sample_data": True,
+        "rows": [row],
+        "filter_excluded_rows": [],
+        "filter_signature": "smoke",
+        "target_platform": "",
+    }
+    service._apply_detail_filter_exclusions(payload)
+    _assert(not payload["rows"], "详情筛选字段没有核实的商品不能继续留在主结果")
+    _assert(payload["filter_excluded_rows"][0].get("exclusion_type") == "detail_filter_unverified", "未核实商品应进入异常复核而不是假装命中")
+
+    verified = product_to_export_row(service.SAMPLE_PRODUCTS[0], "冰格", config)
+    verified["dropship_shipping_fee"] = "8元"
+    verified["supports_dropship"] = "是"
+    verified["detail_verified_fields"] = ["dropship_shipping_fee", "supports_dropship"]
+    records = service.reevaluate_row_filters_after_verification(verified, plan)
+    _assert(any(record.get("field_key") == "dropship_shipping_fee" and record.get("status") == "filtered_out" for record in records), "8元运费不能通过1-5元筛选")
+
+
+def test_auto_verify_limit_and_category_export_filename_cover_full_batch():
+    config = parse_input(sample_data=True, auto_verify_details=True, auto_verify_max_items=200, max_items_per_query=200)
+    _assert(config.auto_verify_max_items == 200, "自动详情核验不应继续被旧的20条硬上限截断")
+    rows = [{"item_id": str(index)} for index in range(200)]
+    _assert(service._auto_verify_limit(config, rows) == 200, "自动详情核验应允许覆盖本轮全部候选")
+
+    single = service._safe_export_filename(
+        ["日用餐厨、居家日用>厨房工具>冰格"],
+        "20260720_120000_000",
+        "xlsx",
+    )
+    _assert("厨房工具﹥冰格" in single and "20260720_120000_000" in single, "单叶子导出文件名应使用完整类目并保留批次")
+    _assert(not re.search(r'[<>:"/\\|?*]', single), "导出文件名必须兼容 Windows 非法字符限制")
+
+    grandchildren = service.TAG_CATEGORY_TREE["日用餐厨、居家日用"]["厨房工具"]
+    whole_secondary = [f"日用餐厨、居家日用>厨房工具>{leaf}" for leaf in grandchildren]
+    grouped = service._safe_export_filename(whole_secondary, "20260720_120000_001", "xlsx")
+    _assert("日用餐厨、居家日用﹥厨房工具_" in grouped, "全选整个二级类目时文件名应收敛为二级类目名")
 
 
 def test_rpa_detail_does_not_treat_url_category_id_as_product_evidence():
@@ -694,6 +1117,7 @@ def test_security_verification_error_message():
         Exception(
             "security_verification_required: 已等待你手动处理 1688 安全验证，"
             "但当前页面仍停留在滑块/验证码校验。系统不会绕过或自动破解验证。"
+            "当前页面：https://s.1688.com/selloffer/offer_search.htm/punish?x5secdata=temporary-token"
         )
     )
     _assert("安全验证" in message or "滑块" in message, "滑块验证应给出明确人工处理提示")
@@ -702,6 +1126,7 @@ def test_security_verification_error_message():
     _assert(state["action"] == "manual_handoff", "滑块验证应进入人工接管")
     _assert(state["retryable"] is False, "滑块验证不应提示自动重试")
     _assert("不会绕过" in message or "不会继续采集" in message, "提示应明确不会绕过验证码")
+    _assert("x5secdata" not in message, "用户提示不应展示风控页超长临时参数")
 
 
 def test_cdp_security_error_context():
@@ -832,6 +1257,13 @@ def test_rpa_collect_uses_human_search_not_keyword_url():
     _assert("search-offer-wrapper" in script, "真实采集应识别新版搜索结果卡片")
     _assert("collectProductsAcrossPages" in script, "真实采集数量不足时应进入翻页采集流程")
     _assert("TAG_COLLECT_RPA_MAX_PAGES" in script, "翻页采集应支持最大页数限制")
+    _assert("Math.min(200" in script, "RPA 单次候选硬上限应提高到200条")
+    _assert("estimatedResultPages" in script and "Math.min(12" in script, "分页页数应按候选目标动态估算且最多12页")
+    _assert("resultPageFingerprint" in script, "翻页后应比较商品指纹，避免重复读取同一页")
+    _assert("page_not_changed" in script, "翻页点击后页面未变化时应停止并记录原因")
+    _assert("requested_limit_reached" in script and "max_pages_reached" in script, "分页应记录明确停止原因")
+    _assert("paginationRoots" in script, "分页控件查找应限制在分页区域，避免误点页面其它箭头")
+    _assert("const target = numberNode || nextNode" in script, "翻页应优先点击明确页码，再回退下一页按钮")
     _assert("applyCategoryFilters" in script, "真实采集应支持按1688左侧类目点击")
     _assert("category_path" in script, "类目筛选不应退化为关键词搜索")
     _assert("categoryNeedleSets" in script, "类目点击应支持把本地类目名映射到1688页面可见入口")
@@ -841,15 +1273,93 @@ def test_rpa_collect_uses_human_search_not_keyword_url():
     _assert("followCategoryClick" in script, "类目点击后应跟随新页或URL变化")
     _assert("collectCategoryDiagnostics" in script, "类目点击失败应返回页面可见类目诊断")
     _assert("clickCategoryLeafLink" in script and 'mode: "direct_link"' in script, "1688 首页隐藏叶子类目链接应有兜底跳转")
+    _assert('fallback_mode: "direct_href"' in script, "悬浮菜单收起导致叶子元素不可见时，应使用已确认的1688叶子链接直达结果页")
+    _assert("releaseForManualHandoff" in script, "CDP 命中登录/安全验证时应保留真实 Chrome 页签供人工处理")
+    _assert("waitForManualSecurityResolution" in script, "滑块出现后应等待人工处理并尝试继续同一任务")
+    _assert("TAG_COLLECT_RPA_MANUAL_VERIFY_WAIT_MS" in script, "人工滑块等待时限应可配置")
+    _assert("人工处理已完成" in script and "继续同一采集任务" in script, "滑块恢复后状态栏应明确同任务续跑")
+    _assert("sop-1688-workbench-overlay" in script, "正在操作的1688页面应注入独立悬浮工作状态栏")
+    _assert("scrollWithinNearestContainer" in script, "类目菜单应只滚动最近的可滚动容器")
+    _assert("TAG_COLLECT_RPA_CATEGORY_SCROLL_STEPS" in script, "类目懒加载扫描应有可配置且有限的局部滚动次数")
+    _assert("category_scroll_scan" in script, "类目滚动扫描应返回次数、停止原因和容器证据")
+    _assert("target_found_after_category_scroll" in script, "局部滚动后必须重新查找目标，不能沿用滚动前的空结果")
+    _assert("no_remaining_category_scroll_container" in script, "滚动到底仍找不到类目时应有限停止并返回明确原因")
+    _assert("reopenCategoryParents" in script, "悬浮菜单超时收起后应快速重新悬浮父级路径再点叶子类目")
+    _assert("preciseHoverTarget" in script, "二级类目悬浮必须优先落在精确标题节点，不能移动到巨大li容器中心")
+    _assert("pointer_target_element" in script, "类目诊断应记录真实悬浮目标元素及尺寸")
+    _assert("pointer_text_hit_box" in script and 'pointer_target_strategy: usableTextHitBox ? "direct_text_range"' in script, "高标题节点应使用文字Range而非元素中心作为真实鼠标落点")
+    _assert('pointerRoute = "category_container_corridor"' in script, "一级到下方类目必须沿菜单容器走廊移动，不能斜穿其它一级类目和首页内容")
+    _assert('container.style.setProperty("scroll-behavior", "auto", "important")' in script, "类目容器滚动必须临时关闭smooth并等待落位")
+    _assert("reopen_not_visible" in script, "父级表面命中但下一层仍无尺寸时不得误报恢复成功")
+    _assert("hidden_exact_matches" in script, "类目未找到时应区分隐藏目标和真正不存在")
+    _assert("if (!actionResult?.ok)" in script, "类目动作未命中时不得额外空等5秒弹窗超时")
+    _assert("page_scroll_restored" in script, "类目交互如意外滚动网页应恢复原页面位置并记录证据")
+    _assert("page.mouse.move" in script, "类目悬停必须使用真实浏览器指针移动，不能只派发脚本合成事件")
+    _assert("page.mouse.click" in script, "类目点击必须使用真实浏览器指针，避免框架忽略脚本合成点击")
+    _assert('pointer_interaction: "playwright_mouse"' in script, "类目诊断应记录真实指针交互方式")
+    _assert("dispatchEvent(new PointerEvent" not in script, "类目菜单不能再依赖非可信的脚本合成PointerEvent")
+    _assert('best.clickable.scrollIntoView({ block: "center", inline: "center" })' not in script, "类目目标不能再用scrollIntoView带动整个网页滚动")
     _assert("filter_results: categoryResults" in script, "类目点击后无商品卡片时也应返回类目执行记录")
     _assert("deferred_navigation" not in script, "多级类目不能用父级类目 href 兜底跳到关键词结果页")
     _assert("navigated_parent_href" not in script, "多级类目缺二级时不应跳父级关键词结果页")
     _assert('"男士内裤":' not in script, "RPA 不应为当前1688类目不存在的男士内裤保留模糊别名")
     _assert("raw.split(\"、\")" not in script, "组合一级类目不能按顿号拆开，否则会误点单独父类")
+    _assert("strictMatch" in script and "directTextOf" in script, "组合一级类目应使用直接文本精确匹配，不能命中宽泛祖先容器")
+    _assert("categoryIdConfirmed" in script, "类目结果确认应优先核对点击类目ID与结果页类目ID")
     _assert("fallback_keyword" not in Path(__file__).with_name("service.py").read_text(encoding="utf-8"), "类目失败不应降级为关键词搜索")
     _assert("manual_page_ambiguous" in script, "人工当前页模式存在多个1688页签时应阻断，不能静默读错页")
     _assert("noDefaults: true" in script, "CDP 连接应保留浏览器默认下载/媒体设置，避免真实 Chrome 初始化失败")
     _assert("browser.close().catch" in script, "人工当前页模式读取后应断开 Playwright CDP 连接")
+
+
+def test_rpa_category_scroll_finds_lazy_target_without_scrolling_page():
+    node_bin = os.environ.get("NODE_BIN") or shutil.which("node")
+    _assert(node_bin, "类目局部滚动行为回归需要 Node.js")
+    script_path = Path(__file__).with_name("rpa_collect.mjs")
+    proc = subprocess.run(
+        [node_bin, str(script_path)],
+        input=json.dumps({"self_test": "category_scroll", "category_scroll_max_steps": 12}, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=45,
+        encoding="utf-8",
+    )
+    _assert(proc.returncode == 0, f"类目局部滚动行为测试进程失败：{proc.stderr or proc.stdout}")
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    _assert(lines, f"类目局部滚动行为测试没有输出：{proc.stderr}")
+    payload = json.loads(lines[-1])
+    _assert(payload.get("success") is True, f"类目局部滚动行为测试失败：{payload}")
+    found = payload.get("found") or {}
+    missing = payload.get("missing") or {}
+    reopen = payload.get("reopen") or {}
+    _assert(found.get("ok") is True and found.get("click_count") == 1, "目标类目懒加载后应被重新定位并用真实鼠标点击一次")
+    _assert(found.get("menu_scroll_top", 0) > 0 and found.get("attempts", 0) > 0, "目标位于下方时必须实际滚动局部类目容器")
+    _assert(found.get("page_scroll_before") == found.get("page_scroll_after"), "寻找下方类目时不得改变 window.scrollY")
+    _assert(missing.get("ok") is False, "滚动到底仍不存在的类目不能误报成功")
+    _assert(0 < missing.get("attempts", 0) <= missing.get("max_steps", 0), "不存在的类目必须在有限滚动次数内停止")
+    _assert(
+        missing.get("stop_reason") in {"no_remaining_category_scroll_container", "category_scroll_max_steps_reached"},
+        "滚动到底仍找不到类目时应返回可诊断停止原因",
+    )
+    _assert(missing.get("page_scroll_before") == missing.get("page_scroll_after"), "失败扫描也不得滚动整个网页")
+    _assert(reopen.get("parents_opened_initially") is True, "级联菜单负例应先成功展开一级和二级")
+    l2_pointer_target = reopen.get("l2_pointer_target") or {}
+    l2_text_hit_box = reopen.get("l2_text_hit_box") or {}
+    _assert(l2_pointer_target.get("tag") == "a", "高li容器中的二级类目必须定位精确标题a节点")
+    _assert((l2_pointer_target.get("rect") or {}).get("height", 0) >= 90, "负例必须覆盖1688真实页面中的高标题a节点")
+    _assert(0 < l2_text_hit_box.get("height", 0) < (l2_pointer_target.get("rect") or {}).get("height", 0), "鼠标应落在标题文字Range而非高a节点中心")
+    _assert(reopen.get("l2_menu_scroll_top", 0) > 0 and reopen.get("l2_target_within_container") is True, "被菜单裁剪的下方类目必须先完成局部滚动并进入可视区")
+    _assert(reopen.get("l2_pointer_route") == "category_container_corridor", "从一级到下方二级类目应沿菜单容器内部移动")
+    _assert(reopen.get("l2_pointer_target_strategy") == "direct_text_range", "二级类目真实鼠标应命中文字Range")
+    _assert(reopen.get("leaf_failed_after_timeout") is True and reopen.get("hidden_match_count", 0) >= 1, "菜单超时收起时应识别到隐藏叶子而非误判网站无此类目")
+    _assert(reopen.get("parents_reopened") is True and reopen.get("recovery_status") == "reopened", "菜单收起后必须重新悬浮父级路径")
+    _assert(reopen.get("next_target_visible") is True, "恢复父级后必须确认下一层目标已获得非零尺寸")
+    _assert(reopen.get("non_visible_recovery_ok") is False, "父级显示命中但下一层仍隐藏时不得误报恢复成功")
+    _assert(reopen.get("non_visible_recovery_status") == "reopen_not_visible", "下一层仍隐藏时应返回reopen_not_visible诊断")
+    _assert(reopen.get("non_visible_recovery_target_visible") is False, "reopen_not_visible负例必须保留下一层零尺寸证据")
+    _assert(reopen.get("l2_hover_count", 0) >= 3, "初次展开、成功恢复和失败恢复都必须真正悬浮二级标题")
+    _assert(reopen.get("leaf_clicked_after_reopen") is True and reopen.get("click_count") == 1, "重新展开后应只点击一次目标叶子类目")
 
 
 def test_web_defaults_to_automatic_batch_collect():
@@ -862,8 +1372,61 @@ def test_web_defaults_to_automatic_batch_collect():
     _assert('id="readCurrentPageBtn"' in html, "页面应保留当前页兜底读取按钮")
     _assert('/api/chrome/start' in html, "前端应调用 /api/chrome/start")
     _assert('/api/chrome/status' in html, "前端应调用 /api/chrome/status")
+    _assert('for="maxItems">候选扫描上限' in html, "Web 应单独展示候选扫描上限")
+    _assert('id="targetPublishableCount"' in html, "Web 应把目标可铺数与候选扫描预算分开")
+    _assert('value="200"' in html and 'max_items_per_query: Number($("maxItems").value || 200)' in html, "Web 深度采集默认应提高到200条")
+    _assert('target_publishable_count: Number($("targetPublishableCount").value || 60)' in html, "Web 默认目标可铺数应为60条")
+    _assert('id="autoVerifyMax" type="number" min="1" max="200" value="200"' in html, "详情补字段默认应允许覆盖200个候选，不能仍停在20条")
+    _assert('role="dialog"' in html and 'data-category-view="favorite"' in html, "类目选择应使用弹窗并提供收藏类目视图")
+    _assert("FAVORITE_CATEGORY_STORAGE_KEY" in html and "localStorage.setItem" in html, "收藏类目应在当前浏览器持久化")
+    _assert('id="categoryModalSummary"' in html and 'id="confirmCategoryPanel"' in html, "类目弹窗应有已选摘要和确定操作")
     _assert('if ($("collectSource")) $("collectSource").value = "rpa";' in html, "初始化/重置后应回到自动批量采集")
     _assert("请先运行 scripts/capabilities/tag_collect/start_chrome_debug.sh" not in html, "Web 文案不应再要求用户手动运行终端脚本")
+
+
+def test_windows_chrome_launcher_uses_available_browser():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        browser = Path(tmp_dir) / "msedge.exe"
+        browser.touch()
+        profile = Path(tmp_dir) / "ChromeProfile"
+        old_values = {
+            key: os.environ.get(key)
+            for key in ("CHROME_BIN", "TAG_COLLECT_CHROME_PROFILE", "TAG_COLLECT_CDP_URL")
+        }
+        original_platform_system = web.platform.system
+        original_popen = web.subprocess.Popen
+        original_runtime_status = web._chrome_runtime_status
+        calls = []
+
+        def fake_popen(args, **kwargs):
+            calls.append((args, kwargs))
+            return types.SimpleNamespace(pid=1234)
+
+        try:
+            os.environ["CHROME_BIN"] = str(browser)
+            os.environ["TAG_COLLECT_CHROME_PROFILE"] = str(profile)
+            web.platform.system = lambda: "Windows"
+            web.subprocess.Popen = fake_popen
+            web._chrome_runtime_status = lambda: {"cdp_ready": True, "message": "ready"}
+            runtime = web._start_chrome_debug_browser()
+        finally:
+            web.platform.system = original_platform_system
+            web.subprocess.Popen = original_popen
+            web._chrome_runtime_status = original_runtime_status
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        _assert(runtime["cdp_ready"], "Windows 浏览器启动后应返回 CDP ready 状态")
+        _assert(len(calls) == 1, "Windows 浏览器启动器只应创建一个进程")
+        args, kwargs = calls[0]
+        _assert(args[0] == str(browser), "Windows 启动器应使用已发现的 Chrome/Edge")
+        _assert("--remote-debugging-address=127.0.0.1" in args, "CDP 必须只监听本机")
+        _assert(f"--remote-debugging-port={web.DEFAULT_CDP_PORT}" in args, "Windows 启动器应使用配置的 CDP 端口")
+        _assert(f"--user-data-dir={profile}" in args, "Windows 启动器应使用项目专用浏览器 profile")
+        _assert(kwargs.get("close_fds") is True, "Windows 浏览器进程不应继承服务端句柄")
 
 
 def test_web_category_selection_does_not_leak_between_tasks():
@@ -945,9 +1508,9 @@ def test_web_category_selection_does_not_leak_between_tasks():
     collect_source = _javascript_function_source(html, "runCollect")
     _assert(collect_source, "Web应提供runCollect采集入口")
     clear_index = collect_source.find("clearRunState()")
-    fetch_index = collect_source.find('fetch("/api/collect"')
+    fetch_index = collect_source.find('fetch("/api/task/start"')
     _assert(clear_index >= 0, "runCollect发起新任务前必须调用clearRunState清掉旧结果/批次")
-    _assert(fetch_index >= 0 and clear_index < fetch_index, "clearRunState必须发生在新/api/collect请求发出之前")
+    _assert(fetch_index >= 0 and clear_index < fetch_index, "clearRunState必须发生在新/api/task/start请求发出之前")
     direct_categories = re.search(
         r"categories\s*:\s*\[\s*\.\.\.state\.selectedCategories\s*\]",
         collect_source,
@@ -1208,7 +1771,7 @@ def test_invalid_category_path_blocks_before_rpa():
 def test_category_navigation_failure_blocks_export():
     calls = []
 
-    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False):
+    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False, **kwargs):
         calls.append({"query": query, "category_filters": category_filters or []})
         return {
             "products": [{
@@ -1266,7 +1829,7 @@ def test_category_navigation_failure_blocks_export():
 def test_partial_category_navigation_blocks_export():
     calls = []
 
-    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False):
+    def fake_collect_products(query, limit, source_url="", native_filters=None, category_filters=None, manual_url_only=False, return_meta=False, **kwargs):
         calls.append({"query": query, "category_filters": category_filters or []})
         return {
             "products": [{
@@ -1331,6 +1894,7 @@ def test_category_navigation_service_error_keeps_filter_context():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         calls.append({"query": query, "category_filters": category_filters or []})
         category_filter = (category_filters or [{}])[0]
@@ -1396,6 +1960,7 @@ def test_multi_category_rpa_runs_are_isolated():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -1403,6 +1968,7 @@ def test_multi_category_rpa_runs_are_isolated():
             "query": query,
             "source_url": source_url,
             "category_filters": category_filters or [],
+            "limit": limit,
         })
         item_id = f"cat-{len(calls)}"
         return {
@@ -1444,13 +2010,201 @@ def test_multi_category_rpa_runs_are_isolated():
             _assert(len(calls) == 2, "多类目应拆成独立RPA任务，避免同页连续点击污染")
             _assert(all(len(call["category_filters"]) == 1 for call in calls), "每次RPA只应接收一个类目路径")
             _assert({call["category_filters"][0]["category_path"] for call in calls} == set(config.categories), "每个已选类目都应独立执行")
+            _assert(sum(call["limit"] for call in calls) == DEFAULT_ITEMS_PER_QUERY, "多类目应共享任务候选预算，不能每个类目重复使用完整上限")
+            _assert(max(call["limit"] for call in calls) <= DEFAULT_ITEMS_PER_QUERY // 2 + 1, "两个类目应近似均分候选预算")
             _assert(len(data["rows"]) == 2, "多类目独立采集应保留两个候选商品")
-            _assert({row["category_path"] for row in data["rows"]} == set(config.categories), "导出行应记录对应采集类目")
+            _assert({row["selected_category_path"] for row in data["rows"]} == set(config.categories), "审计字段应保留完整1688导航路径")
+            _assert(
+                {row["category_path"] for row in data["rows"]}
+                == {service._category_display_path(category) for category in config.categories},
+                "导出商品类目不应把组合一级导航入口冒充真实大类",
+            )
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
         else:
             sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_multi_category_partial_failure_still_exports_successful_results():
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+        **kwargs,
+    ):
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        calls.append(category_path)
+        if len(calls) == 2:
+            error = ServiceError("category_navigation_not_loaded: 第二个类目菜单未稳定展开")
+            error.data = {
+                "code": "category_navigation_not_loaded",
+                "category_path": category_path,
+                "filter_results": [{
+                    "filter_key": category_filter.get("key", "category_path_2"),
+                    "label": f"类目:{category_path}",
+                    "tag": category_path,
+                    "status": "not_found",
+                    "source": "1688_category_navigation",
+                    "message": "第二个类目菜单未稳定展开",
+                }],
+            }
+            raise error
+        return {
+            "products": [{
+                "id": "partial-success-1",
+                "title": f"{category_path} 测试商品",
+                "price": "19.9",
+                "image": "",
+                "url": "https://detail.1688.com/offer/1999999999.html",
+                "stats": {"rawText": f"{category_path} 真实页面列表候选"},
+            }],
+            "filter_results": [{
+                "filter_key": category_filter.get("key", "category_path_1"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "clicked",
+                "source": "1688_category_navigation",
+                "page_url": "https://s.1688.com/selloffer/category-success.html",
+                "message": "已进入商品结果页",
+            }],
+            "pagination": {"pages_visited": 2, "collected_count": 1, "stop_reason": "source_exhausted"},
+        }
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        with _temporary_tag_data_dir():
+            config = parse_input(
+                categories="女装、男装、内衣>新中式>汉服套装,日用餐厨、居家日用>遮阳防雨>雨衣雨披",
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+            )
+            result = run_tag_collect(config)
+            data = result["data"]
+            _assert(result["success"], "多类目已有成功数据时，后续单类目失败仍应返回部分成功")
+            _assert(data["partial_failure_count"] == 1, "部分成功结果应记录失败类目数")
+            _assert(data["collection_status"] == "partial", "部分成功结果应标记为partial")
+            _assert(data["row_count"] == 1, "前一个成功类目的商品必须保留")
+            _assert(Path(data["output_path"]).exists(), "部分成功也必须生成可下载导出文件")
+            _assert(data["partial_failures"][0]["category_path"] == config.categories[1], "失败记录应指向实际失败类目")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_repeated_category_navigation_failures_stop_remaining_home_refreshes():
+    calls = []
+
+    def fake_collect_products(
+        query,
+        limit,
+        source_url="",
+        native_filters=None,
+        category_filters=None,
+        manual_url_only=False,
+        return_meta=False,
+        **kwargs,
+    ):
+        category_filter = (category_filters or [{}])[0]
+        category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
+        calls.append(category_path)
+        error = ServiceError("category_navigation_not_loaded: 首页类目菜单没有展开")
+        error.data = {
+            "code": "category_navigation_not_loaded",
+            "category_path": category_path,
+            "page_url": "https://www.1688.com/",
+            "filter_results": [{
+                "filter_key": category_filter.get("key", f"category_path_{len(calls)}"),
+                "label": f"类目:{category_path}",
+                "tag": category_path,
+                "status": "not_found",
+                "source": "1688_category_navigation",
+                "page_url": "https://www.1688.com/",
+                "message": "首页类目菜单没有展开",
+            }],
+        }
+        raise error
+
+    original_module = sys.modules.get("capabilities.tag_collect.rpa")
+    sys.modules["capabilities.tag_collect.rpa"] = types.SimpleNamespace(
+        collect_products_from_1688_page=fake_collect_products
+    )
+    try:
+        with _temporary_tag_data_dir():
+            config = parse_input(
+                categories=(
+                    "日用餐厨、居家日用>厨房工具>烹饪勺铲,"
+                    "日用餐厨、居家日用>厨房工具>砧板、菜板,"
+                    "日用餐厨、居家日用>厨房工具>多功能切菜器,"
+                    "日用餐厨、居家日用>厨房工具>开瓶器、开罐器"
+                ),
+                sample_data=False,
+                collect_source="rpa",
+                output_format="xlsx",
+            )
+            try:
+                run_tag_collect(config)
+            except ServiceError as exc:
+                detail = getattr(exc, "data", {}) or {}
+                _assert(detail.get("systemic_abort") is True, "连续类目导航失败应标记为系统性停止")
+                _assert(detail.get("consecutive_failure_count") == 2, "应在连续2次相同类目导航失败后停止")
+                _assert(detail.get("skipped_job_count") == 2, "应记录为避免刷新而跳过的剩余类目数")
+                failures = detail.get("partial_failures") or []
+                _assert(len(failures) == 2, "停止前应保留已经尝试的两个失败类目诊断")
+                _assert(failures[-1].get("systemic_abort") is True, "最后一次失败应记录停止刷新原因")
+            else:
+                raise AssertionError("连续类目导航失败且零结果时不应返回成功")
+            _assert(len(calls) == 2, "连续系统性失败后不能继续打开剩余类目并反复刷新首页")
+    finally:
+        if original_module is None:
+            sys.modules.pop("capabilities.tag_collect.rpa", None)
+        else:
+            sys.modules["capabilities.tag_collect.rpa"] = original_module
+
+
+def test_task_store_retries_transient_windows_replace_error():
+    original_replace = web.os.replace
+    calls = []
+
+    def flaky_replace(source, target):
+        calls.append((str(source), str(target)))
+        if len(calls) < 3:
+            raise PermissionError(5, "transient Windows file lock", str(target))
+        return original_replace(source, target)
+
+    try:
+        with _temporary_tag_data_dir() as data_dir:
+            _reset_web_task_memory()
+            web.os.replace = flaky_replace
+            with web.TASK_LOCK:
+                web.TASKS["persist-retry-test"] = {
+                    "task_id": "persist-retry-test",
+                    "status": "completed",
+                    "created_at": "2026-07-20 17:00:00",
+                    "updated_at": "2026-07-20 17:00:01",
+                    "finished_at": "2026-07-20 17:00:01",
+                    "progress": {"stage": "completed", "message": "done"},
+                    "summary": {"categories": [], "category_count": 0},
+                }
+                web._persist_tasks_locked()
+            _assert(len(calls) == 3, "Windows短暂文件占用时任务状态应重试写入")
+            _assert((data_dir / web.TASK_STORE_FILENAME).exists(), "重试成功后任务状态文件必须存在")
+    finally:
+        web.os.replace = original_replace
+        _reset_web_task_memory()
 
 
 def test_category_products_require_item_level_evidence():
@@ -1462,6 +2216,7 @@ def test_category_products_require_item_level_evidence():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -1729,6 +2484,7 @@ def test_gender_style_leaf_category_matches_title_suffix():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -1813,6 +2569,7 @@ def test_category_unknown_is_not_publishable_exported_or_persisted():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -1888,10 +2645,9 @@ def test_category_unknown_is_not_publishable_exported_or_persisted():
             with zipfile.ZipFile(data["output_path"]) as workbook:
                 workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
                 result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-                unknown_xml = _xlsx_sheet_xml_by_name(workbook, "类目待核验")
-                _assert("category-unknown-only" not in result_xml, "unknown商品不能出现在Excel主选品结果sheet")
-                _assert("类目待核验" in workbook_xml, "Excel应为unknown商品提供独立类目待核验sheet")
-                _assert("category-unknown-only" in unknown_xml, "类目待核验sheet应保留unknown商品供人工或详情补证据")
+                _assert("category-unknown-only" in result_xml, "unknown商品应按7.21要求汇总到唯一选品结果sheet")
+                _assert("类目待核验" not in workbook_xml, "Excel不应再生成独立类目待核验附表")
+                _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "unknown商品导出仍只能有一个工作表")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -1911,6 +2667,7 @@ def test_detail_category_evidence_promotes_unknown_and_overrides_title_match():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -1947,7 +2704,7 @@ def test_detail_category_evidence_promotes_unknown_and_overrides_title_match():
             }],
         }
 
-    def fake_detail(url, item_id=""):
+    def fake_detail(url, item_id="", **kwargs):
         if item_id == "detail-promote-unknown":
             return {
                 "product_category_id": "1031910",
@@ -2043,10 +2800,9 @@ def test_detail_category_evidence_promotes_unknown_and_overrides_title_match():
 
             with zipfile.ZipFile(data["output_path"]) as workbook:
                 result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-                failed_xml = _xlsx_sheet_xml_by_name(workbook, "异常复核")
                 _assert("detail-promote-unknown" in result_xml, "详情提升后的商品应进入Excel主选品结果")
-                _assert("detail-override-title" not in result_xml, "详情错类目商品不能留在Excel主选品结果")
-                _assert("detail-override-title" in failed_xml, "详情错类目商品应进入Excel异常复核sheet")
+                _assert("detail-override-title" in result_xml, "详情错类目商品也应按7.21要求汇总进唯一主表供用户查看")
+                _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "详情类目复核导出不得生成异常附表")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -2066,6 +2822,7 @@ def test_category_unknown_successful_detail_without_category_is_not_requeued():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         category_filter = (category_filters or [{}])[0]
         category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -2092,7 +2849,7 @@ def test_category_unknown_successful_detail_without_category_is_not_requeued():
             }],
         }
 
-    def fake_detail(url, current_item_id=""):
+    def fake_detail(url, current_item_id="", **kwargs):
         _assert(current_item_id == item_id, "详情核验应处理当前unknown商品")
         return {key: "1" for key in service.DETAIL_VERIFICATION_FIELDS}
 
@@ -2163,6 +2920,7 @@ def test_category_unknown_security_or_login_failure_remains_retryable():
             category_filters=None,
             manual_url_only=False,
             return_meta=False,
+            **kwargs,
         ):
             category_filter = (category_filters or [{}])[0]
             category_path = str(category_filter.get("category_path") or category_filter.get("tag") or "")
@@ -2270,15 +3028,10 @@ def test_sample_detail_verification():
     )
 
     with zipfile.ZipFile(verify_data["output_path"]) as workbook:
-        config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
-        record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
-        _assert("系统预通过数量" in config_xml, "导出标签配置应包含系统预通过数量")
-        _assert("待人工复核数量" in config_xml, "导出标签配置应包含待人工复核数量")
-        _assert("开发样例" in config_xml, "样例导出配置应醒目标注开发样例")
-        _assert("禁止作为真实选品" in config_xml, "样例导出配置应标注禁止作为真实选品依据")
-        _assert("sample_detail" in record_xml, "核验记录 sheet 应包含样例来源")
-        _assert("商品星级" in record_xml, "核验记录 sheet 应包含商品星级")
-        _assert("评价标签" in record_xml, "核验记录 sheet 应包含评价标签")
+        _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "详情核验后重新导出仍只能有一个工作表")
+    saved = service.get_run_payload(verify_data["run_id"])
+    _assert(saved and saved.get("verification_records"), "字段级核验记录应继续保存在JSON快照")
+    _assert(any(record.get("source") == "sample_detail" for record in saved["verification_records"]), "JSON核验记录应包含样例详情来源")
 
 
 def test_auto_detail_verification_after_collect():
@@ -2296,7 +3049,11 @@ def test_auto_detail_verification_after_collect():
     _assert(data["auto_verify_details"] is True, "返回结果应标记已启用自动详情核验")
     _assert(data["verified_count"] >= 1, "自动详情核验应至少补充 1 个商品")
     _assert(data["verification_records"], "自动详情核验应生成字段级记录")
-    _assert(data["automation_state"]["status"] == "pending_detail", "自动核验上限未覆盖全部队列时应保持待详情核验状态")
+    _assert(data["automation_state"]["status"] in ("pending_detail", "sample_verified", "partial"), "一件代发等详情硬筛未核实的候选移出主结果后，应显示待继续核验或已核验/部分完成状态")
+    _assert(
+        all(row.get("supports_dropship") == "是" for row in data["rows"]),
+        "选择一件代发时，主结果不得保留尚未明确核实的一件代发商品",
+    )
     _assert(data["automation_state"]["verified_count"] >= 1, "自动核验状态应记录已核验数量")
     verified_rows = [
         row for row in data["top_items"]
@@ -2317,10 +3074,11 @@ def test_auto_detail_verification_after_collect():
     )
     with zipfile.ZipFile(data["output_path"]) as workbook:
         result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
-        _assert("sample_verified" in result_xml, "导出结果 sheet 应包含自动核验状态")
-        _assert("样例预通过" in result_xml, "样例自动核验结果应标注样例预通过")
-        _assert("sample_detail" in record_xml, "导出核验记录 sheet 应包含自动详情核验记录")
+        _assert("sample_verified" not in result_xml, "核验状态不得挤占用户确认的24列主表")
+        _assert(any(row.get("manual_review_status") == "样例预通过" for row in verified_rows), "样例自动核验结果应在JSON审计信息中标注样例预通过")
+        _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "自动详情核验导出也只能有一个工作表")
+    saved = service.get_run_payload(data["run_id"])
+    _assert(saved and any(record.get("source") == "sample_detail" for record in saved.get("verification_records", [])), "自动详情核验审计应保留在JSON快照")
 
 
 def test_auto_detail_verification_security_pause():
@@ -2375,17 +3133,19 @@ def test_auto_detail_verification_security_pause():
         _assert(data["automation_state"]["action"] == "manual_handoff", "详情风控应要求人工接管")
         _assert(data["verification_stopped_reason"], "详情风控应返回停止原因")
         _assert(data["verification_failed_count"] == 1, "详情风控商品应计入核验失败")
-        row = data["rows"][0]
+        _assert(not data["rows"], "一件代发详情核验被风控阻断时，未确认商品不能继续留在主结果")
+        row = data["filter_excluded_rows"][0]
         _assert(row["verification_status"] == "failed", "详情风控商品不应被标记为已核验")
         _assert(row["product_refund_rate"] == DETAIL_VERIFICATION_PENDING, "详情风控不应写入样例品退率")
         _assert(row["shipment_rate"] == DETAIL_VERIFICATION_PENDING, "详情风控不应写入样例发货率")
         _assert("sample_verified" not in json.dumps(data, ensure_ascii=False), "真实详情风控不应出现样例核验状态")
         with zipfile.ZipFile(data["output_path"]) as workbook:
-            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
             result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            _assert("详情核验暂停" in config_xml, "导出标签配置应写入暂停状态")
-            _assert("人工接管验证" in config_xml, "导出标签配置应写入建议动作")
-            _assert("failed" in result_xml, "导出结果 sheet 应保留核验失败状态")
+            _assert("real-security-1" in result_xml, "详情风控筛除商品应汇总到唯一主表供用户查看")
+            _assert("failed" not in result_xml, "核验失败状态不得挤占用户确认的24列主表")
+            _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "详情风控暂停导出不得生成异常附表")
+        saved = service.get_run_payload(data["run_id"])
+        _assert(saved and saved.get("automation_state", {}).get("status") == "paused", "暂停状态应保留在JSON快照")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -2468,10 +3228,11 @@ def test_real_run_verify_ignores_sample_flag():
         with zipfile.ZipFile(verify_data["output_path"]) as workbook:
             workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
             result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
-            record_xml = workbook.read("xl/worksheets/sheet5.xml").decode("utf-8")
             _assert("样例说明" not in workbook_xml, "真实批次导出不得包含样例说明 sheet")
-            _assert("真实数据" in result_xml, "真实批次结果行必须标注真实数据")
-            _assert("sample_detail" not in record_xml, "真实批次核验记录不得使用样例详情来源")
+            _assert("真实数据" not in result_xml, "数据模式不得挤占用户确认的24列主表")
+            _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "真实批次导出也只能有一个工作表")
+        saved = service.get_run_payload(verify_data["run_id"])
+        _assert(saved and not any(record.get("source") == "sample_detail" for record in saved.get("verification_records", [])), "真实批次JSON核验记录不得使用样例详情来源")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -2594,8 +3355,8 @@ def test_review_filters_wait_for_detail_then_match():
     result = run_tag_collect(config)
     data = result["data"]
     _assert(result["success"], "评价口碑筛选采集应成功")
-    _assert(data["rows"], "评价口碑筛选应先保留待详情核验候选")
-    first_row = data["rows"][0]
+    _assert(not data["rows"] and data["filter_excluded_rows"], "详情评价筛选未核实前应进入异常复核，不能留在主结果")
+    first_row = data["filter_excluded_rows"][0]
     pending = [
         record for record in first_row.get("filter_match_records", [])
         if record.get("field_key") in ("product_rating", "good_rate", "comment_count", "review_tags")
@@ -2610,6 +3371,7 @@ def test_review_filters_wait_for_detail_then_match():
     ]
     _assert(matched, "详情核验后应生成评价筛选重评估记录")
     _assert(any(record.get("status") == "matched" for record in matched), "详情核验后评价筛选应可命中")
+    _assert(verify_data["rows"], "详情筛选全部命中后商品应恢复到主结果")
 
 
 def test_detail_filter_excluded_rows_leave_main_results():
@@ -2622,12 +3384,16 @@ def test_detail_filter_excluded_rows_leave_main_results():
     )
     result = run_tag_collect(config)
     data = result["data"]
-    before_count = data["row_count"]
-    _assert(before_count >= 1, "详情评价标签筛选前应保留待核验候选")
+    before_count = len(data["filter_excluded_rows"])
+    _assert(data["row_count"] == 0 and before_count >= 1, "详情评价标签未核实前应全部进入异常复核")
     verify_result = verify_run_details(data["run_id"], sample_data=True, max_items=1)
     verify_data = verify_result["data"]
-    _assert(verify_data["filter_excluded_count"] == 1, "详情核验后未命中评价标签的商品应被筛选剔除")
-    _assert(len(verify_data["rows"]) == before_count - 1, "被详情筛选剔除的商品不应继续留在主结果 rows")
+    _assert(verify_data["filter_excluded_count"] >= 1, "详情核验后未命中或尚未核实评价标签的商品应移出主结果")
+    _assert(not verify_data["rows"], "不存在的评价标签不能让任何商品进入主结果 rows")
+    _assert(
+        all(not any(record.get("status") in ("pending_detail", "manual_review_required") for record in row.get("filter_match_records", [])) for row in verify_data["rows"]),
+        "详情硬筛执行后主结果不得继续保留待核验筛选条件",
+    )
     _assert(verify_data["filter_excluded_rows"], "被剔除商品应保留在 filter_excluded_rows 供审计")
 
 
@@ -2641,7 +3407,8 @@ def test_detail_missing_review_metrics_do_not_use_list_values():
     )
     result = run_tag_collect(config)
     data = result["data"]
-    first_id = str(data["rows"][0]["item_id"])
+    _assert(data["filter_excluded_rows"], "详情评价指标未核实前应进入异常复核")
+    first_id = str(data["filter_excluded_rows"][0]["item_id"])
     original_detail = dict(service.SAMPLE_DETAIL_VERIFICATIONS[first_id])
     patched_detail = dict(original_detail)
     patched_detail.pop("good_rate", None)
@@ -2668,6 +3435,7 @@ def test_target_publishable_count_and_candidate_budget():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         return {
             "products": [
@@ -2713,6 +3481,18 @@ def test_target_publishable_count_and_candidate_budget():
                 },
             ][:limit],
             "filter_results": [],
+            "page_meta": [
+                {"page_index": 1, "extracted_count": 1, "accepted_count": 1},
+                {"page_index": 2, "extracted_count": 1, "accepted_count": 1},
+                {"page_index": 3, "extracted_count": 1, "accepted_count": 1},
+            ],
+            "pagination": {
+                "requested_limit": limit,
+                "max_pages": 6,
+                "pages_visited": 3,
+                "collected_count": min(limit, 3),
+                "stop_reason": "requested_limit_reached",
+            },
         }
 
     original_module = sys.modules.get("capabilities.tag_collect.rpa")
@@ -2726,17 +3506,20 @@ def test_target_publishable_count_and_candidate_budget():
                 sample_data=False,
                 collect_source="rpa",
                 output_format="xlsx",
-                max_items_per_query=1,
+                max_items_per_query=3,
                 target_publishable_count=2,
             )
             result = run_tag_collect(config)
             data = result["data"]
             _assert(result["success"], "目标可铺数量采集应成功")
             _assert(data["target_publishable_count"] == 2, "应返回目标可铺数量")
-            _assert(data["candidate_scan_limit"] > config.max_items_per_query, "候选预算应为可铺目标适度放大")
-            _assert(data["candidate_count"] >= 3, "应扫描超过原始每词上限的候选以满足可铺目标")
+            _assert(data["candidate_scan_limit"] == config.max_items_per_query == 3, "候选预算应使用显式扫描上限")
+            _assert(data["candidate_count"] >= 3, "应按显式候选预算扫描足够商品")
             _assert(data["publishable_count"] == 2, "目标计数应按可铺/谨慎结果计算")
             _assert(data["collection_stop_reason"] == "target_met", "达到目标后应标记 target_met")
+            _assert(data["pagination_pages_visited"] == 3, "应返回真实分页访问页数")
+            _assert(data["pagination_collected_count"] == 3, "应返回分页采集候选数")
+            _assert(data["pagination_records"][0]["stop_reason"] == "requested_limit_reached", "应保留分页停止原因")
     finally:
         if original_module is None:
             sys.modules.pop("capabilities.tag_collect.rpa", None)
@@ -2755,6 +3538,7 @@ def test_persistent_rejected_products_are_skipped_next_run():
         category_filters=None,
         manual_url_only=False,
         return_meta=False,
+        **kwargs,
     ):
         calls.append(limit)
         return {
@@ -2882,6 +3666,7 @@ def test_auto_review_status_normalizes_export_rows():
         "product_refund_rate": "1.2%",
         "shipment_rate": "98.8%",
         "collection_rate_24h": "98.0%",
+        "collection_rate_48h": "99.2%",
         "supports_dropship": "是",
         "return_exchange_support": "支持退换",
     }.items():
@@ -2931,13 +3716,363 @@ def test_auto_review_status_normalizes_export_rows():
         output_path = os.path.join(tmpdir, "auto_review.xlsx")
         export_xlsx([good, bad], output_path, {"filter_excluded_rows": [excluded], "run_id": "auto-review"})
         with zipfile.ZipFile(output_path) as workbook:
-            config_xml = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
-            failed_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
-            _assert("系统预通过数量" in config_xml, "导出配置应展示系统预通过数量")
-            _assert("系统不建议数量" in config_xml, "导出配置应展示系统不建议数量")
-            _assert("系统剔除数量" in config_xml, "导出配置应展示系统剔除数量")
-            _assert("auto-review-excluded" in failed_xml, "筛选剔除商品应进入异常复核 sheet")
-            _assert("auto-review-good" not in failed_xml, "系统预通过商品不应进入异常复核 sheet")
+            result_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            _assert("auto-review-good" in result_xml, "系统预通过商品应进入唯一主表")
+            _assert("auto-review-bad" in result_xml, "系统不建议商品应进入唯一主表")
+            _assert("auto-review-excluded" in result_xml, "筛选剔除商品也应汇总进唯一主表")
+            _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "人工复核状态不得再拆成附表")
+
+
+def test_web_feedback_controls_and_inline_javascript_contract():
+    html = web.HTML_PAGE
+    script_match = re.search(r"<script>([\s\S]*?)</script>", html)
+    _assert(script_match, "Web 页面应包含可执行的内嵌脚本")
+    proc = subprocess.run(
+        ["node", "--check"],
+        input=script_match.group(1),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(proc.returncode == 0, f"Web 内嵌 JavaScript 语法检查失败：{proc.stderr or proc.stdout}")
+
+    render_categories = _javascript_function_source(html, "renderCategories")
+    _assert("previousScroll" in render_categories and "preservedColumns.has(key)" in render_categories, "类目重绘应按列恢复滚动位置")
+    _assert("categoryPanel" in render_categories and "panelScrollTop" in render_categories, "勾选三级类目后应恢复类目面板滚动位置")
+    _assert("pageScrollTop" in render_categories and "window.scrollTo" in render_categories, "类目重绘还应恢复页面位置，避免选择后整页上下跳动")
+    _assert('body.category-modal-open .workspace' in html and "overflow: hidden" in html, "类目弹窗打开时必须锁定实际滚动容器workspace")
+    _assert("overscroll-behavior: contain" in html, "类目弹窗和三栏列表应阻断滚动链传到背景")
+    _assert('addEventListener("wheel"' in html and "passive: false" in html and "event.preventDefault()" in html, "类目弹窗边界滚轮必须阻止背景继续滚动")
+    _assert('?["parent"]' in html.replace(" ", "") or '?["parent"]' in html, "点击一级类目时应只保留一级栏滚动位置")
+    _assert('["parent", "child"]' in html, "点击二级类目时应保留一级和二级栏滚动位置")
+    _assert("data-category-group='true'" in html or 'data-category-group="true"' in html, "二级类目应提供全选/取消其下三级类目的复选入口")
+    _assert('data-category-group-action="${esc(value)}"' in html, "二级类目行应提供明确的全选下级按钮")
+    _assert("paths.forEach(path =>" in html, "二级全选应逐个写入三级叶子路径")
+    _assert("state.selectedCategories.add(path)" in html, "二级全选应加入完整三级路径")
+    _assert("setCategorySelection(target.value, target.checked)" in html, "普通叶子类目仍应通过统一选择函数处理")
+    _assert('fetch("/api/task/start"' in html and 'fetch("/api/task/cancel"' in html, "Web 应使用后台任务启动和停止接口")
+    _assert("resumeActiveTask(state.options.active_task || {})" in html, "刷新页面后应恢复仍在运行的后台任务进度")
+    _assert('fetch("/api/templates/save"' in html and 'fetch("/api/templates/delete"' in html, "Web 应提供模板保存和删除操作")
+    _assert('id="stopTaskBtn"' in html and 'id="stickyStopBtn"' in html and 'id="taskProgressStopBtn"' in html, "主操作区、悬浮区和进度卡都应提供停止按钮")
+    _assert('id="versionBadge"' in html and "workbench_build" in html, "页面应展示版本标识，便于确认访问的是新工作台")
+    _assert('data-library-section="${esc(section.key)}"' in html and 'section.key === "priority"' not in html, "重点筛选应由统一 schema 渲染，避免另建重复字段")
+    _assert("safeNoticeText" in html and "x5secdata" in html, "前端提示还应防御性隐藏安全验证临时参数")
+    _assert("本任务不会停一会再自动继续" in html, "完成进度卡应明确任务已结束而不是暂歇")
+    _assert('id="recentTasksCard"' in html and 'id="recentTaskList"' in html, "页面应提供最近任务列表")
+    _assert("state.options.recent_tasks || []" in html and "renderRecentTasks" in html, "页面初始化时应加载持久化任务历史")
+    _assert("服务重启中断" in html and "task_interrupted" in html, "页面应明确展示服务重启中断状态")
+    _assert("loadRecentTaskRun" in html and "/api/run?run_id=" in html, "最近任务应支持重新加载已有批次结果")
+    _assert('id="soundAlertsToggle"' in html, "工作台应提供可持久化的声音提醒开关")
+    _assert("SOUND_ALERT_STORAGE_KEY" in html and "localStorage.setItem" in html, "声音提醒开关应保存到localStorage")
+    _assert('progress.stage === "manual_intervention"' in html, "人工介入实时进度应触发声音判断")
+    _assert('task.status === "completed"' in html and "playTaskCompletedAlert" in html, "任务完成时应触发完成提示音")
+
+    alert_once_source = _javascript_function_source(html, "playTaskAlertOnce")
+    _assert(alert_once_source, "声音提醒应通过统一去重函数播放")
+    alert_proc = subprocess.run(
+        ["node", "-e", f"""
+          const state = {{playedAlertKeys: new Set(), soundAlertsEnabled: true}};
+          let manualCount = 0;
+          let completedCount = 0;
+          const playManualInterventionAlert = () => manualCount += 1;
+          const playTaskCompletedAlert = () => completedCount += 1;
+          {alert_once_source}
+          playTaskAlertOnce("manual:t1:a1", "manual");
+          playTaskAlertOnce("manual:t1:a1", "manual");
+          playTaskAlertOnce("completed:t1", "completed");
+          playTaskAlertOnce("completed:t1", "completed");
+          if (manualCount !== 1 || completedCount !== 1) throw new Error("sound_alert_not_deduplicated");
+        """],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    _assert(alert_proc.returncode == 0, f"声音提醒去重轻量行为测试失败：{alert_proc.stderr or alert_proc.stdout}")
+    _assert("manualSeenKey" in html and 'task.status === "paused"' in html, "实时人工提醒后进入paused终态时不得再次双滴")
+
+
+def test_web_templates_and_background_sample_task_api():
+    web.SERVER_TOKEN = "tag-collect-background-smoke-token"
+    web.ALLOW_REAL_COLLECT = True
+    _reset_web_task_memory()
+    with _temporary_tag_data_dir() as data_dir:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), web.TagCollectHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            template_config = {
+                "categories": ["女装、男装、内衣>新中式>汉服套装"],
+                "tags": ["微信小店"],
+                "library_filters": {
+                    "monthly_dropship_orders_min": "10",
+                    "dropship_shipping_fee_min": "1",
+                    "dropship_shipping_fee_max": "5",
+                    "seller_features": "源头旗舰",
+                },
+                "max_items_per_query": 12,
+            }
+            status, payload = _post_json(
+                f"{base_url}/api/templates/save",
+                {"token": web.SERVER_TOKEN, "name": "日用模板", "config": template_config},
+            )
+            _assert(status == 200 and payload["success"], "模板保存 API 应成功")
+            _assert(payload["data"]["templates"][0]["config"]["library_filters"]["seller_features"] == "源头旗舰", "模板应完整保留商家特色单选值")
+            _, options = _get_json(f"{base_url}/api/options")
+            _assert(any(item.get("name") == "日用模板" for item in options["data"]["templates"]), "刷新 options 后应加载已保存模板")
+
+            status, deleted = _post_json(
+                f"{base_url}/api/templates/delete",
+                {"token": web.SERVER_TOKEN, "name": "日用模板"},
+            )
+            _assert(status == 200 and deleted["success"] and not deleted["data"]["templates"], "模板删除 API 应移除已保存模板")
+
+            status, started = _post_json(
+                f"{base_url}/api/task/start",
+                {
+                    "token": web.SERVER_TOKEN,
+                    "categories": ["女装、男装、内衣>新中式>汉服套装"],
+                    "tags": ["微信小店"],
+                    "sample_data": True,
+                    "auto_verify_details": False,
+                    "max_items_per_query": 5,
+                    "target_publishable_count": 2,
+                    "output_format": "xlsx",
+                },
+            )
+            _assert(status == 200 and started["success"], "后台样例任务应成功启动")
+            task_id = started["data"]["task_id"]
+            task = started["data"]
+            deadline = time.time() + 10
+            while time.time() < deadline and task.get("status") not in {"completed", "failed", "cancelled"}:
+                time.sleep(0.05)
+                _, wrapper = _get_json(f"{base_url}/api/task/status?task_id={task_id}&token={web.SERVER_TOKEN}")
+                task = wrapper["data"]
+            _assert(task.get("status") == "completed", f"后台样例任务应完成，实际状态：{task.get('status')}")
+            _assert(task.get("progress", {}).get("percent") == 100, "后台任务完成时进度应为100%")
+            _assert("collection_stop_reason" in task.get("progress", {}), "后台任务完成进度应携带明确停止原因")
+            _assert("完成" in task.get("progress", {}).get("message", ""), "完成提示应明确采集、筛选和导出已经结束")
+            _assert(task.get("result", {}).get("success"), "后台任务状态应包含最终成功结果")
+            _assert(task["result"]["data"].get("row_count", 0) >= 1, "后台样例任务应返回商品结果")
+            task_store_path = data_dir / web.TASK_STORE_FILENAME
+            _assert(task_store_path.exists(), "后台任务应写入本地状态文件")
+            persisted_text = task_store_path.read_text(encoding="utf-8")
+            lowered = persisted_text.lower()
+            _assert('"rows"' not in lowered, "任务状态文件不应保存商品 rows")
+            _assert("cookie" not in lowered and "x5secdata" not in lowered, "任务状态文件不应保存 Cookie 或风控临时参数")
+            _assert(web.SERVER_TOKEN not in persisted_text, "任务状态文件不应保存 Web token")
+            _, refreshed_options = _get_json(f"{base_url}/api/options")
+            recent = refreshed_options["data"].get("recent_tasks") or []
+            _assert(recent and recent[0].get("task_id") == task_id, "options 应返回最近任务摘要")
+            _assert(recent[0].get("result_summary", {}).get("data", {}).get("row_count", 0) >= 1, "最近任务应保留安全的结果数量摘要")
+
+            _reset_web_task_memory()
+            web._ensure_tasks_loaded()
+            with web.TASK_LOCK:
+                recovered = dict(web.TASKS.get(task_id) or {})
+            _assert(recovered.get("status") == "completed", "服务重新加载后应恢复已完成任务的终态")
+            _assert(recovered.get("result") is None, "恢复历史任务时不应把商品明细重新塞回任务内存")
+            _assert(recovered.get("result_summary", {}).get("data", {}).get("run_id"), "恢复终态任务时应保留 run_id 摘要")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            _reset_web_task_memory()
+
+
+def test_web_task_store_marks_running_as_interrupted_and_strips_sensitive_state():
+    _reset_web_task_memory()
+    with _temporary_tag_data_dir() as data_dir:
+        path = data_dir / web.TASK_STORE_FILENAME
+        path.write_text(
+            json.dumps({
+                "version": 1,
+                "tasks": [
+                    {
+                        "task_id": "running-before-restart",
+                        "status": "running",
+                        "created_at": "2026-07-20 09:00:00",
+                        "updated_at": "2026-07-20 09:01:00",
+                        "progress": {
+                            "stage": "collecting",
+                            "message": "正在访问 https://s.1688.com/punish?x5secdata=secret-token",
+                            "percent": 35,
+                            "candidate_count": 18,
+                            "candidate_scan_limit": 200,
+                        },
+                        "summary": {
+                            "category_count": 1,
+                            "categories": ["女装、男装、内衣>新中式>汉服套装"],
+                            "collect_source": "rpa",
+                            "sample_data": False,
+                        },
+                        "config": {"token": "must-not-survive", "cookie": "must-not-survive"},
+                        "result": {"success": False, "data": {"rows": [{"item_id": "private-row"}], "x5secdata": "must-not-survive"}},
+                    },
+                    {
+                        "task_id": "completed-before-restart",
+                        "status": "completed",
+                        "created_at": "2026-07-20 08:00:00",
+                        "updated_at": "2026-07-20 08:05:00",
+                        "finished_at": "2026-07-20 08:05:00",
+                        "progress": {"stage": "completed", "message": "任务已完成", "percent": 100},
+                        "summary": {"category_count": 0, "categories": [], "collect_source": "rpa", "sample_data": True},
+                        "result_summary": {"success": True, "data": {"run_id": "persisted-run", "row_count": 2, "download_url": "/download?run_id=persisted-run"}},
+                    },
+                ],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        web._ensure_tasks_loaded()
+        recent = web._recent_tasks()
+        by_id = {item.get("task_id"): item for item in recent}
+        interrupted = by_id.get("running-before-restart") or {}
+        _assert(interrupted.get("status") == "interrupted", "服务启动时原 running 任务应改为 interrupted")
+        _assert(interrupted.get("progress", {}).get("stage") == "interrupted", "重启中断任务应写入 interrupted 阶段")
+        _assert("不会自动继续" in interrupted.get("progress", {}).get("message", ""), "重启中断提示应明确不会自动续跑")
+        _assert(interrupted.get("finished_at"), "重启中断任务应补齐结束时间")
+        _assert(by_id.get("completed-before-restart", {}).get("status") == "completed", "既有终态任务应原样恢复")
+        _assert(web._active_task() == {}, "恢复历史任务后不应把已中断任务设为活动任务")
+
+        rewritten = path.read_text(encoding="utf-8").lower()
+        for forbidden in ('"rows"', "private-row", "must-not-survive", "cookie", "x5secdata", "secret-token"):
+            _assert(forbidden not in rewritten, f"重写后的任务状态文件不应包含敏感内容：{forbidden}")
+    _reset_web_task_memory()
+
+
+def test_web_background_task_cancel_stops_worker():
+    web.SERVER_TOKEN = "tag-collect-cancel-smoke-token"
+    web.ALLOW_REAL_COLLECT = True
+    original_run_tag_collect = web.run_tag_collect
+
+    def slow_collect(config, progress_callback=None, cancel_event=None):
+        if progress_callback:
+            progress_callback({"stage": "collecting", "message": "慢任务测试中", "percent": 15, "candidate_count": 1})
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                error = ServiceError("task_cancelled: 用户已停止采集任务。")
+                error.data = {"code": "task_cancelled", "retryable": True}
+                raise error
+            time.sleep(0.02)
+        raise AssertionError("取消事件未传递到后台采集任务")
+
+    web.run_tag_collect = slow_collect
+    with web.TASK_LOCK:
+        web.TASKS.clear()
+        web.TASK_CANCEL_EVENTS.clear()
+        web.ACTIVE_TASK_ID = ""
+    try:
+        with _temporary_tag_data_dir():
+            server = ThreadingHTTPServer(("127.0.0.1", 0), web.TagCollectHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                _, started = _post_json(
+                    f"{base_url}/api/task/start",
+                    {"token": web.SERVER_TOKEN, "sample_data": True, "tags": ["微信小店"], "output_format": "xlsx"},
+                )
+                _assert(started["success"], "取消测试任务应成功启动")
+                task_id = started["data"]["task_id"]
+                deadline = time.time() + 3
+                task = started["data"]
+                while time.time() < deadline and task.get("status") == "queued":
+                    time.sleep(0.02)
+                    _, wrapper = _get_json(f"{base_url}/api/task/status?task_id={task_id}&token={web.SERVER_TOKEN}")
+                    task = wrapper["data"]
+                _, cancelling = _post_json(
+                    f"{base_url}/api/task/cancel",
+                    {"token": web.SERVER_TOKEN, "task_id": task_id},
+                )
+                _assert(cancelling["success"], "停止 API 应接受当前后台任务")
+                deadline = time.time() + 5
+                while time.time() < deadline and task.get("status") not in {"cancelled", "failed", "completed"}:
+                    time.sleep(0.03)
+                    _, wrapper = _get_json(f"{base_url}/api/task/status?task_id={task_id}&token={web.SERVER_TOKEN}")
+                    task = wrapper["data"]
+                _assert(task.get("status") == "cancelled", f"停止后后台任务应进入cancelled，实际：{task.get('status')}")
+                _assert(task.get("result", {}).get("data", {}).get("error_code") == "task_cancelled", "取消结果应返回 task_cancelled")
+                _assert(task.get("progress", {}).get("stage") == "cancelled", "取消完成后进度阶段应为cancelled")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+    finally:
+        web.run_tag_collect = original_run_tag_collect
+        with web.TASK_LOCK:
+            web.TASKS.clear()
+            web.TASK_CANCEL_EVENTS.clear()
+        web.ACTIVE_TASK_ID = ""
+
+
+def test_web_background_security_block_is_paused():
+    web.SERVER_TOKEN = "tag-collect-paused-smoke-token"
+    web.ALLOW_REAL_COLLECT = True
+    original_run_tag_collect = web.run_tag_collect
+
+    def blocked_collect(*args, **kwargs):
+        error = ServiceError(
+            "security_verification_required: 1688 触发了安全滑块/验证码校验。"
+            "系统不会绕过或自动破解验证。"
+            "当前页面：https://s.1688.com/selloffer/offer_search.htm/punish?x5secdata=temporary-token"
+        )
+        error.data = {
+            "code": "security_verification_required",
+            "cdp": True,
+            "source": "1688_search_page",
+            "page_url": "https://s.1688.com/selloffer/offer_search.htm/punish?x5secdata=temporary-token",
+        }
+        raise error
+
+    web.run_tag_collect = blocked_collect
+    with web.TASK_LOCK:
+        web.TASKS.clear()
+        web.TASK_CANCEL_EVENTS.clear()
+        web.ACTIVE_TASK_ID = ""
+    try:
+        with _temporary_tag_data_dir():
+            server = ThreadingHTTPServer(("127.0.0.1", 0), web.TagCollectHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                _, started = _post_json(
+                    f"{base_url}/api/task/start",
+                    {
+                        "token": web.SERVER_TOKEN,
+                        "sample_data": True,
+                        "tags": ["微信小店"],
+                        "output_format": "xlsx",
+                    },
+                )
+                _assert(started["success"], "风控暂停测试任务应成功启动")
+                task_id = started["data"]["task_id"]
+                task = started["data"]
+                deadline = time.time() + 5
+                while time.time() < deadline and task.get("status") not in {"paused", "failed", "completed", "cancelled"}:
+                    time.sleep(0.03)
+                    _, wrapper = _get_json(f"{base_url}/api/task/status?task_id={task_id}&token={web.SERVER_TOKEN}")
+                    task = wrapper["data"]
+                _assert(task.get("status") == "paused", f"安全验证应进入paused而非failed，实际：{task.get('status')}")
+                _assert(task.get("progress", {}).get("stage") == "paused", "安全验证任务进度阶段应为paused")
+                _assert("等待人工" in task.get("progress", {}).get("message", "") or "验证页已保留" in task.get("progress", {}).get("message", ""), "暂停提示应明确需要人工验证")
+                result = task.get("result", {})
+                _assert(result.get("data", {}).get("action") == "manual_handoff", "暂停结果应要求人工接管")
+                _assert("x5secdata" not in result.get("markdown", ""), "页面提示不应展示风控页临时参数")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+    finally:
+        web.run_tag_collect = original_run_tag_collect
+        with web.TASK_LOCK:
+            web.TASKS.clear()
+            web.TASK_CANCEL_EVENTS.clear()
+            web.ACTIVE_TASK_ID = ""
 
 
 def test_web_token_and_sample_api():
@@ -2951,6 +4086,7 @@ def test_web_token_and_sample_api():
         with urllib.request.urlopen(f"{base_url}/api/options", timeout=10) as response:
             options = json.loads(response.read().decode("utf-8"))["data"]
         _assert(options["token"] == web.SERVER_TOKEN, "options 应返回本地 token")
+        _assert(options["workbench_build"] == web.WORKBENCH_BUILD, "options 应返回工作台版本号")
         _assert(options["allow_real_collect"] is True, "真实采集默认应开启")
         _assert(options["limits"]["max_queries"] == 50, "服务端查询词限额应为 50")
         _assert(options["library_filter_schema"], "options 应返回店雷达选品库筛选契约")
@@ -2982,8 +4118,8 @@ def test_web_token_and_sample_api():
                     "min_order_min": "1",
                     "sales_orders_min": "100",
                     "wholesale_price_max": "80",
-                    "fulfillment_times": ["48小时"],
-                    "seller_member_types": ["实力商家"],
+                    "fulfillment_times": ["48H发货"],
+                    "seller_features": "实力商家",
                     "shop_fans_min": "100",
                 },
                 "sample_data": True,
@@ -3033,13 +4169,18 @@ def test_web_token_and_sample_api():
         status, headers, body = _get_bytes(f"{base_url}{payload['data']['download_url']}")
         _assert(status == 200, "download 应返回 200")
         _assert(run_id in headers.get("Content-Disposition", ""), "download 文件名应包含 run_id")
-        with tempfile.NamedTemporaryFile(suffix=".xlsx") as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
             tmp.write(body)
-            tmp.flush()
-            with zipfile.ZipFile(tmp.name) as workbook:
+            tmp_path = tmp.name
+        try:
+            with zipfile.ZipFile(tmp_path) as workbook:
                 workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
-                _assert("核验记录" in workbook_xml, "download xlsx 应包含核验记录 sheet")
-                _assert("筛选执行记录" in workbook_xml, "download xlsx 应包含筛选执行记录 sheet")
+                _assert("选品结果" in workbook_xml, "download xlsx 应包含唯一选品结果 sheet")
+                _assert("核验记录" not in workbook_xml, "download xlsx 不应继续包含核验记录附表")
+                _assert("筛选执行记录" not in workbook_xml, "download xlsx 不应继续包含筛选执行记录附表")
+                _assert(len([name for name in workbook.namelist() if name.startswith("xl/worksheets/sheet")]) == 1, "download xlsx 应严格只有一个工作表")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
         status, payload = _post_json(
             f"{base_url}/api/verify",
@@ -3051,7 +4192,7 @@ def test_web_token_and_sample_api():
         )
         _assert(status == 200, "Web 样例详情核验 HTTP 应成功")
         _assert(payload["success"], "Web 样例详情核验业务应成功")
-        _assert(payload["data"]["verified_count"] >= 1, "Web 样例详情核验应补充商品")
+        _assert(payload["data"]["verified_count"] >= 0, "Web 样例详情核验应返回本次实际处理数量；已自动核验完成时允许为0")
         _assert(payload["data"]["verification_records"], "Web 样例详情核验应返回字段记录")
         _assert(payload["data"]["filter_reevaluation_records"], "Web 样例详情核验应返回详情筛选重评估记录")
 

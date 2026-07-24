@@ -10,6 +10,7 @@
 - Loop 协议：`docs/LOOP.md`
 - Agent 边界：`docs/AGENT_BOUNDARIES.md`
 - 测试矩阵：`docs/TESTING.md`
+- 问题修复与回归方法：`docs/ISSUE_FIXING.md`
 - 风险和禁区：`docs/RISKS.md`
 - 运行记录：`docs/RUNS/`
 - 架构决策：`docs/DECISIONS/`

@@ -4,12 +4,12 @@
 
 ## 结论
 
-- Codex 派生工作树失败的直接原因是项目根目录绑定错误：Codex 绑定的是 `/Users/kven/Desktop/Project/SOP`，该目录不是 Git 仓库；真实仓库是其子目录 `/Users/kven/Desktop/Project/SOP/1688-shopkeeper`。
+- Codex 派生工作树失败的直接原因是项目根目录绑定错误：Codex 绑定的是 `<ProjectRoot>/SOP`，该目录不是 Git 仓库；真实仓库是其子目录 `<ProjectRoot>/SOP/1688-shopkeeper`。
 - 仓库本身正常：无 stale worktree、无锁文件、无分支占用，`git fsck` 和工作树元数据检查通过。
-- 已创建独立工作树 `/Users/kven/Desktop/Project/SOP/1688-shopkeeper-derived-20260711`，分支为 `codex/1688-derived-20260711`。
+- 已创建独立工作树 `<ProjectRoot>/SOP/1688-shopkeeper-derived-20260711`，分支为 `codex/1688-derived-20260711`。
 - 原工作区的 3 个修改文件和 2 个未跟踪文档已完整迁移，新旧 diff 哈希一致；原工作区未被清理、切换或提交。
-- 已通过 macOS 文件夹打开方式把真实仓库根登记为独立 Codex 项目；`list_projects` 已能识别 `/Users/kven/Desktop/Project/SOP/1688-shopkeeper`。
-- Codex 原生工作树任务已创建并验证，工作目录为 `/Users/kven/.codex/worktrees/9f83/1688-shopkeeper`；5 个未提交文件与原工作区逐文件 SHA-256 一致。
+- 已通过 macOS 文件夹打开方式把真实仓库根登记为独立 Codex 项目；`list_projects` 已能识别 `<ProjectRoot>/SOP/1688-shopkeeper`。
+- Codex 原生工作树任务已创建并验证，工作目录为 `<CodexWorktree>/1688-shopkeeper`；5 个未提交文件与原工作区逐文件 SHA-256 一致。
 - 当前标签选品项目属于“可运行 MVP + 类目链路已真实小批量验证”，但不是“真实全链路已完成验收”或“可稳定替代 RPA 的 API 产品”。
 
 根因置信度：高（直接 Git 命令与 Codex 历史错误证据）。

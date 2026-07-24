@@ -32,6 +32,10 @@ git worktree add ../.worktrees/SOP-<task-id> -b agent/<task-id> main
 - `docs/tag-selection-collector-progress.md`
 - `references/capabilities/tag_collect.md`
 
+Bug 修复、截图反馈、问题汇总或重开老问题还要读：
+
+- `docs/ISSUE_FIXING.md`
+
 ## Plan
 
 改动前必须明确：
@@ -40,6 +44,7 @@ git worktree add ../.worktrees/SOP-<task-id> -b agent/<task-id> main
 - 可修改文件范围和禁止修改范围。
 - 验收命令。
 - 是否需要外部网络、浏览器、真实账号登录、人工扫码或安全验证处理。
+- 若是问题修复，明确复现证据、根因链路、负例回归和真实环境验收边界。
 
 ## Scoped Work
 

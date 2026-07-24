@@ -19,9 +19,14 @@
 - `references/capabilities/tag_collect.md`
 - `docs/SOP-project-guide-cn.md`
 
+涉及 Bug 修复、截图反馈、问题汇总或重开老问题时，改代码前再读：
+
+- `docs/ISSUE_FIXING.md`
+
 ## 工作规则
 
 - 先确认目标、非目标、可改文件范围、禁止文件范围和验收命令。
+- 老问题再次出现时按重开问题重新取证，不沿用旧“已解决”结论；每个修复至少补一个能证明错误不会复发的负例。
 - 多 Agent 工作必须先划分文件边界；Reviewer Agent 默认只读。
 - 不回退、覆盖或清理用户和其他 Agent 的改动。
 - 不提交密钥、AK、token、cookie、浏览器 profile、真实用户数据或真实采集导出文件。

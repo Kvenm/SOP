@@ -1,0 +1,926 @@
+1688开放平台接口申请清单（SOP选品工具）
+
+整理时间：2026-07-07
+
+申请执行状态（2026-07-07）：
+- 已使用当前 Chrome 登录态读取 1688 开放平台真实返回结果，没有使用猜测步骤。
+- 已订购成功：采购解决方案（买家自用版）。
+- 已创建并绑定应用：SOP1688选品工具。
+- AppKey：已创建，具体值仅保存在本地凭证环境中，不提交仓库。
+- 应用状态：开发测试中。
+- 解决方案状态：USING。
+- 生效日期：2026-07-07。
+- 到期日期：2027-07-07。
+- 当前应用已授权 API 数量：38 个。
+- 当前“能力管理”已订购能力数量：0 个。
+- 备注：能力管理中的商品主图识别、商品类目属性识别、图像相似度识别、商品竞争力建议、文本风险识别等均为付费资源包，未自动购买。
+
+已授权 API 清单（平台实际返回）：
+alibaba.search.relation.supply
+alibaba.member.getRelationUserInfo
+alibaba.trade.OpQueryMarketingMixConfig
+alibaba.product.follow.crossborder
+alibaba.product.unfollow.crossborder
+alibaba.product.simple.get
+product.keywords.search
+alibaba.trade.receiveAddress.get
+alibaba.createOrder.preview
+alibaba.trade.fastCreateOrder
+alibaba.alipay.url.get
+alibaba.trade.cancel
+alibaba.trade.get.buyerView
+alibaba.trade.getBuyerOrderList
+alibaba.order.memoAdd
+alibaba.trade.payWay.query
+alibaba.trade.pay.protocolPay.isopen
+alibaba.trade.pay.protocolPay.preparePay
+alibaba.trade.addFeedback
+trade.receivegoods.confirm
+alibaba.trade.getLogisticsInfos.buyerView
+alibaba.trade.getLogisticsTraceInfo.buyerView
+alibaba.trade.getRefundReasonList
+alibaba.trade.uploadRefundVoucher
+alibaba.trade.createRefund
+alibaba.trade.refund.buyer.queryOrderRefundList
+alibaba.trade.refund.OpQueryBatchRefundByOrderIdAndStatus
+alibaba.trade.refund.OpQueryOrderRefund
+alibaba.trade.refund.OpQueryOrderRefundOperationList
+alibaba.trade.refund.returnGoods
+alibaba.logistics.OpQueryLogisticCompanyList.offline
+alibaba.trade.getMaxRefundFee
+open.agent.supplyChange
+open.agent.supplyChangeDataFeedback
+fenxiao.supply.addMonitorProduct
+fenxiao.supply.deleteMonitorProduct
+fenxiao.supply.queryMonitorProductList
+open.agent.deepSearch
+
+仍需人工资质/无法静默订购的能力方向：
+- 联盟业务解决方案：用于 CPS 选品、CPS 商品池、佣金、价格雷达等能力；当前平台状态为 CAN_REQUEST，需要先申请“流量联盟机构”角色。
+- 官方物流买家解决方案（自用）：当前平台状态为 CAN_REQUEST，需要先申请“官方物流买家”角色。
+- 1688分销严选采购解决方案（分销买家版）：当前平台状态为 CAN_REQUEST，平台会跳转分销页面申请“分销渠道买家”角色。
+- 代发解决方案（分销买家版）：当前平台状态为 CAN_REQUEST，平台会跳转分销页面申请“分销渠道买家”角色。
+- 88生意通解决方案（买家自用版）：当前平台状态为 CAN_REQUEST，需要先申请“88生意通买家”角色。
+
+人工资质资料提示（平台真实字段）：
+- 流量联盟机构：需要 1688 年采购额、1688 年订单量、支付宝名称、支付宝账号、支付宝类型、支付宝实名校验等。
+- 官方物流买家：需要支付宝/企业信息、营业执照、业务场景、会员数量、日活会员数、支持电商平台等。
+- 88生意通买家：需要公司名称、公司介绍、公司地址、业务场景、年交易额、年订单量、VIP会员数等。
+- 这些字段涉及真实企业资料、支付宝实名、短信验证码或资质审核，不能用后台脚本自动造数据提交。
+
+当前业务覆盖判断：
+- 已覆盖：应用创建、采购买家自用方案、订单预览、快速下单、取消交易、买家订单详情、买家订单列表、买家物流信息、买家物流轨迹、退款相关、收货地址、支付链接、分销词搜、换供/深度找相关 AI agent。
+- 部分覆盖：商品搜索/选品目前有 product.keywords.search，可用于分销词搜方向，但不是 CPS 商品池全量筛选接口；商品详情目前有 alibaba.product.simple.get，但描述限制为“已购买过商家的商品简单信息”，不能等同完整商品详情 API。
+- 未覆盖：官方类目树、类目关键词匹配、类目属性、级联属性、SPU、CPS offer 列表、CPS 价格雷达、CPS 活动、CPS 结算、通用商品详情、通用商品批量详情、卖家视角订单/物流、运费模板、账号基础信息、系统时间等原计划接口。
+- 风险提示：在未补齐类目/CPS/通用商品详情权限前，不能承诺完全替代页面采集；可以先用已授权的分销词搜和订单预览做 API PoC，但选品库级别字段仍需要联盟业务/类目/商品详情权限补齐。
+
+数据来源：
+- 1688开放平台：https://open.1688.com/
+- 1688开放平台控制台：https://open.1688.com/console
+- 1688开放平台接口目录：https://open.1688.com/api/
+
+使用目标：
+用开放平台 API 替代当前 RPA/页面采集里的核心能力，降低滑块、访问拒绝、封控中断带来的不稳定性。接口覆盖范围包括：官方类目、类目属性、标签筛选、候选商品、商品链接、价格、起批量、销量、GMV、商家服务分、一件代发、价格竞争、运费核验、订单预览、后续下单、订单物流、退款售后、授权账号校验。
+
+申请口径：
+以下接口均放入企业账号接口申请范围。文档只列 1688 开放平台公开目录中已存在的接口；每个接口写明用途和可覆盖字段。
+
+纯净接口清单：
+alibaba.category.get
+alibaba.category.searchByKeyword
+alibaba.category.attribute.get
+category.level.attr.get
+alibaba.category.searchSPUInfo
+alibaba.category.getSPUInfo
+alibaba.cps.listOfferPageQuery
+alibaba.cps.listPriceRadarOffer
+alibaba.cps.genClickUrl
+alibaba.cps.listActivityPageQuery
+alibaba.cps.tradeBillList
+alibaba.cps.queryTradeInfoSum
+alibaba.cps.listCPSSettleInfoDetail
+alibaba.cps.getCPSSettleSummaryInfo
+alibaba.product.get
+alibaba.product.getByIdList
+alibaba.product.list.get
+alibaba.product.getByStatus
+alibaba.createOrder.preview
+alibaba.trade.fastCreateOrder
+alibaba.trade.cancel
+alibaba.logistics.freightTemplate.getList
+alibaba.logistics.myFreightTemplate.list.get
+alibaba.trade.ec.getOrder.sellerView
+alibaba.trade.ec.getOrderList.sellerView
+alibaba.trade.getLogisticsInfos.buyerView
+alibaba.trade.getLogisticsTraceInfo.buyerView
+alibaba.trade.ec.getLogisticsInfos.sellerView
+alibaba.trade.refund.queryOrderRefundList
+alibaba.trade.refund.OpQueryBatchRefundByOrderIdAndStatus.sellerView
+trade.refund.agreeReplace
+trade.refund.uploadForReshipping
+alibaba.account.basic
+alibaba.account.agent.basic
+system.time.get
+
+一、类目与标签字段
+
+1. alibaba.category.get
+命名空间：com.alibaba.product
+用途：
+- 获取 1688 官方类目树。
+- 从 categoryID=0 开始遍历一级类目，再逐级获取二级、三级类目。
+- 用官方类目 ID 替代本地手工维护类目，解决“选择男士内裤却搜到内衣”等类目错配问题。
+字段/能力：
+- categoryID 类目ID
+- categoryInfo 类目列表
+- 类目名称
+- 父子级关系
+- 三级叶子类目
+- errorCode/errorMsg/succes 调用结果
+
+2. alibaba.category.searchByKeyword
+命名空间：com.alibaba.product
+用途：
+- 根据关键词搜索 1688 发布类目。
+- 用户输入关键词时匹配官方叶子类目。
+- 用于类目纠错、关键词转类目、类目回显。
+字段/能力：
+- 关键词匹配到的叶子类目
+- 类目ID
+- 类目名称
+- 类目路径
+- 匹配结果
+
+3. alibaba.category.attribute.get
+命名空间：com.alibaba.product
+用途：
+- 根据叶子类目ID获取类目属性。
+- 把页面上的筛选标签映射到 1688 官方类目属性。
+- 用于不同类目下的材质、规格、适用人群、风格、颜色、尺码等字段筛选。
+字段/能力：
+- categoryID 类目ID
+- webSite 站点，1688 场景传 1688
+- scene 场景
+- attributes 类目属性列表
+- 属性ID
+- 属性名称
+- 属性值
+- 是否必填
+- attributeLevelMapStr 级联属性信息
+- levelAttrRelList 级联关系
+- success/errorCode/errorMsg 调用结果
+
+4. category.level.attr.get
+命名空间：cn.alibaba.open
+用途：
+- 根据类目ID和层级属性表达式获取级联属性。
+- 用于存在级联关系的类目筛选，例如先选一级属性后再透出二级/三级属性值。
+字段/能力：
+- 类目ID
+- 层级属性表达式
+- 级联属性
+- 属性层级关系
+- 属性值关系
+
+5. alibaba.category.searchSPUInfo
+命名空间：com.alibaba.product
+用途：
+- 根据 1688 类目获取标准化产品单元 SPU 信息。
+- 用于标准化类目下的规格归一、同款判断、相似款判断。
+字段/能力：
+- 类目ID
+- SPU 信息
+- 标准化规格
+- 类目规格属性
+- 标准产品单元关系
+
+6. alibaba.category.getSPUInfo
+命名空间：com.alibaba.product
+用途：
+- 根据类目属性值获取 SPU 信息。
+- 用于按属性组合识别标准产品单元，辅助同款/相似款分析。
+字段/能力：
+- 类目ID
+- 属性ID
+- 属性值
+- SPU 信息
+- 属性值对应的标准产品单元
+
+二、候选商品与选品筛选
+
+7. alibaba.cps.listOfferPageQuery
+命名空间：com.alibaba.p4p
+用途：
+- 获取联盟 offer 列表。
+- 作为 API 方式下的核心候选商品来源。
+- 支持按类目ID、关键词、属性标签、价格、起批量、销量、佣金比例、老买家佣金比例、排序、分页查询。
+- 用于替代页面搜索和列表页初筛。
+入参字段/能力：
+- categoryId 类目ID
+- feedInfo 关键词或 offerId
+- defineTags 属性标签，属性间逗号分隔，例如实力商家、深度认证、一件代发、进口货源、优惠券
+- filterMinPrice 售价下限
+- filterMaxPrice 售价上限
+- filterQuantityBeginMin 起批量下限
+- filterQuantityBeginMax 起批量上限
+- filterSaleQuantityMin 销量下限
+- filterSaleQuantityMax 销量上限
+- filterRatioMin 佣金比例下限
+- filterRatioMax 佣金比例上限
+- filterOldBuyerRatio 老买家佣金比例区间
+- sortField 排序字段
+- pageNo 页号
+- pageSize 页大小
+返回字段/能力：
+- result offer 列表
+- totalRow 总记录数
+- offerId 商品ID
+- title 商品标题
+- url 商品链接
+- imgUrl 商品主图
+- imageInfos 商品主图列表
+- price 商品价格
+- unit 单位
+- saleQuantity 月销量
+- gmv30 近30天成交额
+- categoryId 类目ID
+- quantityBegin 起批量
+- companyName 公司名称
+- sellerId 卖家ID
+- loginId 卖家登录ID
+- scoreFh 发货速度
+- scoreHmRate 货物描述
+- scoreXyRate 响应速度
+- slsjFlag 实力商家标志
+- sdrzFlag 深度认证标志
+- yjdfFlag 一件代发标志
+- tpServiceYear 诚信通年限
+- offerTagList 商品标签列表
+- tkCnt 月推广量
+- tkCommission 月支出佣金
+- ratio 佣金比例
+- oldBuyerRatio 老买家佣金比例
+
+8. alibaba.cps.listPriceRadarOffer
+命名空间：com.alibaba.p4p
+用途：
+- 获取 offer 价格雷达信息。
+- 用于价格竞争、同款价格、市场竞争强度、红海/蓝海判断。
+字段/能力：
+- offerIds 商品ID列表
+- offer 价格雷达信息
+- 价格竞争信息
+- 价格对比信息
+- 同类商品价格参考
+
+9. alibaba.cps.genClickUrl
+命名空间：com.alibaba.p4p
+用途：
+- 批量生成联盟推广 URL 点击信息。
+- 用于导出表中的商品链接、可追踪跳转链接、后续归因链路。
+字段/能力：
+- offerId/offer URL
+- 推广点击 URL
+- 链接生成结果
+- 跳转跟踪信息
+
+10. alibaba.cps.listActivityPageQuery
+命名空间：com.alibaba.p4p
+用途：
+- 获取联盟活动列表。
+- 用于筛选参加活动、促销、补贴、平台招商活动的商品池。
+字段/能力：
+- 活动列表
+- 活动ID
+- 活动名称
+- 活动商品范围
+- 活动状态
+
+11. alibaba.cps.tradeBillList
+命名空间：com.alibaba.p4p
+用途：
+- 联盟实时获取订单列表。
+- 如果后续使用 CPS 链接或联盟链路，可用于订单和成交回查。
+字段/能力：
+- 联盟订单列表
+- 订单号
+- offerId
+- 成交时间
+- 成交金额
+- 订单状态
+- 佣金相关字段
+
+12. alibaba.cps.queryTradeInfoSum
+命名空间：com.alibaba.p4p
+用途：
+- 查询订单汇总信息。
+- 用于统计通过选品工具产生的联盟订单总量、成交额、状态汇总。
+字段/能力：
+- 订单汇总
+- 成交汇总
+- 订单数量
+- 成交金额
+- 佣金汇总
+
+13. alibaba.cps.listCPSSettleInfoDetail
+命名空间：com.alibaba.p4p
+用途：
+- 获取联盟结算明细列表。
+- 用于按月回查 CPS 结算明细。
+字段/能力：
+- 结算明细
+- 结算月份
+- 订单号
+- 商品ID
+- 结算金额
+- 佣金金额
+- 结算状态
+
+14. alibaba.cps.getCPSSettleSummaryInfo
+命名空间：com.alibaba.p4p
+用途：
+- 获取联盟结算摘要账单。
+- 用于统计 CPS 结算汇总。
+字段/能力：
+- 结算摘要
+- 结算周期
+- 结算金额
+- 佣金汇总
+- 结算状态
+
+三、商品详情与商品回查
+
+15. alibaba.product.get
+命名空间：com.alibaba.product
+用途：
+- 根据 productID 获取商品详细信息。
+- 主要用于企业账号自有商品、已授权商品、铺货后商品、已建立分销关系商品的详情回查。
+- 用于补充商品标题、类目、图片、SKU、销售、物流、属性、价格、资质等详情字段。
+入参字段/能力：
+- productID 商品ID
+- webSite 站点，1688 场景传 1688
+- scene 业务场景
+返回字段/能力：
+- productInfo 商品详细信息
+- productID 商品ID
+- productType 商品类型
+- categoryID 类目ID
+- categoryName 类目名称
+- subject 商品标题
+- description 商品详情
+- image 商品主图
+- skuInfos SKU信息
+- saleInfo 销售信息
+- shippingInfo 物流信息
+- attributes 商品属性
+- supplierUserId 供应商用户ID
+- supplierLoginId 供应商登录ID
+- sellerLoginId 卖家旺旺ID
+- qualityLevel 商品星级
+- referencePrice 参考价格
+- bookedCount 成交量
+- createTime 创建时间
+- approvedTime 审核通过时间
+- sevenDaysRefunds 是否支持七天无理由退货
+- crossBorderOffer 是否海外代发
+- productOfficialLogisticsModel 官方物流件重尺模型
+- bizGroupInfos 商品业务支持信息
+- errMsg 错误信息
+
+16. alibaba.product.getByIdList
+命名空间：com.alibaba.product
+用途：
+- 根据商品ID列表批量获取卖家商品。
+- 用于企业账号自有商品、已授权商品、铺货后商品批量详情补充。
+字段/能力：
+- 商品ID列表
+- 商品基础信息
+- 商品详情信息
+- SKU信息
+- 价格信息
+- 类目信息
+- 销售信息
+
+17. alibaba.product.list.get
+命名空间：com.alibaba.product
+用途：
+- 卖家根据条件分页查询商品列表。
+- 用于企业账号自有商品管理、铺货后商品回查、商品状态核对。
+字段/能力：
+- 商品状态
+- 类目ID
+- 商品关键词
+- 商品ID列表
+- 星级范围
+- 发布时间
+- 价格范围
+- 销量排序
+- 商品列表
+
+18. alibaba.product.getByStatus
+命名空间：com.alibaba.product
+用途：
+- 根据状态查询商品。
+- 用于自有商品、铺货商品、下架/上架/审核状态回查。
+字段/能力：
+- 商品状态
+- 商品ID
+- 商品列表
+- 状态筛选结果
+
+四、运费、可订购性与铺货 dry-run
+
+19. alibaba.createOrder.preview
+命名空间：com.alibaba.trade
+用途：
+- 创建订单前预览，不真正下单。
+- 用于核验商品是否可订购、起批量、库存、混批、代销关系、运费、服务、交易方式。
+- 作为运费自动核验和铺货 dry-run 的核心接口。
+入参字段/能力：
+- addressParam 收货地址信息
+- cargoParamList 商品信息
+- invoiceParam 发票信息
+- flow 下单流程，general/fenxiao/saleproxy/paired/boutiquefenxiao/boutiquepifa 等
+- instanceId 批发团实例ID
+- encryptOutOrderInfo 下游加密订单信息
+- proxySettleRecordId 分账采购单ID
+- inventoryMode 库存模式
+- outOrderId 外部订单号
+- pickupService 上门揽收
+- crossBorderLogisticsSolutionId 跨境物流解决方案ID
+- useBorderLogisticsSolution 是否使用跨境物流方案
+- isvBizType 开放平台业务码
+返回字段/能力：
+- orderPreviewResuslt 订单预览结果
+- success 是否成功
+- errorCode 错误码
+- errorMsg 错误信息
+- sumPayment 总费用
+- sumCarriage 总运费
+- sumPaymentNoCarriage 不含运费货品总费用
+- discountFee 优惠金额
+- tradeModeNameList 可用交易方式
+- cargoList 规格信息
+- shopPromotionList 店铺优惠
+- tradeServiceList 服务列表
+- canUseOfficialSolution 是否可用官方物流提货
+- officialSolutionModel 官方物流提货服务
+- postFeeByDescOfferList 运费说明商品列表
+- consignOfferList 代销商品列表
+- unsupportedCrossBorderPayOfferList 不支持跨境宝支付商品列表
+- extPairList 扩展对象列表
+
+20. alibaba.trade.fastCreateOrder
+命名空间：com.alibaba.trade
+用途：
+- 快速创建 1688 大市场订单和 1688 代销订单。
+- 用于后续真实采购、分销、铺货链路下单。
+- 用于确认微信小店回流订单与 1688 下单字段映射。
+字段/能力：
+- flow 下单流程
+- addressParam 收货地址
+- cargoParamList 商品信息
+- tradeType 交易方式
+- fenxiaoChannel 回流订单下游平台，支持 weixin 微信小店
+- outOrderId 外部订单号
+- message 买家留言
+- shopPromotionId 店铺优惠ID
+- result 订单详细信息
+- success/code/message 下单结果
+
+21. alibaba.trade.cancel
+命名空间：com.alibaba.trade
+用途：
+- 买家或卖家取消交易。
+- 用于下单测试、异常订单处理、未付款订单关闭。
+字段/能力：
+- 订单号
+- 订单状态校验
+- 取消原因
+- 取消结果
+- 错误码
+
+22. alibaba.logistics.freightTemplate.getList
+命名空间：com.alibaba.logistics
+用途：
+- 获取运费模板列表。
+- 用于核验运费模板、包邮、卖家承担运费、官方运费模板支持情况。
+字段/能力：
+- 运费模板列表
+- 类目ID筛选
+- 发货地址ID筛选
+- 运费模板ID
+- 运费模板名称
+- 运费模板规则
+- 错误码/错误信息
+
+23. alibaba.logistics.myFreightTemplate.list.get
+命名空间：com.alibaba.logistics
+用途：
+- 根据物流模板ID获取卖家的物流模板。
+- 用于企业账号自有商品、供应商授权、代销关系场景下的运费模板核验。
+字段/能力：
+- 运费模板ID
+- 运费说明
+- 卖家承担运费标识
+- 模板详情
+- 运费规则
+
+五、订单、物流与售后回查
+
+24. alibaba.trade.ec.getOrder.sellerView
+命名空间：com.alibaba.trade
+用途：
+- 获取单个交易明细。
+- 用于企业账号作为卖家时查询订单详情。
+字段/能力：
+- 订单详情
+- 商品明细
+- 订单状态
+- 交易信息
+- 买卖双方信息
+- 支付信息
+
+25. alibaba.trade.ec.getOrderList.sellerView
+命名空间：com.alibaba.trade
+用途：
+- 获取卖家订单列表。
+- 用于企业账号自有订单管理、铺货后订单回查、批量订单状态同步。
+字段/能力：
+- 订单列表
+- 订单基础信息
+- 卖家订单状态
+- 创建时间
+- 支付状态
+- 订单金额
+
+26. alibaba.trade.getLogisticsInfos.buyerView
+命名空间：com.alibaba.logistics
+用途：
+- 获取买家订单物流详情。
+- 用于采购/分销场景下查看物流详情。
+字段/能力：
+- 物流详情
+- 发件人
+- 收件人
+- 货物明细
+- 订单物流信息
+- 物流公司
+- 物流单号
+
+27. alibaba.trade.getLogisticsTraceInfo.buyerView
+命名空间：com.alibaba.logistics
+用途：
+- 获取买家订单物流跟踪信息。
+- 用于采购/分销订单物流轨迹同步。
+字段/能力：
+- 物流单号
+- 物流公司
+- 物流轨迹
+- 物流节点时间
+- 物流跟踪状态
+
+28. alibaba.trade.ec.getLogisticsInfos.sellerView
+命名空间：com.alibaba.logistics
+用途：
+- 获取卖家订单物流详情。
+- 用于企业账号作为卖家时查询物流。
+字段/能力：
+- 物流详情
+- 物流单号
+- 发货信息
+- 发件人
+- 收件人
+- 货物明细
+
+29. alibaba.trade.refund.queryOrderRefundList
+命名空间：com.alibaba.trade
+用途：
+- 根据订单号或退款单列表查询退款单列表。
+- 用于售后状态、退款记录、异常订单回查。
+字段/能力：
+- 订单号
+- 退款单列表
+- 退款状态
+- 退款金额
+- 售后类型
+- 售后更新时间
+
+30. alibaba.trade.refund.OpQueryBatchRefundByOrderIdAndStatus.sellerView
+命名空间：com.alibaba.trade
+用途：
+- 根据订单号实时查询售中退款单列表。
+- 用于企业账号作为卖家时回查售中退款。
+字段/能力：
+- 订单号
+- 退款单列表
+- 退款状态
+- 售中退款信息
+- 退款单更新时间
+
+31. trade.refund.agreeReplace
+命名空间：com.alibaba.trade
+用途：
+- 卖家同意换货并填写退货地址信息。
+- 用于后续真实订单售后换货处理。
+字段/能力：
+- 退款单号
+- 换货状态
+- 退货地址
+- 处理结果
+
+32. trade.refund.uploadForReshipping
+命名空间：com.alibaba.trade
+用途：
+- 卖家上传补寄单号。
+- 用于售后补发、换货补寄物流同步。
+字段/能力：
+- 退款单号
+- 补寄物流公司
+- 补寄物流单号
+- 上传结果
+
+六、账号、授权与调用校验
+
+33. alibaba.account.basic
+命名空间：com.alibaba.account
+用途：
+- 获取授权用户基本信息。
+- 用于确认企业账号授权是否正常，校验当前 access_token 对应的账号。
+字段/能力：
+- 会员信息
+- 授权账号信息
+- memberId
+- loginId
+- success/errorCode/errorMessage
+
+34. alibaba.account.agent.basic
+命名空间：com.alibaba.account
+用途：
+- 查看他人用户信息。
+- 用于分销、采购、供应商信息补充场景。
+字段/能力：
+- 用户基础信息
+- 供应商账号信息
+- 分销/采购相关账号信息
+- 公司主体信息
+
+35. system.time.get
+命名空间：cn.alibaba.open
+用途：
+- 获取开放平台系统时间。
+- 用于本地时间校准、签名时间校验、接口调用日志对齐。
+字段/能力：
+- 平台当前时间
+- 时间戳
+- 本地与平台时间差
+
+七、字段覆盖关系
+
+1. 类目与类目路径
+覆盖接口：
+- alibaba.category.get
+- alibaba.category.searchByKeyword
+覆盖字段：
+- 商品类目
+- 一级类目
+- 二级类目
+- 三级类目
+- 类目ID
+- 类目路径
+
+2. 类目标签与筛选属性
+覆盖接口：
+- alibaba.category.attribute.get
+- category.level.attr.get
+- alibaba.category.searchSPUInfo
+- alibaba.category.getSPUInfo
+覆盖字段：
+- 材质
+- 规格
+- 尺码
+- 颜色
+- 风格
+- 适用人群
+- 类目属性
+- 级联筛选
+- SPU/标准规格
+
+3. 候选商品列表
+覆盖接口：
+- alibaba.cps.listOfferPageQuery
+覆盖字段：
+- 商品ID
+- 商品标题
+- 商品链接
+- 商品主图
+- 主图链接
+- 类目ID
+- 商品价格
+- 起批量
+- 月销量
+- 近30天成交额
+- 公司名称
+- 卖家ID
+- 卖家登录ID
+- 商品标签
+- 一件代发标志
+- 实力商家标志
+- 深度认证标志
+- 诚信通年限
+
+4. 价格、销量、GMV、起批量
+覆盖接口：
+- alibaba.cps.listOfferPageQuery
+- alibaba.product.get
+- alibaba.product.getByIdList
+覆盖字段：
+- 批发价
+- 参考价格
+- 起批范围
+- 月销量
+- 近30天销量
+- 近30天销售额
+- SKU价格
+- 库存
+- 商品上架/审核时间
+
+5. 价格竞争与同款分析
+覆盖接口：
+- alibaba.cps.listPriceRadarOffer
+- alibaba.category.searchSPUInfo
+- alibaba.category.getSPUInfo
+覆盖字段：
+- 价格雷达
+- 同款/相似款数量
+- 同类价格对比
+- 红海/蓝海判断输入
+- 标准化规格
+
+6. 商家服务与履约能力
+覆盖接口：
+- alibaba.cps.listOfferPageQuery
+- alibaba.account.agent.basic
+- alibaba.product.get
+覆盖字段：
+- 发货速度
+- 货物描述
+- 响应速度
+- 公司名称
+- 卖家会员信息
+- 诚信通年限
+- 实力商家
+- 深度认证
+- 一件代发
+- 商品服务标签
+
+7. 运费与可下单核验
+覆盖接口：
+- alibaba.createOrder.preview
+- alibaba.logistics.freightTemplate.getList
+- alibaba.logistics.myFreightTemplate.list.get
+覆盖字段：
+- 批发运费
+- 代发运费
+- 是否包邮
+- 可订购状态
+- 起批量校验
+- 库存校验
+- 混批校验
+- 代销关系校验
+- 可用交易方式
+- 官方物流支持
+- 运费模板
+- 运费说明
+
+8. 微信小店/下游订单链路
+覆盖接口：
+- alibaba.createOrder.preview
+- alibaba.trade.fastCreateOrder
+- alibaba.trade.cancel
+覆盖字段：
+- 外部订单号
+- 下游平台标识
+- fenxiaoChannel=weixin
+- 收货地址
+- 商品明细
+- 下单结果
+- 异常取消
+- 铺货 dry-run 结果
+
+9. 订单与物流回查
+覆盖接口：
+- alibaba.trade.ec.getOrder.sellerView
+- alibaba.trade.ec.getOrderList.sellerView
+- alibaba.trade.getLogisticsInfos.buyerView
+- alibaba.trade.getLogisticsTraceInfo.buyerView
+- alibaba.trade.ec.getLogisticsInfos.sellerView
+覆盖字段：
+- 订单号
+- 订单状态
+- 交易金额
+- 商品明细
+- 物流公司
+- 物流单号
+- 发货信息
+- 物流轨迹
+- 收发件信息
+
+10. 退款与售后
+覆盖接口：
+- alibaba.trade.refund.queryOrderRefundList
+- alibaba.trade.refund.OpQueryBatchRefundByOrderIdAndStatus.sellerView
+- trade.refund.agreeReplace
+- trade.refund.uploadForReshipping
+覆盖字段：
+- 退款单
+- 退款状态
+- 退款金额
+- 售中退款
+- 换货状态
+- 补寄物流单号
+- 售后处理结果
+
+11. 授权与调用安全
+覆盖接口：
+- alibaba.account.basic
+- alibaba.account.agent.basic
+- system.time.get
+覆盖字段：
+- 授权账号
+- 企业账号信息
+- 供应商账号信息
+- access_token 归属账号
+- 平台系统时间
+- 调用时间校准
+
+八、当前导出字段对应的接口来源
+
+商品基础：
+- 商品类目：alibaba.category.get、alibaba.cps.listOfferPageQuery、alibaba.product.get
+- 商品标题：alibaba.cps.listOfferPageQuery、alibaba.product.get
+- 商品ID：alibaba.cps.listOfferPageQuery、alibaba.product.get
+- 商品链接：alibaba.cps.listOfferPageQuery、alibaba.cps.genClickUrl
+- 商品主图/主图链接：alibaba.cps.listOfferPageQuery、alibaba.product.get
+
+价格与成本：
+- 批发价：alibaba.cps.listOfferPageQuery、alibaba.product.get
+- 起批范围：alibaba.cps.listOfferPageQuery、alibaba.createOrder.preview、alibaba.product.get
+- 代发价：alibaba.product.get、alibaba.createOrder.preview
+- 批发运费/代发运费：alibaba.createOrder.preview、alibaba.logistics.freightTemplate.getList、alibaba.logistics.myFreightTemplate.list.get
+- 是否包邮：alibaba.createOrder.preview、alibaba.logistics.freightTemplate.getList
+
+销售表现：
+- 近30天订单数/件数/销售额：alibaba.cps.listOfferPageQuery
+- 月代发订单：alibaba.cps.listOfferPageQuery、alibaba.cps.tradeBillList
+- SKU数量：alibaba.product.get
+- 收藏客户：以 alibaba.cps.listOfferPageQuery、alibaba.product.get 回包为准
+
+竞争信息：
+- 下游铺货数：以 alibaba.cps.listOfferPageQuery、alibaba.cps.tradeBillList 回包为准
+- 同款/相似款数量：alibaba.cps.listPriceRadarOffer、alibaba.category.searchSPUInfo、alibaba.category.getSPUInfo
+- 商品标识：alibaba.cps.listOfferPageQuery
+- 红海/蓝海判断：由价格雷达、销量、GMV、同款数量、价格区间计算
+
+口碑与质量：
+- 好评率：以 alibaba.cps.listOfferPageQuery、alibaba.product.get 的企业账号实际回包为准
+- 评论数：以 alibaba.cps.listOfferPageQuery、alibaba.product.get 的企业账号实际回包为准
+- 品退率：以企业账号获批后的 CPS/商品/商家/订单相关回包为准
+- 资质证书：alibaba.product.get、alibaba.account.agent.basic
+- 商品星级：alibaba.product.get
+- 评价标签：以 alibaba.product.get 的企业账号实际回包为准
+
+履约能力：
+- 权益保障：alibaba.cps.listOfferPageQuery、alibaba.product.get、alibaba.createOrder.preview
+- 代发权益：alibaba.cps.listOfferPageQuery、alibaba.createOrder.preview、alibaba.trade.fastCreateOrder
+- 面单支持：alibaba.createOrder.preview、alibaba.trade.fastCreateOrder
+- 24小时揽收率：以企业账号获批后的 CPS/物流/商家相关回包为准
+- 发货率：以企业账号获批后的 CPS/物流/商家相关回包为准
+- 发货时效：alibaba.cps.listOfferPageQuery、alibaba.createOrder.preview、物流相关接口
+- 是否一件代发：alibaba.cps.listOfferPageQuery、alibaba.createOrder.preview
+- 是否支持退换：alibaba.product.get、退款售后相关接口
+
+商家信息：
+- 店铺名称：alibaba.cps.listOfferPageQuery、alibaba.account.agent.basic
+- 所在地：alibaba.account.agent.basic、alibaba.product.get
+- 综合服务：alibaba.cps.listOfferPageQuery
+- 公司类型：alibaba.account.agent.basic、alibaba.product.get
+- 卖家会员类型：alibaba.account.agent.basic
+- 卖家服务：alibaba.cps.listOfferPageQuery、alibaba.product.get
+- 诚信通年限：alibaba.cps.listOfferPageQuery
+- 店铺链接：alibaba.cps.listOfferPageQuery、alibaba.cps.genClickUrl
+- 是否源头工厂：以 alibaba.cps.listOfferPageQuery、alibaba.account.agent.basic 的企业账号实际回包为准
+
+平台适配与风险：
+- 适合微信小店：由价格、运费、起批量、代发、物流、售后、品类风险、数据完整度计算
+- 品牌/侵权风险：由商品标题、类目、属性、资质、人工规则计算
+- 低价质损风险：由价格、评价、退货、评分、类目规则计算
+- 售后风险：由品退率、退款记录、退换支持、发货能力计算
+- 库存：alibaba.product.get、alibaba.createOrder.preview
+
+九、数据真实性处理口径
+
+- 只有接口真实返回、订单预览真实校验、授权账号真实回查的数据，才能在导出中标记为真实数据。
+- API 回包没有返回的字段，不用样例数据补齐，不写成真实数据。
+- 没有单独接口名的字段，不额外编造接口名；申请时统一作为上面已有接口的字段范围确认，拿到企业账号实际回包后再接入项目字段映射。
+- 品退率、发货率、24小时揽收率、好评率、评论数、评价标签、店铺粉丝数、店铺商品数、商家特色、经营模式、是否源头工厂、是否支持微信小店面单，均按真实回包校验；未拿到真实回包前在系统里保持未核验状态。

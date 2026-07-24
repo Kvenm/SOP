@@ -4,32 +4,41 @@
 import json
 import mimetypes
 import os
+import platform
+import re
 import secrets
 import socket
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.error import URLError
 from urllib.request import urlopen
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from _auth import get_ak_from_env
 from capabilities.tag_collect.service import (
     CATEGORY_DICTIONARY,
+    DEFAULT_ITEMS_PER_QUERY,
+    DEFAULT_TARGET_PUBLISHABLE_COUNT,
     EXPORT_COLUMNS,
     MAX_ITEMS_PER_QUERY,
+    MAX_AUTO_VERIFY_ITEMS,
     MAX_QUERIES,
+    MAX_TARGET_PUBLISHABLE_COUNT,
     TAG_CATEGORY_TREE,
     TAG_FILTER_GROUPS,
     METRIC_FILTER_GROUPS,
     get_export_path,
+    get_tag_collect_data_dir,
     get_library_capabilities,
     get_library_filter_coverage,
     get_library_filter_schema,
     get_numbered_export_columns,
     collect_error_state,
+    TASK_CANCELLED_CODE,
     get_run_payload,
     parse_input,
     run_tag_collect,
@@ -40,8 +49,26 @@ from capabilities.tag_collect.service import (
 
 SERVER_TOKEN = ""
 ALLOW_REAL_COLLECT = True
+WORKBENCH_BUILD = "2026.07.23-shipping-monthly-metrics-r2"
 DEFAULT_CDP_PORT = int(os.environ.get("TAG_COLLECT_CDP_PORT") or 9222)
 DEFAULT_CDP_URL = f"http://127.0.0.1:{DEFAULT_CDP_PORT}"
+TASK_LOCK = threading.RLock()
+TASKS: Dict[str, Dict[str, Any]] = {}
+TASK_CANCEL_EVENTS: Dict[str, threading.Event] = {}
+ACTIVE_TASK_ID = ""
+MAX_TASK_HISTORY = 20
+TASK_STORE_FILENAME = "web_tasks.json"
+TASK_STORE_VERSION = 1
+TASK_STORE_LOADED_PATH = ""
+TASK_IN_FLIGHT_STATUSES = {"queued", "running", "cancelling"}
+TASK_TERMINAL_STATUSES = {"completed", "paused", "failed", "cancelled", "interrupted"}
+PAUSED_TASK_ACTIONS = {
+    "manual_handoff",
+    "manual_login",
+    "manual_open_page",
+    "paste_url",
+    "restart_chrome_debug",
+}
 
 
 def _tag_collect_dir() -> Path:
@@ -124,20 +151,64 @@ def _chrome_runtime_status() -> Dict[str, Any]:
 
 
 def _start_chrome_debug_browser() -> Dict[str, Any]:
-    script = _tag_collect_dir() / "start_chrome_debug.sh"
-    if not script.exists():
-        raise RuntimeError(f"未找到采集浏览器启动脚本：{script}")
     env = os.environ.copy()
     env.setdefault("TAG_COLLECT_CDP_PORT", str(DEFAULT_CDP_PORT))
     os.environ["TAG_COLLECT_CDP_URL"] = DEFAULT_CDP_URL
-    subprocess.Popen(
-        [str(script)],
-        cwd=str(_tag_collect_dir()),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    if platform.system() == "Windows":
+        configured_browser = str(env.get("CHROME_BIN") or "").strip()
+        browser_candidates = [
+            configured_browser,
+            str(Path(env.get("PROGRAMFILES") or "") / "Google/Chrome/Application/chrome.exe"),
+            str(Path(env.get("PROGRAMFILES(X86)") or "") / "Google/Chrome/Application/chrome.exe"),
+            str(Path(env.get("LOCALAPPDATA") or "") / "Google/Chrome/Application/chrome.exe"),
+            str(Path(env.get("PROGRAMFILES") or "") / "Microsoft/Edge/Application/msedge.exe"),
+            str(Path(env.get("PROGRAMFILES(X86)") or "") / "Microsoft/Edge/Application/msedge.exe"),
+        ]
+        browser = next(
+            (Path(candidate) for candidate in browser_candidates if candidate and Path(candidate).is_file()),
+            None,
+        )
+        if browser is None:
+            raise RuntimeError("未找到可用的 Chrome 或 Edge；请先安装浏览器，或通过 CHROME_BIN 指定路径。")
+        profile = Path(
+            env.get("TAG_COLLECT_CHROME_PROFILE")
+            or Path(env.get("LOCALAPPDATA") or Path.home()) / "SOP1688/ChromeProfile"
+        )
+        profile.mkdir(parents=True, exist_ok=True)
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs = {
+            "cwd": str(_tag_collect_dir()),
+            "env": env,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if creationflags:
+            popen_kwargs["creationflags"] = creationflags
+        subprocess.Popen(
+            [
+                str(browser),
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={DEFAULT_CDP_PORT}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "https://www.1688.com/",
+            ],
+            **popen_kwargs,
+        )
+    else:
+        script = _tag_collect_dir() / "start_chrome_debug.sh"
+        if not script.exists():
+            raise RuntimeError(f"未找到采集浏览器启动脚本：{script}")
+        subprocess.Popen(
+            [str(script)],
+            cwd=str(_tag_collect_dir()),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     status = _chrome_runtime_status()
     deadline = time.time() + 8
     while time.time() < deadline and not status.get("cdp_ready"):
@@ -193,6 +264,590 @@ def _bool_value(value: Any, *, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _template_store_path() -> Path:
+    return Path(get_tag_collect_data_dir()) / "filter_templates.json"
+
+
+def _load_templates() -> List[Dict[str, Any]]:
+    path = _template_store_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return []
+    templates = payload.get("templates") if isinstance(payload, dict) else []
+    return [item for item in templates if isinstance(item, dict) and str(item.get("name") or "").strip()]
+
+
+def _save_templates(templates: List[Dict[str, Any]]) -> None:
+    path = _template_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps({"version": 1, "templates": templates}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
+
+def _template_config(value: Any) -> Dict[str, Any]:
+    config = dict(value) if isinstance(value, dict) else {}
+    allowed = {
+        "categories",
+        "tags",
+        "keywords",
+        "source_urls",
+        "exclude_tags",
+        "library_filters",
+        "multi_category_mode",
+        "max_queries",
+        "max_items_per_query",
+        "target_publishable_count",
+        "auto_verify_details",
+        "auto_verify_max_items",
+        "output_format",
+        "collect_source",
+    }
+    return {key: config.get(key) for key in allowed if key in config}
+
+
+def _upsert_template(name: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    clean_name = " ".join(str(name or "").strip().split())[:80]
+    if not clean_name:
+        raise ValueError("请填写模板名称。")
+    templates = _load_templates()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    existing = next((item for item in templates if item.get("name") == clean_name), None)
+    if existing:
+        existing["config"] = _template_config(config)
+        existing["updated_at"] = now
+    else:
+        templates.append({
+            "name": clean_name,
+            "config": _template_config(config),
+            "created_at": now,
+            "updated_at": now,
+        })
+    templates = sorted(templates, key=lambda item: str(item.get("updated_at") or ""), reverse=True)[:50]
+    _save_templates(templates)
+    return templates
+
+
+def _delete_template(name: str) -> List[Dict[str, Any]]:
+    clean_name = str(name or "").strip()
+    templates = [item for item in _load_templates() if item.get("name") != clean_name]
+    _save_templates(templates)
+    return templates
+
+
+def _task_store_path() -> Path:
+    return Path(get_tag_collect_data_dir()) / TASK_STORE_FILENAME
+
+
+def _task_timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _safe_task_text(value: Any, *, limit: int = 600) -> str:
+    text = str(value or "")
+    text = re.sub(r"https?://\S+", "[链接已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?i)\b(?:x5secdata|x5step|cookie|authorization|access[_-]?token|refresh[_-]?token|token)\b(?:\s*[:=]\s*)?[^\s，。；;]*",
+        "[临时参数已隐藏]",
+        text,
+    )
+    text = " ".join(text.split())
+    return f"{text[:limit]}…" if len(text) > limit else text
+
+
+def _safe_nonnegative_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _task_request_summary(config: Any, request_meta: Dict[str, Any]) -> Dict[str, Any]:
+    categories = [
+        _safe_task_text(item, limit=180)
+        for item in list(request_meta.get("categories") or getattr(config, "categories", []) or [])
+        if str(item or "").strip()
+    ]
+    return {
+        "category_count": len(categories),
+        "categories": categories[:6],
+        "collect_source": _safe_task_text(request_meta.get("collect_source") or getattr(config, "collect_source", ""), limit=40),
+        "sample_data": bool(request_meta.get("sample_data", getattr(config, "sample_data", False))),
+        "multi_category_mode": bool(request_meta.get("multi_category_mode")),
+        "max_items_per_query": _safe_nonnegative_int(getattr(config, "max_items_per_query", 0)),
+        "target_publishable_count": _safe_nonnegative_int(getattr(config, "target_publishable_count", 0)),
+    }
+
+
+def _safe_task_summary(value: Any) -> Dict[str, Any]:
+    summary = value if isinstance(value, dict) else {}
+    categories = summary.get("categories") if isinstance(summary.get("categories"), list) else []
+    category_count = summary.get("category_count")
+    if category_count in (None, ""):
+        category_count = len(categories)
+    return {
+        "category_count": _safe_nonnegative_int(category_count, default=len(categories)),
+        "categories": [_safe_task_text(item, limit=180) for item in categories[:6]],
+        "collect_source": _safe_task_text(summary.get("collect_source"), limit=40),
+        "sample_data": bool(summary.get("sample_data")),
+        "multi_category_mode": bool(summary.get("multi_category_mode")),
+        "max_items_per_query": _safe_nonnegative_int(summary.get("max_items_per_query")),
+        "target_publishable_count": _safe_nonnegative_int(summary.get("target_publishable_count")),
+    }
+
+
+def _safe_task_progress(value: Any) -> Dict[str, Any]:
+    progress = value if isinstance(value, dict) else {}
+    safe: Dict[str, Any] = {}
+    text_keys = {"stage", "message", "run_id", "collection_stop_reason", "shortfall_reason"}
+    number_keys = {
+        "percent",
+        "pages_visited",
+        "candidate_count",
+        "candidate_scan_limit",
+        "verification_index",
+        "verification_total",
+    }
+    for key in text_keys:
+        if progress.get(key) not in (None, ""):
+            safe[key] = _safe_task_text(progress.get(key), limit=600 if key in {"message", "shortfall_reason"} else 160)
+    for key in number_keys:
+        if progress.get(key) not in (None, ""):
+            try:
+                safe[key] = int(progress.get(key))
+            except (TypeError, ValueError):
+                continue
+    return safe
+
+
+def _safe_result_summary(value: Any) -> Dict[str, Any]:
+    result = value if isinstance(value, dict) else {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    safe_data: Dict[str, Any] = {}
+    text_keys = {
+        "run_id",
+        "collection_stop_reason",
+        "shortfall_reason",
+        "error_code",
+        "action",
+        "suggestion",
+    }
+    number_keys = {
+        "row_count",
+        "candidate_count",
+        "candidate_scan_limit",
+        "pagination_pages_visited",
+        "pagination_collected_count",
+        "target_publishable_count",
+        "publishable_count",
+        "publishable_candidate_count",
+        "verified_count",
+    }
+    for key in text_keys:
+        if data.get(key) not in (None, ""):
+            safe_data[key] = _safe_task_text(data.get(key), limit=600 if key in {"shortfall_reason", "suggestion"} else 160)
+    for key in number_keys:
+        if data.get(key) not in (None, ""):
+            try:
+                safe_data[key] = int(data.get(key))
+            except (TypeError, ValueError):
+                continue
+    download_url = str(data.get("download_url") or "")
+    if download_url.startswith("/download?run_id="):
+        safe_data["download_url"] = download_url[:260]
+    automation = data.get("automation_state") if isinstance(data.get("automation_state"), dict) else {}
+    if automation:
+        safe_data["automation_state"] = {
+            key: _safe_task_text(automation.get(key), limit=500)
+            for key in ("status", "message", "stopped_reason", "action")
+            if automation.get(key) not in (None, "")
+        }
+    return {
+        "success": bool(result.get("success")),
+        "markdown": _safe_task_text(result.get("markdown"), limit=600),
+        "data": safe_data,
+    }
+
+
+def _result_summary_from_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(task.get("result"), dict):
+        return _safe_result_summary(task.get("result"))
+    if isinstance(task.get("result_summary"), dict):
+        return _safe_result_summary(task.get("result_summary"))
+    return {}
+
+
+def _persisted_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    summary = task.get("summary")
+    if not isinstance(summary, dict):
+        summary = _task_request_summary(task.get("config"), dict(task.get("request_meta") or {}))
+    persisted = {
+        "task_id": _safe_task_text(task.get("task_id"), limit=120),
+        "status": _safe_task_text(task.get("status"), limit=40),
+        "created_at": _safe_task_text(task.get("created_at"), limit=40),
+        "updated_at": _safe_task_text(task.get("updated_at"), limit=40),
+        "started_at": _safe_task_text(task.get("started_at"), limit=40),
+        "finished_at": _safe_task_text(task.get("finished_at"), limit=40),
+        "progress": _safe_task_progress(task.get("progress")),
+        "summary": _safe_task_summary(summary),
+    }
+    result_summary = _result_summary_from_task(task)
+    if result_summary:
+        persisted["result_summary"] = result_summary
+    return persisted
+
+
+def _trim_task_history_locked() -> None:
+    if len(TASKS) <= MAX_TASK_HISTORY:
+        return
+    ordered = sorted(
+        TASKS.values(),
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    keep_ids = {str(item.get("task_id") or "") for item in ordered[:MAX_TASK_HISTORY]}
+    if ACTIVE_TASK_ID:
+        keep_ids.add(ACTIVE_TASK_ID)
+    for task_id in list(TASKS):
+        if task_id not in keep_ids:
+            TASKS.pop(task_id, None)
+            TASK_CANCEL_EVENTS.pop(task_id, None)
+
+
+def _persist_tasks_locked() -> None:
+    path = _task_store_path()
+    _trim_task_history_locked()
+    tasks = sorted(
+        (_persisted_task(task) for task in TASKS.values()),
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )[:MAX_TASK_HISTORY]
+    payload = {"version": TASK_STORE_VERSION, "updated_at": _task_timestamp(), "tasks": tasks}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    last_error: Optional[OSError] = None
+    for attempt in range(4):
+        temp_path = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{attempt}.tmp"
+        )
+        try:
+            temp_path.write_text(payload_text, encoding="utf-8")
+            os.replace(temp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt < 3:
+                time.sleep(0.05 * (attempt + 1))
+    if last_error is not None:
+        print(f"任务状态写入失败：{last_error}")
+
+
+def _ensure_tasks_loaded() -> None:
+    global ACTIVE_TASK_ID, TASK_STORE_LOADED_PATH
+    path = _task_store_path()
+    path_key = str(path.resolve())
+    with TASK_LOCK:
+        if TASK_STORE_LOADED_PATH == path_key:
+            return
+        TASKS.clear()
+        TASK_CANCEL_EVENTS.clear()
+        ACTIVE_TASK_ID = ""
+        payload: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+                payload = loaded if isinstance(loaded, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        interrupted = False
+        for item in payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            task = _persisted_task(item)
+            task_id = str(task.get("task_id") or "")
+            if not task_id:
+                continue
+            status = str(task.get("status") or "failed")
+            if status in TASK_IN_FLIGHT_STATUSES:
+                now = _task_timestamp()
+                task["status"] = "interrupted"
+                task["updated_at"] = now
+                task["finished_at"] = now
+                task["progress"] = {
+                    **dict(task.get("progress") or {}),
+                    "stage": "interrupted",
+                    "message": "Web 服务重启，原任务已中断，不会自动继续。",
+                }
+                interrupted = True
+            elif status not in TASK_TERMINAL_STATUSES:
+                task["status"] = "failed"
+            task["result"] = None
+            TASKS[task_id] = task
+        _trim_task_history_locked()
+        TASK_STORE_LOADED_PATH = path_key
+        if interrupted:
+            _persist_tasks_locked()
+
+
+def _public_task(task: Optional[Dict[str, Any]], *, include_result: bool = True) -> Dict[str, Any]:
+    if not task:
+        return {}
+    result = {
+        key: value
+        for key, value in task.items()
+        if key not in {"config", "request_meta", "result"}
+    }
+    if include_result and task.get("result") is not None:
+        result["result"] = task.get("result")
+    return result
+
+
+def _active_task() -> Dict[str, Any]:
+    _ensure_tasks_loaded()
+    with TASK_LOCK:
+        task = TASKS.get(ACTIVE_TASK_ID) if ACTIVE_TASK_ID else None
+        return _public_task(task, include_result=False)
+
+
+def _recent_tasks() -> List[Dict[str, Any]]:
+    _ensure_tasks_loaded()
+    with TASK_LOCK:
+        tasks = sorted(
+            (_persisted_task(task) for task in TASKS.values()),
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )
+        return tasks[:MAX_TASK_HISTORY]
+
+
+def _update_task(task_id: str, **values: Any) -> None:
+    _ensure_tasks_loaded()
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return
+        task.update(values)
+        task["updated_at"] = _task_timestamp()
+        _persist_tasks_locked()
+
+
+def _task_progress_callback(task_id: str):
+    def callback(progress: Dict[str, Any]) -> None:
+        _update_task(task_id, progress=dict(progress))
+    return callback
+
+
+def _prepare_collect_request(payload: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+    sample_data = _bool_value(payload.get("sample_data"), default=False)
+    collect_source = str(payload.get("collect_source") or "rpa").lower()
+    auto_verify_details = _bool_value(payload.get("auto_verify_details"), default=False)
+    if collect_source in ("url_direct", "direct_url", "http_url") and not sample_data:
+        auto_verify_details = False
+    task_categories, task_library_filters, multi_category_mode = _normalized_web_task_scope(payload)
+    if not sample_data:
+        if not ALLOW_REAL_COLLECT:
+            error = RuntimeError("当前 Web 工作台未开启真实采集。正式测试请在运行服务的本机打开 127.0.0.1 后再执行真实采集。")
+            error.data = {"code": "real_collect_disabled"}
+            raise error
+        ak_id, _ = get_ak_from_env()
+        if collect_source == "api" and not ak_id:
+            error = RuntimeError("AK 未配置，当前 Web 工作台已阻止 API 真实采集。请先配置 AK，或改用人工页面读取。")
+            error.data = {"code": "ak_missing"}
+            raise error
+    config = parse_input(
+        categories=_csv_join(task_categories),
+        tags=_csv_join(payload.get("tags")),
+        keywords=_csv_join(payload.get("keywords")),
+        source_urls=_csv_join(payload.get("source_urls")),
+        exclude_tags=_csv_join(payload.get("exclude_tags")),
+        max_queries=int(payload.get("max_queries") or 20),
+        max_items_per_query=int(payload.get("max_items_per_query") or DEFAULT_ITEMS_PER_QUERY),
+        target_publishable_count=int(payload.get("target_publishable_count") or DEFAULT_TARGET_PUBLISHABLE_COUNT),
+        sample_data=sample_data,
+        output_format=str(payload.get("output_format") or "xlsx"),
+        collect_source=collect_source,
+        library_filters=task_library_filters,
+        auto_verify_details=auto_verify_details,
+        auto_verify_max_items=int(payload.get("auto_verify_max_items") or 0),
+    )
+    return config, {
+        "categories": task_categories,
+        "library_filters": task_library_filters,
+        "multi_category_mode": multi_category_mode,
+        "collect_source": collect_source,
+        "sample_data": sample_data,
+        "request": dict(payload),
+    }
+
+
+def _finalize_collect_result(result: Dict[str, Any], config: Any, request_meta: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(result.get("data") or {})
+    run_payload = get_run_payload(str(data.get("run_id") or "")) or {}
+    data["rows"] = run_payload.get("rows", data.get("rows", []))
+    data["download_url"] = f"/download?run_id={data['run_id']}" if data.get("run_id") else ""
+    data["task_categories"] = list(getattr(config, "categories", []) or [])
+    data["multi_category_mode"] = bool(request_meta.get("multi_category_mode"))
+    return {"success": bool(result.get("success")), "markdown": result.get("markdown", ""), "data": data}
+
+
+def _collect_failure_result(exc: Exception, request_meta: Dict[str, Any]) -> Dict[str, Any]:
+    error_state = collect_error_state(exc)
+    detail = getattr(exc, "data", {}) or {}
+    filter_results = error_state.get("filter_results") or detail.get("filter_results") or []
+    if not isinstance(filter_results, list):
+        filter_results = []
+    error_snapshot_path = save_error_payload({
+        "request": {
+            "categories": request_meta.get("categories", []),
+            "collect_source": request_meta.get("collect_source", ""),
+            "sample_data": request_meta.get("sample_data", False),
+            "library_filters": request_meta.get("library_filters", {}),
+            "multi_category_mode": request_meta.get("multi_category_mode", False),
+        },
+        "error_state": error_state,
+        "error_data": detail,
+    })
+    paused = str(error_state.get("action") or "") in PAUSED_TASK_ACTIONS
+    return {
+        "success": False,
+        "markdown": f"采集已暂停：{error_state['message']}" if paused else f"采集失败：{error_state['message']}",
+        "data": {
+            "run_id": "",
+            "row_count": 0,
+            "rows": [],
+            "error_code": error_state["code"],
+            "action": error_state["action"],
+            "retryable": error_state["retryable"],
+            "suggestion": error_state["suggestion"],
+            "runtime": error_state.get("runtime", _chrome_runtime_status()),
+            "filter_results": filter_results,
+            "diagnostics": error_state.get("diagnostics") or detail.get("diagnostics") or {},
+            "category_path": error_state.get("category_path") or detail.get("category_path") or "",
+            "error_snapshot_path": error_snapshot_path,
+        },
+    }
+
+
+def _run_collect_task(task_id: str) -> None:
+    global ACTIVE_TASK_ID
+    _ensure_tasks_loaded()
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return
+        config = task["config"]
+        request_meta = task["request_meta"]
+        cancel_event = TASK_CANCEL_EVENTS[task_id]
+        task["status"] = "running"
+        task["started_at"] = _task_timestamp()
+        task["updated_at"] = task["started_at"]
+        _persist_tasks_locked()
+    try:
+        result = run_tag_collect(
+            config,
+            progress_callback=_task_progress_callback(task_id),
+            cancel_event=cancel_event,
+        )
+        final_result = _finalize_collect_result(result, config, request_meta)
+        final_data = final_result.get("data", {}) if isinstance(final_result, dict) else {}
+        partial_failure_count = int(final_data.get("partial_failure_count") or 0)
+        _update_task(
+            task_id,
+            status="completed",
+            result=final_result,
+            progress={
+                "stage": "completed",
+                "message": (
+                    f"任务部分完成：{partial_failure_count} 个类目/子任务失败，已导出此前成功结果。"
+                    if partial_failure_count
+                    else "采集、筛选和导出已完成。"
+                ),
+                "percent": 100,
+                "run_id": final_data.get("run_id", ""),
+                "pages_visited": final_data.get("pagination_pages_visited", 0),
+                "candidate_count": final_data.get("candidate_count", 0),
+                "candidate_scan_limit": final_data.get("candidate_scan_limit", 0),
+                "collection_stop_reason": final_data.get("collection_stop_reason", ""),
+                "shortfall_reason": final_data.get("shortfall_reason", ""),
+            },
+            finished_at=_task_timestamp(),
+        )
+    except Exception as exc:
+        failure = _collect_failure_result(exc, request_meta)
+        failure_data = failure.get("data", {})
+        error_code = failure_data.get("error_code")
+        cancelled = error_code == TASK_CANCELLED_CODE
+        paused = str(failure_data.get("action") or "") in PAUSED_TASK_ACTIONS
+        with TASK_LOCK:
+            current_progress = dict((TASKS.get(task_id) or {}).get("progress") or {})
+        if error_code == "security_verification_required":
+            progress_message = "任务已安全暂停。验证页已保留在采集 Chrome 中；人工完成验证后，请回到工作台重新开始采集。"
+        elif error_code == "login_required":
+            progress_message = "任务已暂停。登录页已保留在采集 Chrome 中；完成登录并确认搜索页正常后，请重新开始采集。"
+        elif error_code == "category_navigation_not_loaded":
+            progress_message = "任务已暂停：未能稳定进入目标类目结果页，请查看下方类目执行记录。"
+        else:
+            progress_message = failure.get("markdown", "采集失败")
+        _update_task(
+            task_id,
+            status="cancelled" if cancelled else ("paused" if paused else "failed"),
+            result=failure,
+            progress={
+                **current_progress,
+                "stage": "cancelled" if cancelled else ("paused" if paused else "failed"),
+                "message": "任务已停止。" if cancelled else progress_message,
+                "percent": 100 if cancelled else int(current_progress.get("percent") or 0),
+            },
+            finished_at=_task_timestamp(),
+        )
+    finally:
+        with TASK_LOCK:
+            if ACTIVE_TASK_ID == task_id:
+                ACTIVE_TASK_ID = ""
+
+
+def _start_collect_task(config: Any, request_meta: Dict[str, Any]) -> Dict[str, Any]:
+    global ACTIVE_TASK_ID
+    _ensure_tasks_loaded()
+    with TASK_LOCK:
+        if ACTIVE_TASK_ID:
+            active = TASKS.get(ACTIVE_TASK_ID)
+            if active and active.get("status") in {"queued", "running", "cancelling"}:
+                raise RuntimeError("已有采集任务正在执行，请先等待完成或停止当前任务。")
+        task_id = secrets.token_urlsafe(12)
+        now = _task_timestamp()
+        TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "progress": {"stage": "queued", "message": "任务已进入执行队列。", "percent": 0},
+            "result": None,
+            "config": config,
+            "request_meta": request_meta,
+            "summary": _task_request_summary(config, request_meta),
+        }
+        TASK_CANCEL_EVENTS[task_id] = threading.Event()
+        ACTIVE_TASK_ID = task_id
+        _trim_task_history_locked()
+        _persist_tasks_locked()
+    thread = threading.Thread(target=_run_collect_task, args=(task_id,), daemon=True, name=f"tag-collect-{task_id[:6]}")
+    thread.start()
+    return _public_task(TASKS[task_id], include_result=False)
 
 
 def _normalized_web_task_scope(payload: Dict[str, Any]) -> tuple[List[str], Dict[str, Any], bool]:
@@ -259,15 +914,19 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             self._send(204, b"", "image/x-icon")
             return
         if parsed.path == "/api/options":
+            _ensure_tasks_loaded()
             self._send_json(200, {
                 "success": True,
                 "data": {
                     "token": SERVER_TOKEN,
+                    "workbench_build": WORKBENCH_BUILD,
                     "allow_real_collect": ALLOW_REAL_COLLECT,
                     "runtime": _chrome_runtime_status(),
                     "limits": {
                         "max_queries": MAX_QUERIES,
                         "max_items_per_query": MAX_ITEMS_PER_QUERY,
+                        "max_auto_verify_items": MAX_AUTO_VERIFY_ITEMS,
+                        "max_target_publishable_count": MAX_TARGET_PUBLISHABLE_COUNT,
                     },
                     "category_tree": TAG_CATEGORY_TREE,
                     "category_dictionary": {
@@ -283,8 +942,27 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                     "library_filter_schema": get_library_filter_schema(),
                     "library_filter_coverage": get_library_filter_coverage(),
                     "library_capabilities": get_library_capabilities(),
+                    "templates": _load_templates(),
+                    "active_task": _active_task(),
+                    "recent_tasks": _recent_tasks(),
                 },
             })
+            return
+        if parsed.path == "/api/task/status":
+            _ensure_tasks_loaded()
+            params = parse_qs(parsed.query)
+            token = (params.get("token") or [""])[0]
+            if token != SERVER_TOKEN:
+                self._send_json(403, {"success": False, "markdown": "本地工作台 token 校验失败。", "data": {}})
+                return
+            task_id = (params.get("task_id") or [""])[0]
+            with TASK_LOCK:
+                task = TASKS.get(task_id)
+                snapshot = _public_task(task, include_result=True)
+            if not snapshot:
+                self._send_json(404, {"success": False, "markdown": "未找到采集任务。", "data": {}})
+                return
+            self._send_json(200, {"success": True, "markdown": "", "data": snapshot})
             return
         if parsed.path == "/api/chrome/status":
             self._send_json(200, {
@@ -299,7 +977,9 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             if not payload:
                 self._send_json(404, {"success": False, "markdown": "未找到采集批次", "data": {}})
                 return
-            self._send_json(200, {"success": True, "markdown": "", "data": payload})
+            data = dict(payload)
+            data["download_url"] = f"/download?run_id={run_id}"
+            self._send_json(200, {"success": True, "markdown": "", "data": data})
             return
         if parsed.path == "/download":
             self._download(parsed.query)
@@ -308,7 +988,15 @@ class TagCollectHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/collect", "/api/verify", "/api/chrome/start"):
+        if parsed.path not in (
+            "/api/collect",
+            "/api/verify",
+            "/api/chrome/start",
+            "/api/task/start",
+            "/api/task/cancel",
+            "/api/templates/save",
+            "/api/templates/delete",
+        ):
             self._send_json(404, {"success": False, "markdown": "Not found", "data": {}})
             return
 
@@ -320,6 +1008,61 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 "markdown": "本地工作台 token 校验失败，已拒绝执行采集任务。",
                 "data": {"run_id": "", "row_count": 0, "rows": []},
             })
+            return
+
+        if parsed.path == "/api/templates/save":
+            try:
+                templates = _upsert_template(str(payload.get("name") or ""), dict(payload.get("config") or {}))
+                self._send_json(200, {"success": True, "markdown": "模板已保存。", "data": {"templates": templates}})
+            except Exception as exc:
+                self._send_json(200, {"success": False, "markdown": str(exc), "data": {"templates": _load_templates()}})
+            return
+
+        if parsed.path == "/api/templates/delete":
+            templates = _delete_template(str(payload.get("name") or ""))
+            self._send_json(200, {"success": True, "markdown": "模板已删除。", "data": {"templates": templates}})
+            return
+
+        if parsed.path == "/api/task/cancel":
+            task_id = str(payload.get("task_id") or "")
+            _ensure_tasks_loaded()
+            with TASK_LOCK:
+                task = TASKS.get(task_id)
+                cancel_event = TASK_CANCEL_EVENTS.get(task_id)
+                if task and task.get("status") in {"queued", "running", "cancelling"} and cancel_event:
+                    cancel_event.set()
+                    task["status"] = "cancelling"
+                    task["progress"] = {
+                        **dict(task.get("progress") or {}),
+                        "stage": "cancelling",
+                        "message": "正在停止当前采集步骤。",
+                    }
+                    task["updated_at"] = _task_timestamp()
+                    _persist_tasks_locked()
+                    snapshot = _public_task(task, include_result=False)
+                else:
+                    snapshot = _public_task(task, include_result=False)
+            self._send_json(200, {
+                "success": bool(snapshot),
+                "markdown": "已发送停止请求。" if snapshot else "当前任务不存在或已经结束。",
+                "data": snapshot,
+            })
+            return
+
+        if parsed.path == "/api/task/start":
+            try:
+                config, request_meta = _prepare_collect_request(payload)
+                task = _start_collect_task(config, request_meta)
+                self._send_json(200, {"success": True, "markdown": "采集任务已启动。", "data": task})
+            except Exception as exc:
+                failure = _collect_failure_result(exc, {
+                    "categories": payload.get("categories") or [],
+                    "library_filters": payload.get("library_filters") or {},
+                    "multi_category_mode": _bool_value(payload.get("multi_category_mode"), default=False),
+                    "collect_source": payload.get("collect_source") or "rpa",
+                    "sample_data": _bool_value(payload.get("sample_data"), default=False),
+                })
+                self._send_json(200, failure)
             return
 
         if parsed.path == "/api/chrome/start":
@@ -353,7 +1096,7 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             result = verify_run_details(
                 run_id,
                 sample_data=sample_verify,
-                max_items=int(payload.get("max_items") or 20),
+                max_items=int(payload.get("max_items") or MAX_AUTO_VERIFY_ITEMS),
             )
             self._send_json(200, result)
             return
@@ -394,8 +1137,8 @@ class TagCollectHandler(BaseHTTPRequestHandler):
                 source_urls=_csv_join(payload.get("source_urls")),
                 exclude_tags=_csv_join(payload.get("exclude_tags")),
                 max_queries=int(payload.get("max_queries") or 20),
-                max_items_per_query=int(payload.get("max_items_per_query") or 20),
-                target_publishable_count=int(payload.get("target_publishable_count") or payload.get("max_items_per_query") or 20),
+                max_items_per_query=int(payload.get("max_items_per_query") or DEFAULT_ITEMS_PER_QUERY),
+                target_publishable_count=int(payload.get("target_publishable_count") or DEFAULT_TARGET_PUBLISHABLE_COUNT),
                 sample_data=sample_data,
                 output_format=str(payload.get("output_format") or "xlsx"),
                 collect_source=collect_source,
@@ -433,7 +1176,11 @@ class TagCollectHandler(BaseHTTPRequestHandler):
             })
             self._send_json(200, {
                 "success": False,
-                "markdown": f"采集失败：{error_state['message']}",
+                "markdown": (
+                    f"采集已暂停：{error_state['message']}"
+                    if str(error_state.get("action") or "") in PAUSED_TASK_ACTIONS
+                    else f"采集失败：{error_state['message']}"
+                ),
                 "data": {
                     "run_id": "",
                     "row_count": 0,
@@ -463,7 +1210,10 @@ class TagCollectHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename=tag_collect_export{Path(filename).suffix}; filename*=UTF-8''{quote(filename)}",
+        )
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -473,6 +1223,7 @@ def serve_tag_collect_workbench(host: str = "127.0.0.1", port: int = 8765, allow
     global ALLOW_REAL_COLLECT, SERVER_TOKEN
     ALLOW_REAL_COLLECT = bool(allow_real and host in ("127.0.0.1", "localhost", "::1"))
     SERVER_TOKEN = secrets.token_urlsafe(24)
+    _ensure_tasks_loaded()
     server = ThreadingHTTPServer((host, port), TagCollectHandler)
     print(f"标签选品 Web 工作台已启动：http://{host}:{port}")
     if ALLOW_REAL_COLLECT:
@@ -871,6 +1622,14 @@ HTML_PAGE = r"""<!doctype html>
       color: #909399;
       font-size: 12px;
       white-space: nowrap;
+    }
+    .category-column-head button {
+      background: transparent;
+      border: 0;
+      color: var(--accent);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 2px 4px;
     }
     .category-column-list {
       max-height: 360px;
@@ -1472,6 +2231,41 @@ HTML_PAGE = r"""<!doctype html>
       border: 1px solid #ffd591;
       color: #ad6800;
     }
+    .task-progress {
+      background: #f8fbff;
+      border: 1px solid #cfe2ff;
+      border-radius: 6px;
+      display: grid;
+      gap: 9px;
+      margin-top: 12px;
+      padding: 12px 14px;
+    }
+    .task-progress[hidden] { display: none; }
+    .task-progress-head {
+      align-items: center;
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+    }
+    .task-progress-head strong,
+    .task-progress-head span { display: block; }
+    .task-progress-head strong { color: #1f2937; font-size: 14px; }
+    .task-progress-head div > span,
+    .task-progress-meta { color: #667085; font-size: 12px; margin-top: 3px; }
+    .task-progress-head > span { color: var(--accent); font-size: 14px; font-weight: 760; }
+    .task-progress-track {
+      background: #e7eef8;
+      border-radius: 999px;
+      height: 8px;
+      overflow: hidden;
+    }
+    .task-progress-track span {
+      background: linear-gradient(90deg, #1677ff, #56a3ff);
+      display: block;
+      height: 100%;
+      transition: width .25s ease;
+      width: 0;
+    }
     .result-tools {
       align-items: end;
       display: grid;
@@ -1536,9 +2330,9 @@ HTML_PAGE = r"""<!doctype html>
     }
     table {
       border-collapse: collapse;
-      min-width: 2060px;
+      min-width: 4000px;
       table-layout: fixed;
-      width: 100%;
+      width: 4000px;
     }
     th, td {
       border-bottom: 1px solid var(--line);
@@ -1546,7 +2340,6 @@ HTML_PAGE = r"""<!doctype html>
       text-align: left;
       vertical-align: top;
       white-space: nowrap;
-      max-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
     }
@@ -1563,12 +2356,30 @@ HTML_PAGE = r"""<!doctype html>
     th.col-seq, td.col-seq { width: 58px; }
     th.col-_select, td.col-_select { width: 46px; }
     th.col-category_path, td.col-category_path { width: 270px; }
+    th.col-image_cell, td.col-image_cell { width: 104px; }
     th.col-title, td.col-title { width: 360px; }
     th.col-item_id, td.col-item_id { width: 140px; }
+    th.col-url, td.col-url { width: 118px; }
     th.col-wholesale_price, td.col-wholesale_price { width: 88px; }
+    th.col-supports_dropship, td.col-supports_dropship,
+    th.col-free_shipping, td.col-free_shipping { width: 112px; }
     th.col-orders_30d, td.col-orders_30d,
     th.col-units_30d, td.col-units_30d,
     th.col-comment_count, td.col-comment_count { width: 116px; }
+    th.col-sales_amount_30d, td.col-sales_amount_30d { width: 132px; }
+    th.col-dropship_price, td.col-dropship_price { width: 110px; }
+    th.col-rights_protection, td.col-rights_protection,
+    th.col-dropship_rights, td.col-dropship_rights { width: 168px; }
+    th.col-listed_at, td.col-listed_at,
+    th.col-collected_at, td.col-collected_at { width: 154px; }
+    th.col-stock, td.col-stock { width: 136px; }
+    th.col-matched_tags, td.col-matched_tags { width: 184px; }
+    th.col-good_rate, td.col-good_rate,
+    th.col-good_rate_bucket, td.col-good_rate_bucket,
+    th.col-shipment_rate_bucket, td.col-shipment_rate_bucket { width: 118px; }
+    th.col-collection_rate_24h, td.col-collection_rate_24h,
+    th.col-collection_rate_48h, td.col-collection_rate_48h { width: 138px; }
+    th.col-shipment_speed, td.col-shipment_speed { width: 150px; }
     th.col-repurchase_rate, td.col-repurchase_rate,
     th.col-recommendation_score, td.col-recommendation_score { width: 92px; }
     th.col-monthly_dropship_orders, td.col-monthly_dropship_orders,
@@ -2377,6 +3188,7 @@ HTML_PAGE = r"""<!doctype html>
     .template-inline input {
       width: 160px;
     }
+    .template-inline select { min-width: 150px; }
     .category-summary {
       color: #606266;
       display: inline-flex;
@@ -2389,9 +3201,156 @@ HTML_PAGE = r"""<!doctype html>
     }
     .category-picker {
       display: none;
+      align-items: center;
+      background: rgba(21, 27, 38, .48);
+      border: 0;
+      border-radius: 0;
+      inset: 0;
+      justify-content: center;
+      margin: 0;
+      max-height: none;
+      overflow: auto;
+      padding: 24px;
+      position: fixed;
+      z-index: 120;
+      overscroll-behavior: contain;
     }
     .category-picker.is-open {
-      display: block;
+      display: flex;
+    }
+    .category-modal-shell {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 24px 70px rgba(25, 33, 46, .28);
+      display: flex;
+      flex-direction: column;
+      max-height: calc(100vh - 48px);
+      overflow: hidden;
+      width: min(1180px, 100%);
+      overscroll-behavior: contain;
+    }
+    .category-modal-head,
+    .category-modal-foot {
+      align-items: center;
+      display: flex;
+      flex: 0 0 auto;
+      justify-content: space-between;
+      padding: 15px 18px;
+    }
+    .category-modal-head {
+      border-bottom: 1px solid #ebeef5;
+    }
+    .category-modal-head > div {
+      display: grid;
+      gap: 3px;
+    }
+    .category-modal-head strong {
+      color: #303133;
+      font-size: 17px;
+    }
+    .category-modal-head span,
+    .category-modal-foot span {
+      color: #909399;
+      font-size: 12px;
+    }
+    .category-modal-close {
+      border: 0;
+      font-size: 24px;
+      min-height: 32px;
+      min-width: 32px;
+      padding: 0;
+    }
+    .category-modal-body {
+      display: grid;
+      flex: 1 1 auto;
+      grid-template-columns: 150px minmax(0, 1fr);
+      min-height: 0;
+      overflow: hidden;
+      overscroll-behavior: contain;
+    }
+    .category-modal-tabs {
+      background: #f7f8fa;
+      border-right: 1px solid #ebeef5;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 14px 10px;
+    }
+    .category-modal-tabs button {
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      color: #606266;
+      justify-content: flex-start;
+      min-height: 40px;
+      text-align: left;
+      width: 100%;
+    }
+    .category-modal-tabs button.is-active {
+      background: #ecf5ff;
+      color: #409eff;
+      font-weight: 700;
+    }
+    .category-modal-content {
+      min-width: 0;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding: 14px 16px 18px;
+    }
+    .category-modal-foot {
+      border-top: 1px solid #ebeef5;
+    }
+    body.category-modal-open {
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
+    body.category-modal-open .workspace {
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
+    .category-favorite-action {
+      align-items: center;
+      background: transparent;
+      border: 0;
+      color: #c0c4cc;
+      display: inline-flex;
+      font-size: 18px;
+      justify-content: center;
+      min-height: 28px;
+      min-width: 28px;
+      padding: 0;
+    }
+    .category-favorite-action.is-favorite {
+      color: #f5b942;
+    }
+    .category-row {
+      grid-template-columns: 30px minmax(0, 1fr) 30px;
+    }
+    .category-row.has-group-action {
+      grid-template-columns: 30px minmax(0, 1fr) auto 30px;
+    }
+    .category-empty-favorites {
+      color: #909399;
+      padding: 42px 20px;
+      text-align: center;
+    }
+    @media (max-width: 760px) {
+      .category-picker { align-items: flex-start; padding: 8px; }
+      .category-modal-shell { max-height: calc(100vh - 16px); }
+      .category-modal-body { grid-template-columns: 1fr; overflow: auto; }
+      .category-modal-tabs {
+        border-bottom: 1px solid #ebeef5;
+        border-right: 0;
+        flex-direction: row;
+        padding: 8px 10px;
+      }
+      .category-modal-tabs button { justify-content: center; min-height: 34px; }
+      .category-modal-content { overflow: visible; padding: 10px; }
+      .category-tools { grid-template-columns: 1fr; }
+      .category-cascade-grid { grid-template-columns: 1fr; }
+      .category-column { border-bottom: 1px solid #ebeef5; border-right: 0; }
+      .category-column-list { max-height: 220px; }
+      .category-modal-head span { display: none; }
     }
     .category-cascade {
       gap: 10px;
@@ -2426,9 +3385,10 @@ HTML_PAGE = r"""<!doctype html>
     }
     .category-column-list {
       max-height: 380px;
+      overscroll-behavior: contain;
     }
     .category-row {
-      grid-template-columns: 30px minmax(0, 1fr);
+      grid-template-columns: 30px minmax(0, 1fr) 30px;
       margin-bottom: 5px;
       min-height: 38px;
     }
@@ -2691,6 +3651,18 @@ HTML_PAGE = r"""<!doctype html>
       top: 58px;
       z-index: 35;
     }
+    .workbench-version {
+      background: #ecfdf3;
+      border: 1px solid #95d9b0;
+      border-radius: 999px;
+      color: #087b35;
+      display: inline-flex;
+      font-size: 11px;
+      font-weight: 750;
+      margin-left: 8px;
+      padding: 3px 8px;
+      vertical-align: middle;
+    }
     .task-steps {
       display: grid;
       gap: 8px;
@@ -2797,6 +3769,24 @@ HTML_PAGE = r"""<!doctype html>
       padding: 0 10px;
       white-space: nowrap;
     }
+    .sound-alert-toggle {
+      align-items: center;
+      background: #ffffff;
+      border: 1px solid #e4e7ed;
+      border-radius: 4px;
+      color: #303133;
+      display: inline-flex;
+      font-size: 12px;
+      gap: 7px;
+      margin: 0;
+      min-height: 28px;
+      padding: 0 10px;
+      white-space: nowrap;
+    }
+    .sound-alert-toggle input {
+      accent-color: #409eff;
+      margin: 0;
+    }
     .review-mode-toggle {
       display: none;
     }
@@ -2822,6 +3812,270 @@ HTML_PAGE = r"""<!doctype html>
     }
     .detail-warning[hidden] {
       display: none;
+    }
+    #categoryTree,
+    #categoryPanel,
+    .category-column-list {
+      overflow-anchor: none;
+    }
+    .category-accuracy-note {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 4px;
+      color: #1e4f8f;
+      font-size: 12px;
+      line-height: 1.55;
+      margin-top: 9px;
+      padding: 8px 10px;
+    }
+    .category-row.has-group-action {
+      grid-template-columns: 28px minmax(0, 1fr) auto 30px;
+    }
+    .category-group-action {
+      align-self: center;
+      background: #fff;
+      border: 1px solid #b7dcff;
+      border-radius: 4px;
+      color: #1677d2;
+      font-size: 11px;
+      min-height: 26px;
+      padding: 0 8px;
+      white-space: nowrap;
+    }
+    .category-group-action:hover {
+      background: #ecf5ff;
+      border-color: #409eff;
+    }
+    .template-section .template-inline {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: minmax(160px, 220px) minmax(180px, 1fr) auto auto;
+      width: 100%;
+    }
+    .template-status {
+      color: #667085;
+      display: block;
+      font-size: 12px;
+      margin-top: 7px;
+    }
+    .library-section[data-library-section="priority"] {
+      background: #f8fbff;
+      border: 1px solid #b7dcff;
+      border-radius: 6px;
+      margin: 10px 0;
+      padding-left: 10px;
+      padding-right: 10px;
+    }
+    .library-section[data-library-section="priority"] .library-section-head {
+      border-left-color: #1677ff;
+    }
+    .library-section[data-library-section="priority"] .library-section-head strong::after {
+      background: #1677ff;
+      border-radius: 999px;
+      color: #fff;
+      content: "常用";
+      font-size: 10px;
+      margin-left: 7px;
+      padding: 2px 6px;
+    }
+    .task-progress {
+      background: #f8fbff;
+      border-color: #b7dcff;
+      margin-top: 10px;
+      padding: 10px 12px;
+    }
+    .task-progress-actions {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+    }
+    .task-progress-actions button {
+      min-height: 28px;
+      padding: 0 10px;
+    }
+    .task-progress-outcome {
+      background: #fff;
+      border: 1px solid #dbe7f5;
+      border-radius: 4px;
+      color: #344054;
+      font-size: 12px;
+      line-height: 1.55;
+      margin-top: 8px;
+      padding: 7px 9px;
+    }
+    .task-progress-outcome[hidden] {
+      display: none;
+    }
+    .task-progress[data-status="interrupted"] {
+      background: #fffaf0;
+      border-color: #f6c56f;
+    }
+    .recent-tasks-card {
+      background: #fff;
+      border: 1px solid #dfe6ef;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      padding: 12px 14px;
+    }
+    .recent-tasks-head {
+      align-items: center;
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      margin-bottom: 9px;
+    }
+    .recent-tasks-head strong {
+      color: #1f2937;
+      font-size: 14px;
+    }
+    .recent-tasks-head span {
+      color: #7a8491;
+      font-size: 12px;
+    }
+    .recent-task-list {
+      display: grid;
+      gap: 7px;
+    }
+    .recent-task-empty {
+      background: #f8fafc;
+      border: 1px dashed #d5dce6;
+      border-radius: 4px;
+      color: #7a8491;
+      font-size: 12px;
+      padding: 9px 10px;
+    }
+    .recent-task-item {
+      align-items: center;
+      background: #fbfcfe;
+      border: 1px solid #e4eaf2;
+      border-radius: 4px;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: minmax(180px, 1.15fr) minmax(180px, 1fr) auto;
+      padding: 9px 10px;
+    }
+    .recent-task-item.status-interrupted {
+      background: #fffaf0;
+      border-color: #f6c56f;
+    }
+    .recent-task-main,
+    .recent-task-detail {
+      min-width: 0;
+    }
+    .recent-task-main strong,
+    .recent-task-main span,
+    .recent-task-detail strong,
+    .recent-task-detail span {
+      display: block;
+    }
+    .recent-task-main strong {
+      color: #1f2937;
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .recent-task-main span,
+    .recent-task-detail span {
+      color: #7a8491;
+      font-size: 11px;
+      line-height: 1.45;
+      margin-top: 2px;
+    }
+    .recent-task-detail strong {
+      color: #4b5563;
+      font-size: 12px;
+      font-weight: 650;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .recent-task-actions {
+      align-items: flex-end;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .recent-task-status {
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 11px;
+      font-weight: 720;
+      padding: 3px 7px;
+      white-space: nowrap;
+    }
+    .recent-task-status.status-completed { background: #ecfdf3; color: #087b35; }
+    .recent-task-status.status-running,
+    .recent-task-status.status-queued,
+    .recent-task-status.status-cancelling { background: #ecf5ff; color: #1677d2; }
+    .recent-task-status.status-paused,
+    .recent-task-status.status-interrupted { background: #fff1cc; color: #9a6200; }
+    .recent-task-status.status-failed,
+    .recent-task-status.status-cancelled { background: #fff0f0; color: #b42318; }
+    .recent-task-links {
+      display: flex;
+      gap: 5px;
+    }
+    .recent-task-links button,
+    .recent-task-links a {
+      align-items: center;
+      background: #fff;
+      border: 1px solid #b7dcff;
+      border-radius: 4px;
+      color: #1677d2;
+      display: inline-flex;
+      font-size: 11px;
+      min-height: 26px;
+      padding: 0 8px;
+      text-decoration: none;
+    }
+    .batch-guidance {
+      align-items: center;
+      background: #f8fafc;
+      border-top: 1px solid #e7edf5;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 10px 12px;
+    }
+    .run-section .batch-guidance {
+      grid-column: 2;
+    }
+    .batch-guidance strong {
+      color: #1f2937;
+      font-size: 12px;
+    }
+    .batch-guidance span {
+      color: #667085;
+      font-size: 12px;
+    }
+    .batch-presets {
+      display: inline-flex;
+      gap: 6px;
+    }
+    .batch-presets button {
+      background: #fff;
+      border: 1px solid #d0d5dd;
+      border-radius: 4px;
+      color: #344054;
+      font-size: 12px;
+      min-height: 28px;
+      padding: 0 9px;
+    }
+    .batch-presets button.is-active {
+      background: #ecf5ff;
+      border-color: #409eff;
+      color: #1677d2;
+      font-weight: 700;
+    }
+    .export-contract-note {
+      background: #ecfdf3;
+      border: 1px solid #bbebcb;
+      border-radius: 4px;
+      color: #087b35;
+      font-size: 12px;
+      margin: 10px 0;
+      padding: 8px 10px;
     }
     #task {
       padding-top: 14px;
@@ -2999,7 +4253,7 @@ HTML_PAGE = r"""<!doctype html>
       box-shadow: 0 12px 34px rgba(15, 23, 42, .16);
       display: grid;
       gap: 12px;
-      grid-template-columns: minmax(180px, 1fr) auto auto auto;
+      grid-template-columns: minmax(180px, 1fr) auto auto auto auto;
       left: 205px;
       padding: 10px 12px;
       position: fixed;
@@ -3026,6 +4280,19 @@ HTML_PAGE = r"""<!doctype html>
     }
     .sticky-action-bar .download[hidden] {
       display: none;
+    }
+    .danger-action {
+      border-color: #f1aeb5 !important;
+      color: #b42318 !important;
+    }
+    .danger-action:not(:disabled):hover { background: #fff1f2 !important; }
+    .product-thumb {
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+      display: block;
+      height: 54px;
+      object-fit: cover;
+      width: 54px;
     }
     .empty-result-card {
       background: #f8fafc;
@@ -3063,6 +4330,13 @@ HTML_PAGE = r"""<!doctype html>
       .sticky-action-bar {
         left: 12px;
         right: 12px;
+      }
+      .recent-task-item {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .recent-task-detail {
+        grid-column: 1 / -1;
+        grid-row: 2;
       }
     }
     @media (max-width: 700px) {
@@ -3146,6 +4420,12 @@ HTML_PAGE = r"""<!doctype html>
       .category-cascade-grid {
         grid-template-columns: 1fr;
       }
+      .template-section .template-inline {
+        grid-template-columns: 1fr;
+      }
+      .run-section .batch-guidance {
+        grid-column: auto;
+      }
       .category-cascade-grid {
         min-height: 0;
       }
@@ -3225,7 +4505,7 @@ HTML_PAGE = r"""<!doctype html>
     <div class="workspace">
       <section class="library-page">
         <div class="page-head">
-          <div class="page-tab-title">1688选品库</div>
+          <div class="page-tab-title">1688选品库 <span id="versionBadge" class="workbench-version">问题修复版</span></div>
           <div class="help-links">
             <span class="is-reserved" aria-disabled="true">使用帮助</span>
             <span class="is-reserved" aria-disabled="true">新手教程</span>
@@ -3250,8 +4530,8 @@ HTML_PAGE = r"""<!doctype html>
             <div class="selected-summary" id="selectedSummary">
               <div class="selected-summary-item">
                 <span>类目范围</span>
-                <strong id="selectedCategoryCount">全部</strong>
-                <em id="selectedCategoryText">全部类目</em>
+                <strong id="selectedCategoryCount">未选择</strong>
+                <em id="selectedCategoryText">请选择最右侧叶子类目</em>
               </div>
               <div class="selected-summary-item">
                 <span>已选筛选</span>
@@ -3277,13 +4557,43 @@ HTML_PAGE = r"""<!doctype html>
                 <button type="button" data-scroll-target="runFilterSection">查询设置</button>
                 <button type="button" data-scroll-target="resultSection">结果导出</button>
               </div>
-              <label class="review-mode-toggle">
-                <input id="reviewModeToggle" type="checkbox" />
-                调试视图
-                <span>显示字段映射</span>
-              </label>
+              <div class="filter-anchor-actions">
+                <label class="sound-alert-toggle">
+                  <input id="soundAlertsToggle" type="checkbox" checked />
+                  声音提醒
+                </label>
+                <label class="review-mode-toggle">
+                  <input id="reviewModeToggle" type="checkbox" />
+                  调试视图
+                  <span>显示字段映射</span>
+                </label>
+              </div>
             </div>
             <div id="detailWarning" class="detail-warning" hidden></div>
+            <div id="taskProgress" class="task-progress" hidden>
+              <div class="task-progress-head">
+                <div>
+                  <strong id="taskProgressTitle">准备启动</strong>
+                  <span id="taskProgressMessage">正在创建采集任务。</span>
+                </div>
+                <div class="task-progress-actions">
+                  <span id="taskProgressPercent">0%</span>
+                  <button id="taskProgressStopBtn" class="secondary danger-action" type="button" disabled>停止采集</button>
+                </div>
+              </div>
+              <div class="task-progress-track"><span id="taskProgressBar"></span></div>
+              <div id="taskProgressMeta" class="task-progress-meta">等待任务状态</div>
+              <div id="taskProgressOutcome" class="task-progress-outcome" hidden></div>
+            </div>
+          </div>
+          <div id="recentTasksCard" class="recent-tasks-card">
+            <div class="recent-tasks-head">
+              <strong>最近任务</strong>
+              <span id="recentTasksCount">加载中</span>
+            </div>
+            <div id="recentTaskList" class="recent-task-list">
+              <div class="recent-task-empty">正在读取本机最近任务记录。</div>
+            </div>
           </div>
           <div class="filter-panel">
           <div class="library-toolbar">
@@ -3362,27 +4672,59 @@ HTML_PAGE = r"""<!doctype html>
                 <div class="category-inline">
                   <button id="toggleCategoryPanel" class="secondary" type="button">选择类目</button>
                   <button id="clearCategories" class="secondary" type="button">清空</button>
-                  <span id="categorySummary" class="category-summary">全部类目</span>
-                </div>
-                <div class="template-inline">
-                  <span class="inline-label">我的模板：</span>
-                  <input id="templateName" type="text" placeholder="无数据" />
-                  <button id="saveTemplateBtn" class="secondary ghost" type="button" disabled title="模板管理接口预留">管理</button>
+                  <span id="categorySummary" class="category-summary">未选择精确类目</span>
                 </div>
               </div>
-              <div id="categoryPanel" class="category-picker">
-                <div class="category-tools">
-                  <input id="categorySearch" type="text" placeholder="搜索类目" />
-                  <label class="chip" title="默认关闭：选择新叶子类目会替换上一个任务的类目">
-                    <input id="multiCategoryMode" type="checkbox" />多类目任务
-                  </label>
-                  <div class="category-task-mode">
-                    <span id="categoryTaskModeBadge" class="status-pill">单类目任务</span>
-                    <span id="categoryTaskModeHint">选择新类目会替换上一个类目，防止任务串入</span>
+              <div class="category-accuracy-note">一级大类只用于定位 1688 导航，不会直接作为商品真实类目。请选到最右侧叶子；需要整个二级时，点击二级行右侧“全选下级”。</div>
+              <div id="categoryPanel" class="category-picker" role="dialog" aria-modal="true" aria-labelledby="categoryDialogTitle">
+                <div class="category-modal-shell">
+                  <div class="category-modal-head">
+                    <div>
+                      <strong id="categoryDialogTitle">选择商品类目</strong>
+                      <span>只提交最右侧叶子类目；收藏仅保存在当前浏览器。</span>
+                    </div>
+                    <button id="closeCategoryPanel" class="secondary category-modal-close" type="button" aria-label="关闭类目选择">×</button>
+                  </div>
+                  <div class="category-modal-body">
+                    <aside class="category-modal-tabs" aria-label="类目视图">
+                      <button type="button" class="is-active" data-category-view="all">全部类目</button>
+                      <button type="button" data-category-view="favorite">收藏类目 <span id="favoriteCategoryCount">0</span></button>
+                    </aside>
+                    <div class="category-modal-content">
+                      <div class="category-tools">
+                        <input id="categorySearch" type="text" placeholder="搜索一级、二级或叶子类目" />
+                        <label class="chip" title="默认关闭：选择新叶子类目会替换上一个任务的类目">
+                          <input id="multiCategoryMode" type="checkbox" />多类目任务
+                        </label>
+                        <div class="category-task-mode">
+                          <span id="categoryTaskModeBadge" class="status-pill">单类目任务</span>
+                          <span id="categoryTaskModeHint">选择新类目会替换上一个类目，防止任务串入</span>
+                        </div>
+                      </div>
+                      <div id="categoryTree"></div>
+                    </div>
+                  </div>
+                  <div class="category-modal-foot">
+                    <span id="categoryModalSummary">未选择类目</span>
+                    <button id="confirmCategoryPanel" class="primary" type="button">确定</button>
                   </div>
                 </div>
-                <div id="categoryTree"></div>
               </div>
+            </div>
+          </div>
+
+          <div id="templateFilterSection" class="filter-row compact template-section">
+            <div class="row-label">筛选模板</div>
+            <div class="row-control">
+              <div class="template-inline">
+                <select id="templateSelect" aria-label="选择筛选模板">
+                  <option value="">选择已保存模板</option>
+                </select>
+                <input id="templateName" type="text" placeholder="输入模板名称，例如：男鞋低运费" />
+                <button id="saveTemplateBtn" class="secondary" type="button">保存当前筛选</button>
+                <button id="deleteTemplateBtn" class="secondary ghost" type="button" disabled>删除模板</button>
+              </div>
+              <span id="templateStatus" class="template-status">暂无已保存模板；保存后刷新页面仍可加载。</span>
             </div>
           </div>
 
@@ -3423,7 +4765,7 @@ HTML_PAGE = r"""<!doctype html>
             <div id="libraryFilters"></div>
           </div>
 
-          <details class="legacy-filter-box">
+          <details class="legacy-filter-box developer-only">
             <summary>兼容旧版运营标签</summary>
             <div id="filterGroups"></div>
           </details>
@@ -3465,8 +4807,12 @@ HTML_PAGE = r"""<!doctype html>
                 <input id="maxQueries" type="number" min="1" max="200" value="20" />
               </div>
               <div>
-                <label for="maxItems">目标可铺数</label>
-                <input id="maxItems" type="number" min="1" max="100" value="5" />
+                <label for="maxItems">候选扫描上限</label>
+                <input id="maxItems" type="number" min="1" max="200" value="200" />
+              </div>
+              <div>
+                <label for="targetPublishableCount">目标可铺数</label>
+                <input id="targetPublishableCount" type="number" min="1" max="100" value="60" />
               </div>
               <div>
                 <label for="autoVerifyDetails">详情补字段</label>
@@ -3477,15 +4823,26 @@ HTML_PAGE = r"""<!doctype html>
               </div>
               <div>
                 <label for="autoVerifyMax">自动核验上限</label>
-                <input id="autoVerifyMax" type="number" min="1" max="20" value="20" />
+                <input id="autoVerifyMax" type="number" min="1" max="200" value="200" />
               </div>
+            </div>
+            <div class="batch-guidance">
+              <strong>采集深度</strong>
+              <div class="batch-presets" aria-label="候选扫描预设">
+                <button type="button" data-items-preset="50">快速 50</button>
+                <button type="button" data-items-preset="120">标准 120</button>
+                <button type="button" data-items-preset="200" class="is-active">深度 200</button>
+              </div>
+              <span id="scanEstimate">最多读取约 9-12 页；速度较慢，但会尽量采满 200 个去重候选。</span>
+              <span>任务达到候选上限、没有下一页、达到可铺目标或触发人工验证时都会明确结束，不会静默休眠后继续。</span>
             </div>
           </div>
 
           <div class="action-strip">
             <button id="runBtn" class="primary" type="button">开始自动采集</button>
+            <button id="stopTaskBtn" class="secondary danger-action" type="button" disabled>停止采集</button>
             <button id="resetBtn" class="secondary" type="button">重置筛选</button>
-            <button id="saveFilterBtn" class="secondary ghost" type="button" disabled title="筛选模板接口预留">保存筛选</button>
+            <button id="saveFilterBtn" class="secondary ghost" type="button">保存为模板</button>
           </div>
 
           <div id="notice" class="notice"></div>
@@ -3495,6 +4852,7 @@ HTML_PAGE = r"""<!doctype html>
               <span id="stickyActionText">选择类目、关键词或筛选项后开始自动采集；导出后再人工复核。</span>
             </div>
             <button id="stickyRunBtn" class="primary" type="button">开始自动采集</button>
+            <button id="stickyStopBtn" class="secondary danger-action" type="button" disabled>停止</button>
             <button id="stickyResetBtn" class="secondary" type="button">重置</button>
             <a id="stickyDownloadLink" class="download" href="#" hidden>导出</a>
           </div>
@@ -3547,6 +4905,7 @@ HTML_PAGE = r"""<!doctype html>
             <button id="verifyBtn" class="secondary" type="button" disabled>真实详情核验</button>
           </div>
           <div id="automationMessage" class="automation-message"></div>
+          <div class="export-contract-note">导出文件只保留“选品结果”一个工作表，固定为 7.21 模板确认的 24 个业务字段；完整真实性、失败原因和核验记录继续保存在同批次 JSON 快照中。</div>
           <div id="resultEmptyHint" class="empty-result-card">还没有查询结果。先完成类目、搜索词或筛选条件，再点击“开始自动采集”；生成结果后可导出 Excel/CSV，导出后再人工复核。</div>
           <div class="result-tools">
             <div>
@@ -3627,12 +4986,22 @@ HTML_PAGE = r"""<!doctype html>
       filterWarnings: [],
       categoryUnknownCount: 0,
       collecting: false,
+      taskId: "",
+      taskStatus: "idle",
+      recentTasks: [],
+      templates: [],
       reviewMode: false,
       debugSampleMode: false,
       debugViewMode: false,
       selectedCategories: new Set(),
+      favoriteCategories: new Set(),
+      categoryViewMode: "all",
       activeCategoryParent: "",
       activeCategoryChild: "",
+      categoryScrollLock: null,
+      soundAlertsEnabled: true,
+      audioContext: null,
+      playedAlertKeys: new Set(),
       selectedTags: new Set(),
       selectedLibrary: {},
       selectedRows: new Set(),
@@ -3640,24 +5009,28 @@ HTML_PAGE = r"""<!doctype html>
         ["_select", ""],
         ["seq", "序号"],
         ["category_path", "商品类目"],
+        ["image_cell", "商品主图"],
         ["title", "商品标题"],
         ["item_id", "商品ID"],
-        ["wholesale_price", "批发价"],
+        ["url", "商品链接(点击下方链接可跳转)"],
+        ["monthly_dropship_orders", "月代发订单"],
+        ["supports_dropship", "是否一件代发"],
         ["orders_30d", "近30天订单数"],
         ["units_30d", "近30天件数"],
-        ["repurchase_rate", "复购率"],
-        ["monthly_dropship_orders", "月代发订单"],
+        ["sales_amount_30d", "近30天销售额"],
+        ["dropship_price", "代发价"],
+        ["listed_at", "上架时间"],
         ["comment_count", "评论数"],
-        ["wholesale_shipping_fee", "批发运费"],
+        ["stock", "库存"],
         ["dropship_shipping_fee", "代发运费"],
-        ["product_refund_rate", "品退率"],
-        ["shipment_rate", "发货率"],
-        ["verified_at", "核验时间"],
-        ["recommendation_score", "推荐分"],
-        ["recommendation_level", "推荐等级"],
-        ["risk_flags", "风险提示"],
-        ["verification_status", "核验状态"],
-        ["wechat_shop_suggestion", "适合微信小店(规则预判)"]
+        ["matched_tags", "命中标签"],
+        ["free_shipping", "是否包邮"],
+        ["good_rate", "好评率"],
+        ["good_rate_bucket", "好评率区间"],
+        ["collection_rate_48h", "48小时揽收率"],
+        ["shipment_speed", "发货时效"],
+        ["shipment_rate_bucket", "发货率区间"],
+        ["collected_at", "采集时间"]
       ]
     };
 
@@ -3681,9 +5054,16 @@ HTML_PAGE = r"""<!doctype html>
       }[char]));
     }
 
+    function safeNoticeText(value) {
+      let text = String(value ?? "");
+      text = text.replace(/https?:\/\/[^\s]*(?:punish|captcha|login)[^\s]*/gi, "[1688 登录/验证页面已隐藏]");
+      text = text.replace(/([?&](?:x5secdata|x5step|_tmd_token|_tmd_timestamp|_tmd_noncestr|_tmd_signature)=)[^&\s]+/gi, "$1[已隐藏]");
+      return text.length > 1200 ? `${text.slice(0, 1200)}…` : text;
+    }
+
     function showNotice(text, ok, mode = "") {
       const node = $("notice");
-      node.textContent = text;
+      node.textContent = safeNoticeText(text);
       node.className = `notice show ${mode || (ok ? "ok" : "fail")}`;
     }
 
@@ -3938,8 +5318,7 @@ HTML_PAGE = r"""<!doctype html>
       const base = result.markdown || "采集失败";
       const suggestion = data.suggestion || "";
       if (data.error_code === "security_verification_required") {
-        const pageUrl = runtime.page_url ? ` 当前拦截页：${runtime.page_url}` : "";
-        return `${base} ${suggestion}${pageUrl}`;
+        return `${base} 验证页已保留在采集 Chrome 中，请人工完成验证；确认 1688 搜索页恢复正常后，回到本页点击“开始自动采集”。系统不会自动重试。`;
       }
       if (data.error_code === "login_required") {
         return `${base} ${suggestion || "请先在真实 Chrome 中完成 1688 登录，再回到本页查询。"}`;
@@ -3954,8 +5333,132 @@ HTML_PAGE = r"""<!doctype html>
       const selected = [...state.selectedCategories];
       const summary = $("categorySummary");
       if (!summary) return;
-      summary.textContent = selected.length ? `已选 ${selected.length} 个：${selected.slice(0, 4).join("、")}${selected.length > 4 ? "..." : ""}` : "全部类目";
+      summary.textContent = selected.length ? `已选 ${selected.length} 个叶子：${selected.slice(0, 4).join("、")}${selected.length > 4 ? "..." : ""}` : "未选择精确类目";
+      if ($("categoryModalSummary")) {
+        $("categoryModalSummary").textContent = selected.length ? `已选 ${selected.length} 个叶子类目` : "未选择类目";
+      }
+      if ($("favoriteCategoryCount")) $("favoriteCategoryCount").textContent = String(state.favoriteCategories.size);
       updateSelectedSummary();
+    }
+
+    const FAVORITE_CATEGORY_STORAGE_KEY = "sop1688.favoriteCategories.v1";
+    const SOUND_ALERT_STORAGE_KEY = "sop1688.soundAlerts.v1";
+
+    function loadFavoriteCategories() {
+      try {
+        const values = JSON.parse(localStorage.getItem(FAVORITE_CATEGORY_STORAGE_KEY) || "[]");
+        state.favoriteCategories = new Set(Array.isArray(values) ? values.map(value => String(value || "").trim()).filter(Boolean) : []);
+      } catch {
+        state.favoriteCategories = new Set();
+      }
+    }
+
+    function saveFavoriteCategories() {
+      try {
+        localStorage.setItem(FAVORITE_CATEGORY_STORAGE_KEY, JSON.stringify([...state.favoriteCategories]));
+      } catch {}
+    }
+
+    function toggleFavoriteCategory(path) {
+      const value = String(path || "").trim();
+      if (!value) return;
+      state.favoriteCategories.has(value) ? state.favoriteCategories.delete(value) : state.favoriteCategories.add(value);
+      saveFavoriteCategories();
+    }
+
+    function loadSoundAlertPreference() {
+      try {
+        const stored = localStorage.getItem(SOUND_ALERT_STORAGE_KEY);
+        state.soundAlertsEnabled = stored == null ? true : stored !== "0";
+      } catch {
+        state.soundAlertsEnabled = true;
+      }
+      if ($("soundAlertsToggle")) $("soundAlertsToggle").checked = state.soundAlertsEnabled;
+    }
+
+    function saveSoundAlertPreference() {
+      try {
+        localStorage.setItem(SOUND_ALERT_STORAGE_KEY, state.soundAlertsEnabled ? "1" : "0");
+      } catch {}
+    }
+
+    function unlockSoundAlerts() {
+      if (!state.soundAlertsEnabled) return null;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return null;
+      if (!state.audioContext) state.audioContext = new AudioContextClass();
+      if (state.audioContext.state === "suspended") state.audioContext.resume().catch(() => {});
+      return state.audioContext;
+    }
+
+    function playAlertSequence(notes) {
+      const audio = unlockSoundAlerts();
+      if (!audio || !state.soundAlertsEnabled) return;
+      const startAt = audio.currentTime + 0.02;
+      notes.forEach(([frequency, offset, duration, volume = 0.055]) => {
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(frequency, startAt + offset);
+        gain.gain.setValueAtTime(0.0001, startAt + offset);
+        gain.gain.exponentialRampToValueAtTime(volume, startAt + offset + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + offset + duration);
+        oscillator.connect(gain);
+        gain.connect(audio.destination);
+        oscillator.start(startAt + offset);
+        oscillator.stop(startAt + offset + duration + 0.02);
+      });
+    }
+
+    function playManualInterventionAlert() {
+      playAlertSequence([
+        [880, 0, 0.13],
+        [880, 0.22, 0.13]
+      ]);
+    }
+
+    function playTaskCompletedAlert() {
+      playAlertSequence([
+        [660, 0, 0.14],
+        [784, 0.17, 0.14],
+        [988, 0.34, 0.22]
+      ]);
+    }
+
+    function playTaskAlertOnce(key, kind) {
+      const normalized = String(key || "").trim();
+      if (!normalized || state.playedAlertKeys.has(normalized)) return;
+      state.playedAlertKeys.add(normalized);
+      if (!state.soundAlertsEnabled) return;
+      kind === "manual" ? playManualInterventionAlert() : playTaskCompletedAlert();
+    }
+
+    function setCategoryPanelOpen(open) {
+      const panel = $("categoryPanel");
+      if (!panel) return;
+      const shouldOpen = Boolean(open);
+      const wasOpen = panel.classList.contains("is-open");
+      const workspace = document.querySelector(".workspace");
+      if (shouldOpen && !wasOpen) {
+        state.categoryScrollLock = {
+          pageTop: window.scrollY,
+          workspaceTop: workspace?.scrollTop || 0
+        };
+      }
+      panel.classList.toggle("is-open", shouldOpen);
+      document.body.classList.toggle("category-modal-open", shouldOpen);
+      $("toggleCategoryPanel").textContent = "选择类目";
+      if (shouldOpen) {
+        renderCategories(false);
+        window.setTimeout(() => $("categorySearch")?.focus(), 80);
+      } else if (wasOpen && state.categoryScrollLock) {
+        const locked = state.categoryScrollLock;
+        state.categoryScrollLock = null;
+        window.requestAnimationFrame(() => {
+          if (workspace) workspace.scrollTop = locked.workspaceTop;
+          window.scrollTo({top: locked.pageTop, behavior: "auto"});
+        });
+      }
     }
 
     function multiCategoryModeEnabled() {
@@ -3973,6 +5476,19 @@ HTML_PAGE = r"""<!doctype html>
         state.selectedCategories.clear();
       }
       state.selectedCategories.add(path);
+    }
+
+    function setCategoryGroupSelection(value, selected = null) {
+      const parts = String(value || "").split(">");
+      if (!parts[0] || !parts[1]) return;
+      state.activeCategoryParent = parts[0];
+      state.activeCategoryChild = parts[1];
+      const grandchildren = categoryEntries(parts[0]).find(([child]) => child === parts[1])?.[1] || [];
+      const paths = grandchildren.map(grand => `${parts[0]}>${parts[1]}>${grand}`);
+      const shouldSelect = selected == null ? !paths.every(path => state.selectedCategories.has(path)) : Boolean(selected);
+      if (shouldSelect && $("multiCategoryMode")) $("multiCategoryMode").checked = true;
+      paths.forEach(path => shouldSelect ? state.selectedCategories.add(path) : state.selectedCategories.delete(path));
+      updateCategoryTaskMode();
     }
 
     function normalizeCategorySelectionMode() {
@@ -3996,6 +5512,9 @@ HTML_PAGE = r"""<!doctype html>
       state.collecting = Boolean(active);
       ["runBtn", "stickyRunBtn", "readCurrentPageBtn"].forEach(id => {
         if ($(id)) $(id).disabled = state.collecting;
+      });
+      ["stopTaskBtn", "stickyStopBtn", "taskProgressStopBtn"].forEach(id => {
+        if ($(id)) $(id).disabled = !state.collecting;
       });
       if (state.collecting) {
         if ($("runBtn")) $("runBtn").textContent = "读取中";
@@ -4059,51 +5578,78 @@ HTML_PAGE = r"""<!doctype html>
       }
     }
 
-    function categoryRowHtml({value, label, kind, meta = "", current = false, selected = false, checked = false, path = "", selectable = true}) {
+    function categoryRowHtml({value, label, kind, meta = "", current = false, selected = false, checked = false, path = "", selectable = true, groupTotal = 0, groupSelected = 0}) {
+      const groupAttrs = groupTotal
+        ? `data-category-group="true" data-group-total="${groupTotal}" data-group-selected="${groupSelected}"`
+        : "";
+      const favoritePath = path || value;
+      const favorite = state.favoriteCategories.has(favoritePath);
       return `
-        <div class="category-row ${current ? "is-current" : ""} ${selected ? "is-selected" : ""}">
+        <div class="category-row ${current ? "is-current" : ""} ${selected ? "is-selected" : ""} ${groupTotal ? "has-group-action" : ""}">
           <label class="category-check" title="复选${esc(label)}">
-            <input type="checkbox" data-kind="category" value="${esc(value)}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} title="${selectable ? `选择 ${esc(label)}` : "请继续选择右侧下级类目"}" />
+            <input type="checkbox" data-kind="category" value="${esc(value)}" ${groupAttrs} ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} title="${groupTotal ? `全选或取消 ${esc(label)} 下的三级类目` : (selectable ? `选择 ${esc(label)}` : "请继续选择右侧下级类目")}" />
           </label>
           <button class="category-row-button" type="button" data-category-nav="${esc(kind)}" data-category-path="${esc(path || value)}" title="${esc(path || value)}">
             <span class="category-row-title">${esc(label)}</span>
             ${meta ? `<span class="category-row-meta">${esc(meta)}</span>` : ""}
           </button>
+          ${groupTotal ? `<button class="category-group-action" type="button" data-category-group-action="${esc(value)}">${groupSelected === groupTotal ? "取消" : `全选 ${groupTotal}`}</button>` : ""}
+          <button class="category-favorite-action ${favorite ? "is-favorite" : ""}" type="button" data-category-favorite="${esc(favoritePath)}" aria-label="${favorite ? "取消收藏" : "收藏"} ${esc(label)}" title="${favorite ? "取消收藏" : "收藏类目"}">${favorite ? "★" : "☆"}</button>
         </div>
       `;
     }
 
-    function renderCategories() {
+    function categoryScrollColumns(preserveScroll) {
+      if (preserveScroll === true) return new Set(["parent", "child", "grand"]);
+      if (Array.isArray(preserveScroll)) return new Set(preserveScroll);
+      return new Set();
+    }
+
+    function renderCategories(preserveScroll = true) {
       const wrap = $("categoryTree");
+      const preservedColumns = categoryScrollColumns(preserveScroll);
+      const previousScroll = Object.fromEntries(
+        [...wrap.querySelectorAll("[data-category-list]")].map(node => [node.dataset.categoryList, node.scrollTop])
+      );
+      const preservePanelScroll = preservedColumns.size > 0;
+      const panelScrollTop = preservePanelScroll ? ($("categoryPanel")?.scrollTop || 0) : 0;
+      const pageScrollTop = preservePanelScroll ? window.scrollY : null;
       const q = $("categorySearch").value.trim().toLowerCase();
       const tree = state.options.category_tree || {};
       const dict = state.options.category_dictionary || {};
+      const favoriteMode = state.categoryViewMode === "favorite";
       ensureActiveCategory();
 
       const parents = Object.keys(tree);
       const allMatches = [];
       for (const parent of parents) {
         const entries = categoryEntries(parent);
+        const parentFavorite = state.favoriteCategories.has(parent);
         const parentMatches = !q || parent.toLowerCase().includes(q);
         const matchedChildren = [];
         for (const [child, grandchildren] of entries) {
+          const childPath = `${parent}>${child}`;
+          const childFavorite = state.favoriteCategories.has(childPath);
+          const favoriteGrandchildren = grandchildren.filter(grand => state.favoriteCategories.has(`${childPath}>${grand}`));
+          if (favoriteMode && !parentFavorite && !childFavorite && !favoriteGrandchildren.length) continue;
+          const scopedGrandchildren = favoriteMode && !parentFavorite && !childFavorite ? favoriteGrandchildren : grandchildren;
           const childMatches = !q || `${parent} ${child}`.toLowerCase().includes(q);
-          const matchedGrandchildren = grandchildren.filter(grand => !q || `${parent} ${child} ${grand}`.toLowerCase().includes(q));
+          const matchedGrandchildren = scopedGrandchildren.filter(grand => !q || `${parent} ${child} ${grand}`.toLowerCase().includes(q));
           if (parentMatches || childMatches || matchedGrandchildren.length) {
-            matchedChildren.push([child, q && !parentMatches && !childMatches ? matchedGrandchildren : grandchildren]);
+            matchedChildren.push([child, q && !parentMatches && !childMatches ? matchedGrandchildren : scopedGrandchildren]);
           }
         }
-        if (parentMatches || matchedChildren.length) {
+        if ((!favoriteMode && parentMatches) || matchedChildren.length || (favoriteMode && parentFavorite)) {
           allMatches.push([parent, matchedChildren.length ? matchedChildren : entries]);
         }
       }
 
-      const visibleParents = q ? allMatches.map(([parent]) => parent) : parents;
+      const visibleParents = (q || favoriteMode) ? allMatches.map(([parent]) => parent) : parents;
       if (q && visibleParents.length && !visibleParents.includes(state.activeCategoryParent)) {
         state.activeCategoryParent = visibleParents[0];
         state.activeCategoryChild = "";
       }
-      const activeEntries = q
+      const activeEntries = (q || favoriteMode)
         ? (allMatches.find(([parent]) => parent === state.activeCategoryParent)?.[1] || [])
         : categoryEntries(state.activeCategoryParent);
       if (!state.activeCategoryChild || !activeEntries.some(([child]) => child === state.activeCategoryChild)) {
@@ -4130,6 +5676,7 @@ HTML_PAGE = r"""<!doctype html>
       const childHtml = activeEntries.map(([child, grandchildren]) => {
         const value = `${state.activeCategoryParent}>${child}`;
         const selectedCount = categorySelectedCount(state.activeCategoryParent, child);
+        const allChildrenSelected = grandchildren.length > 0 && selectedCount === grandchildren.length;
         return categoryRowHtml({
           value,
           label: child,
@@ -4138,8 +5685,10 @@ HTML_PAGE = r"""<!doctype html>
           meta: selectedCount ? `已选 ${selectedCount}` : `${grandchildren.length} 个三级`,
           current: child === state.activeCategoryChild,
           selected: state.selectedCategories.has(value) || selectedCount > 0,
-          checked: state.selectedCategories.has(value),
-          selectable: grandchildren.length === 0
+          checked: grandchildren.length ? allChildrenSelected : state.selectedCategories.has(value),
+          selectable: true,
+          groupTotal: grandchildren.length,
+          groupSelected: selectedCount
         });
       }).join("");
 
@@ -4169,18 +5718,19 @@ HTML_PAGE = r"""<!doctype html>
             <strong>类目字典 ${esc(dict.version || "-")}</strong>
             <span>${esc(dict.source || "-")} · ${esc(dict.status || "-")}</span>
           </div>
+          ${favoriteMode && !visibleParents.length ? `<div class="category-empty-favorites">还没有收藏类目。切换到“全部类目”，点击类目右侧 ☆ 收藏。</div>` : ""}
           <div class="category-cascade-grid">
             <div class="category-column">
               <div class="category-column-head"><strong>一级类目</strong><span>${visibleParents.length}/${parents.length}</span></div>
-              <div class="category-column-list">${parentHtml || `<div class="category-empty">没有匹配的一级类目</div>`}</div>
+              <div class="category-column-list" data-category-list="parent">${parentHtml || `<div class="category-empty">没有匹配的一级类目</div>`}</div>
             </div>
             <div class="category-column">
               <div class="category-column-head"><strong>二级类目</strong><span>${esc(state.activeCategoryParent || "请选择一级")}</span></div>
-              <div class="category-column-list">${childHtml || `<div class="category-empty">先选择左侧一级类目</div>`}</div>
+              <div class="category-column-list" data-category-list="child">${childHtml || `<div class="category-empty">先选择左侧一级类目</div>`}</div>
             </div>
             <div class="category-column">
-              <div class="category-column-head"><strong>三级类目</strong><span>${esc(state.activeCategoryChild || "请选择二级")}</span></div>
-              <div class="category-column-list">${grandHtml || `<div class="category-empty">当前二级暂无三级类目</div>`}</div>
+              <div class="category-column-head"><strong>三级类目</strong>${activeGrandchildren.length ? `<button type="button" data-category-select-all="true">${activeGrandchildren.every(grand => state.selectedCategories.has(`${state.activeCategoryParent}>${state.activeCategoryChild}>${grand}`)) ? `取消当前二级 ${activeGrandchildren.length} 项` : `全选当前二级 ${activeGrandchildren.length} 项`}</button>` : `<span>${esc(state.activeCategoryChild || "请选择二级")}</span>`}</div>
+              <div class="category-column-list" data-category-list="grand">${grandHtml || `<div class="category-empty">当前二级暂无三级类目</div>`}</div>
             </div>
           </div>
           <div class="category-selected-bar">
@@ -4189,6 +5739,30 @@ HTML_PAGE = r"""<!doctype html>
           </div>
         </div>
       `;
+      document.querySelectorAll("[data-category-view]").forEach(button => {
+        button.classList.toggle("is-active", button.dataset.categoryView === state.categoryViewMode);
+      });
+      if ($("favoriteCategoryCount")) $("favoriteCategoryCount").textContent = String(state.favoriteCategories.size);
+      wrap.querySelectorAll("input[data-category-group='true']").forEach(input => {
+        const selectedCount = Number(input.dataset.groupSelected || 0);
+        const total = Number(input.dataset.groupTotal || 0);
+        input.indeterminate = selectedCount > 0 && selectedCount < total;
+      });
+      if (preservedColumns.size) {
+        [...wrap.querySelectorAll("[data-category-list]")].forEach((node, index) => {
+          const key = node.dataset.categoryList;
+          node.scrollTop = preservedColumns.has(key) ? (previousScroll[key] || 0) : 0;
+        });
+        if ($("categoryPanel")) $("categoryPanel").scrollTop = panelScrollTop;
+        window.requestAnimationFrame(() => {
+          [...wrap.querySelectorAll("[data-category-list]")].forEach(node => {
+            const key = node.dataset.categoryList;
+            node.scrollTop = preservedColumns.has(key) ? (previousScroll[key] || 0) : 0;
+          });
+          if ($("categoryPanel")) $("categoryPanel").scrollTop = panelScrollTop;
+          if (pageScrollTop != null) window.scrollTo({top: pageScrollTop, behavior: "auto"});
+        });
+      }
       updateCategorySummary();
     }
 
@@ -4408,13 +5982,11 @@ HTML_PAGE = r"""<!doctype html>
       const keyword = $("keywords").value.trim();
       const matchType = $("matchType").value;
       const historyKeyword = $("historyKeyword").value.trim();
-      const templateName = $("templateName").value.trim();
       const sourceUrls = effectiveSourceUrls();
       if (categoryPaths.length) filters.category_paths = categoryPaths;
       if (keyword) filters.search_keyword = keyword;
       if (matchType && matchType !== "模糊匹配") filters.match_type = matchType;
       if (historyKeyword) filters.history_keyword = historyKeyword;
-      if (templateName) filters.template_name = templateName;
       if (sourceUrls) filters.source_urls = sourceUrls;
       document.querySelectorAll("[data-library-list]").forEach(input => {
         if (!input.checked) return;
@@ -4501,8 +6073,8 @@ HTML_PAGE = r"""<!doctype html>
       const sourceUrls = effectiveSourceUrls();
       const historyKeyword = $("historyKeyword")?.value.trim() || "";
       const searchParts = [keyword, historyKeyword].filter(Boolean);
-      $("selectedCategoryCount").textContent = categoryPaths.length ? `${categoryPaths.length} 个` : "全部";
-      $("selectedCategoryText").textContent = categoryPaths.length ? categoryPaths.slice(0, 3).join("、") : "全部类目";
+      $("selectedCategoryCount").textContent = categoryPaths.length ? `${categoryPaths.length} 个` : "未选择";
+      $("selectedCategoryText").textContent = categoryPaths.length ? categoryPaths.slice(0, 3).join("、") : "请选择最右侧叶子类目";
       $("selectedFilterCount").textContent = `${activeLabels.length} 项`;
       $("selectedFilterText").textContent = activeLabels.length ? activeLabels.slice(0, 5).join("、") : "未选择高级筛选";
       const sourceMode = $("collectSource")?.value || "rpa";
@@ -4524,7 +6096,7 @@ HTML_PAGE = r"""<!doctype html>
         const searchText = sourceMode === "manual_url"
           ? "当前页兜底读取"
           : (sourceMode === "rpa" ? "自动批量采集" : (sourceUrls ? "URL 采集" : (keyword ? `关键词 ${keyword}` : "待填写搜索入口")));
-        $("stickyActionText").textContent = `${categoryPaths.length ? `类目 ${categoryPaths.length} 个` : "全部类目"} · ${activeLabels.length} 个筛选 · ${searchText}`;
+        $("stickyActionText").textContent = `${categoryPaths.length ? `类目 ${categoryPaths.length} 个` : "未选择精确类目"} · ${activeLabels.length} 个筛选 · ${searchText}`;
       }
       const detailLabels = selectedDetailLabels(filters);
       const warning = $("detailWarning");
@@ -4596,6 +6168,10 @@ HTML_PAGE = r"""<!doctype html>
       if (key === "_select") {
         const keyValue = rowKey(row, index);
         return `<input class="row-select" type="checkbox" data-row-key="${esc(keyValue)}" ${state.selectedRows.has(keyValue) ? "checked" : ""} />`;
+      }
+      if (key === "image_cell") {
+        const imageUrl = row.image_url || "";
+        return imageUrl ? `<img class="product-thumb" src="${esc(imageUrl)}" alt="${esc(row.title || "商品主图")}" loading="lazy" />` : "-";
       }
       if (key === "url" && value) return `<a href="${esc(value)}" target="_blank" rel="noreferrer">打开</a>`;
       if (key === "recommendation_level") {
@@ -4779,14 +6355,445 @@ HTML_PAGE = r"""<!doctype html>
       `).join("") || `<div class="record-item"><strong>暂无核验记录</strong><span>采集后点击“真实详情核验”生成字段级记录。</span></div>`;
     }
 
+    function currentTemplateConfig() {
+      return {
+        categories: [...state.selectedCategories],
+        tags: [...state.selectedTags],
+        keywords: $("keywords").value,
+        source_urls: effectiveSourceUrls(),
+        exclude_tags: $("excludeTags").value,
+        library_filters: collectLibraryFilters(),
+        multi_category_mode: multiCategoryModeEnabled(),
+        max_queries: Number($("maxQueries").value || 20),
+        max_items_per_query: Number($("maxItems").value || 200),
+        target_publishable_count: Number($("targetPublishableCount").value || 60),
+        auto_verify_details: $("autoVerifyDetails").checked,
+        auto_verify_max_items: Number($("autoVerifyMax").value || $("maxItems").value || 200),
+        output_format: $("outputFormat").value,
+        collect_source: $("collectSource").value || "rpa"
+      };
+    }
+
+    function renderTemplates() {
+      const select = $("templateSelect");
+      if (!select) return;
+      const current = select.value;
+      select.innerHTML = `<option value="">选择已保存模板</option>` + (state.templates || []).map(item => (
+        `<option value="${esc(item.name)}">${esc(item.name)}</option>`
+      )).join("");
+      if ((state.templates || []).some(item => item.name === current)) select.value = current;
+      $("deleteTemplateBtn").disabled = !select.value;
+      if ($("templateStatus")) {
+        $("templateStatus").textContent = (state.templates || []).length
+          ? `已保存 ${(state.templates || []).length} 个模板；选择模板会恢复类目、重点筛选和采集数量。`
+          : "暂无已保存模板；保存后刷新页面仍可加载。";
+      }
+    }
+
+    function applyLibraryFiltersToUI(filters = {}) {
+      document.querySelectorAll("[data-library-list], [data-library-bool]").forEach(input => input.checked = false);
+      document.querySelectorAll("[data-library-range], [data-library-text]").forEach(input => input.value = "");
+      document.querySelectorAll("[data-library-radio]").forEach(input => input.checked = input.value === "不限");
+      document.querySelectorAll("[data-library-select]").forEach(input => input.value = input.dataset.defaultValue || "");
+      document.querySelectorAll("[data-library-list]").forEach(input => {
+        const values = filters[input.dataset.libraryList];
+        input.checked = Array.isArray(values) && values.includes(input.value);
+      });
+      document.querySelectorAll("[data-library-bool]").forEach(input => {
+        input.checked = Boolean(filters[input.dataset.libraryBool]);
+      });
+      document.querySelectorAll("[data-library-radio]").forEach(input => {
+        const value = filters[input.dataset.libraryRadio];
+        input.checked = value ? input.value === value : input.value === "不限";
+      });
+      document.querySelectorAll("[data-library-select]").forEach(input => {
+        const value = filters[input.dataset.librarySelect];
+        if (value != null && value !== "") input.value = value;
+      });
+      document.querySelectorAll("[data-library-text]").forEach(input => {
+        const value = filters[input.dataset.libraryText];
+        if (value != null) input.value = value;
+      });
+      document.querySelectorAll("[data-library-range]").forEach(input => {
+        const key = `${input.dataset.libraryRange}_${input.dataset.bound}`;
+        const value = filters[key];
+        input.value = value == null ? "" : value;
+      });
+      state.selectedLibrary = {...filters};
+    }
+
+    function applyTemplate(template) {
+      const config = template?.config || {};
+      state.selectedCategories = new Set(config.categories || []);
+      state.selectedTags = new Set(config.tags || []);
+      $("multiCategoryMode").checked = Boolean(config.multi_category_mode);
+      $("keywords").value = config.keywords || "";
+      $("sourceUrls").value = config.source_urls || "";
+      $("excludeTags").value = config.exclude_tags || "";
+      $("maxQueries").value = config.max_queries || 20;
+      $("maxItems").value = config.max_items_per_query || 200;
+      $("targetPublishableCount").value = config.target_publishable_count || 60;
+      $("autoVerifyDetails").checked = config.auto_verify_details !== false;
+      $("autoVerifyMax").value = config.auto_verify_max_items || 200;
+      $("outputFormat").value = config.output_format || "xlsx";
+      $("collectSource").value = config.collect_source || "rpa";
+      const firstCategory = [...state.selectedCategories][0] || "";
+      const parts = firstCategory.split(">");
+      state.activeCategoryParent = parts[0] || "";
+      state.activeCategoryChild = parts[1] || "";
+      renderCategories(false);
+      renderFilterGroups();
+      renderLibraryFilters();
+      applyLibraryFiltersToUI(config.library_filters || {});
+      updateCategoryTaskMode();
+      updateCollectModeUI(false);
+      updateScanEstimate();
+      updateSelectedSummary();
+      showNotice(`已加载模板：${template.name}`, true);
+    }
+
+    async function saveCurrentTemplate() {
+      const name = $("templateName").value.trim();
+      if (!name) {
+        showNotice("请先输入模板名称。", false, "paused");
+        $("templateName").focus();
+        return;
+      }
+      const response = await fetch("/api/templates/save", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({token: state.options.token, name, config: currentTemplateConfig()})
+      });
+      const result = await response.json();
+      if (!result.success) {
+        showNotice(result.markdown || "模板保存失败。", false);
+        return;
+      }
+      state.templates = result.data.templates || [];
+      renderTemplates();
+      $("templateSelect").value = name;
+      $("deleteTemplateBtn").disabled = false;
+      if ($("templateStatus")) $("templateStatus").textContent = `模板“${name}”已保存；刷新页面后仍可加载。`;
+      showNotice(`模板“${name}”已保存。`, true);
+    }
+
+    async function deleteCurrentTemplate() {
+      const name = $("templateSelect").value;
+      if (!name) return;
+      const response = await fetch("/api/templates/delete", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({token: state.options.token, name})
+      });
+      const result = await response.json();
+      state.templates = result.data?.templates || [];
+      renderTemplates();
+      $("templateName").value = "";
+      if ($("templateStatus")) $("templateStatus").textContent = `模板“${name}”已删除。`;
+      showNotice(`模板“${name}”已删除。`, true);
+    }
+
+    function updateScanEstimate() {
+      const input = $("maxItems");
+      if (!input) return;
+      const limit = Math.max(1, Math.min(200, Number(input.value || 200)));
+      const pages = Math.min(12, Math.max(1, Math.ceil(limit / 24) + 1));
+      document.querySelectorAll("[data-items-preset]").forEach(button => {
+        button.classList.toggle("is-active", Number(button.dataset.itemsPreset) === limit);
+      });
+      if ($("scanEstimate")) {
+        $("scanEstimate").textContent = limit >= 180
+          ? `深度采集：最多读取约 ${pages} 页，速度较慢，尽量采满 ${limit} 个去重候选。`
+          : `预计最多读取约 ${pages} 页，尽量采满 ${limit} 个去重候选。`;
+      }
+    }
+
+    function collectionStopReasonLabel(value) {
+      return {
+        target_met: "已达到目标可铺数量",
+        candidate_budget_exhausted: "候选扫描上限已用完",
+        source_exhausted_or_filters_too_strict: "没有更多候选，或筛选条件较严"
+      }[String(value || "")] || String(value || "");
+    }
+
+    function taskStatusLabel(status) {
+      return {
+        queued: "等待执行",
+        running: "正在采集",
+        cancelling: "正在停止",
+        cancelled: "已停止",
+        completed: "已完成",
+        paused: "等待人工处理",
+        failed: "执行失败",
+        interrupted: "服务重启中断"
+      }[String(status || "")] || "任务状态";
+    }
+
+    function recentTaskResultData(task = {}) {
+      return task.result?.data || task.result_summary?.data || {};
+    }
+
+    function recentTaskReason(task = {}) {
+      const progress = task.progress || {};
+      const resultData = recentTaskResultData(task);
+      const status = String(task.status || "");
+      if (status === "interrupted") return "Web 服务重启，原任务已中断，不会自动继续。";
+      if (status === "completed") {
+        const stopReason = collectionStopReasonLabel(progress.collection_stop_reason || resultData.collection_stop_reason || "");
+        const shortfall = progress.shortfall_reason || resultData.shortfall_reason || "";
+        return `${stopReason || "采集、筛选和导出已完成"}${shortfall ? `；${shortfall}` : ""}`;
+      }
+      return progress.message || task.result_summary?.markdown || "暂无停止原因。";
+    }
+
+    function renderRecentTasks(tasks = state.recentTasks) {
+      const list = $("recentTaskList");
+      if (!list) return;
+      const recent = Array.isArray(tasks) ? tasks.slice(0, 8) : [];
+      if ($("recentTasksCount")) $("recentTasksCount").textContent = recent.length ? `最近 ${recent.length} 条` : "暂无记录";
+      if (!recent.length) {
+        list.innerHTML = `<div class="recent-task-empty">还没有任务记录。运行开发样例或正式任务后，这里会保留最近状态；服务重启也不会直接消失。</div>`;
+        return;
+      }
+      list.innerHTML = recent.map(task => {
+        const status = String(task.status || "failed");
+        const statusClass = ["queued", "running", "cancelling", "cancelled", "completed", "paused", "failed", "interrupted"].includes(status) ? status : "failed";
+        const summary = task.summary || {};
+        const categories = Array.isArray(summary.categories) ? summary.categories : [];
+        const categoryCount = Number(summary.category_count || categories.length || 0);
+        const categoryPreview = categories.slice(0, 2).map(item => String(item || "").split(">").slice(-1)[0]).filter(Boolean).join("、");
+        const categoryText = categoryCount
+          ? `${categoryCount} 个类目${categoryPreview ? ` · ${categoryPreview}${categoryCount > 2 ? "等" : ""}` : ""}`
+          : "未限定类目";
+        const modeText = `${summary.sample_data ? "开发样例" : "真实模式"} · ${collectSourceLabel(summary.collect_source || "rpa")}`;
+        const progress = task.progress || {};
+        const resultData = recentTaskResultData(task);
+        const pages = Number(progress.pages_visited || resultData.pagination_pages_visited || 0);
+        const candidates = Number(progress.candidate_count ?? resultData.candidate_count ?? 0);
+        const limit = Number(progress.candidate_scan_limit || resultData.candidate_scan_limit || 0);
+        const rowCount = Number(resultData.row_count || 0);
+        const meta = [pages ? `${pages} 页` : "", (candidates || limit) ? `候选 ${candidates}/${limit || "-"}` : "", rowCount ? `结果 ${rowCount} 条` : ""].filter(Boolean).join(" · ") || "暂无数量摘要";
+        const runId = String(resultData.run_id || progress.run_id || "");
+        const downloadUrl = String(resultData.download_url || (runId ? `/download?run_id=${encodeURIComponent(runId)}` : ""));
+        const actions = runId ? `
+          <div class="recent-task-links">
+            <button type="button" data-recent-run="${esc(runId)}" data-recent-source="${esc(summary.collect_source || "rpa")}" data-recent-sample="${summary.sample_data ? "1" : "0"}">查看结果</button>
+            <a href="${esc(downloadUrl)}">下载</a>
+          </div>` : "";
+        return `
+          <div class="recent-task-item status-${statusClass}" data-recent-task-id="${esc(task.task_id || "")}">
+            <div class="recent-task-main">
+              <strong>${esc(categoryText)}</strong>
+              <span>${esc(modeText)} · ${esc(task.finished_at || task.started_at || task.created_at || "时间未知")}</span>
+            </div>
+            <div class="recent-task-detail">
+              <strong>${esc(meta)}</strong>
+              <span>${esc(safeNoticeText(recentTaskReason(task)))}</span>
+            </div>
+            <div class="recent-task-actions">
+              <span class="recent-task-status status-${statusClass}">${esc(taskStatusLabel(status))}</span>
+              ${actions}
+            </div>
+          </div>`;
+      }).join("");
+    }
+
+    function upsertRecentTask(task = {}) {
+      if (!task.task_id) return;
+      state.recentTasks = [task, ...(state.recentTasks || []).filter(item => item.task_id !== task.task_id)].slice(0, 20);
+      renderRecentTasks();
+    }
+
+    function renderTaskProgress(task = {}) {
+      const progress = task.progress || {};
+      const resultData = recentTaskResultData(task);
+      const taskKey = task.task_id || state.taskId || "unknown";
+      const manualSeenKey = `manual-seen:${taskKey}`;
+      if (progress.stage === "manual_intervention") {
+        playTaskAlertOnce(`manual:${taskKey}:${progress.alert_key || task.status || progress.updated_at || "attention"}`, "manual");
+        state.playedAlertKeys.add(manualSeenKey);
+      } else if (task.status === "paused" && !state.playedAlertKeys.has(manualSeenKey)) {
+        playTaskAlertOnce(`manual:${taskKey}:paused`, "manual");
+        state.playedAlertKeys.add(manualSeenKey);
+      }
+      if (task.status === "completed") {
+        playTaskAlertOnce(`completed:${taskKey}`, "completed");
+      }
+      const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+      $("taskProgress").hidden = false;
+      $("taskProgress").dataset.status = task.status || "unknown";
+      $("taskProgressTitle").textContent = taskStatusLabel(task.status);
+      $("taskProgressMessage").textContent = progress.message || "正在等待状态更新。";
+      $("taskProgressPercent").textContent = `${percent}%`;
+      $("taskProgressBar").style.width = `${percent}%`;
+      const meta = [];
+      if (progress.pages_visited) meta.push(`已读取 ${progress.pages_visited} 页`);
+      if (progress.candidate_count != null) meta.push(`候选 ${progress.candidate_count}/${progress.candidate_scan_limit || "-"}`);
+      if (progress.verification_total) meta.push(`详情核验 ${progress.verification_index || 0}/${progress.verification_total}`);
+      $("taskProgressMeta").textContent = meta.join(" · ") || `任务编号 ${task.task_id || state.taskId || "-"}`;
+      const terminal = ["completed", "paused", "failed", "cancelled", "interrupted"].includes(task.status);
+      const outcome = $("taskProgressOutcome");
+      if (outcome) {
+        const stopReason = progress.collection_stop_reason || resultData.collection_stop_reason || "";
+        const shortfall = progress.shortfall_reason || resultData.shortfall_reason || "";
+        let text = "";
+        if (task.status === "completed") {
+          text = `任务已结束：${collectionStopReasonLabel(stopReason) || "采集、筛选和导出已完成"}${shortfall ? `；${shortfall}` : ""}。本任务不会停一会再自动继续。`;
+        } else if (task.status === "paused") {
+          text = "任务已暂停并停止自动访问。请在采集 Chrome 中人工完成登录或安全验证，再回到工作台重新开始；系统不会自动重试。";
+        } else if (task.status === "cancelled") {
+          text = "任务已按你的操作停止，不会继续采集。";
+        } else if (task.status === "failed") {
+          text = "任务已失败并结束，不会继续采集；请按上方提示处理后重新开始。";
+        } else if (task.status === "interrupted") {
+          text = "Web 服务已重启，原任务明确中断且不会自动继续。请确认采集 Chrome 当前页面后，再手动新建任务。";
+        }
+        outcome.textContent = safeNoticeText(text);
+        outcome.hidden = !terminal || !text;
+      }
+      if ($("taskProgressStopBtn")) $("taskProgressStopBtn").disabled = !["queued", "running", "cancelling"].includes(task.status);
+      upsertRecentTask(task);
+    }
+
+    async function waitForTask(taskId) {
+      while (true) {
+        const response = await fetch(`/api/task/status?task_id=${encodeURIComponent(taskId)}&token=${encodeURIComponent(state.options.token)}`);
+        const wrapper = await response.json();
+        if (!wrapper.success) throw new Error(wrapper.markdown || "任务状态读取失败");
+        const task = wrapper.data || {};
+        state.taskStatus = task.status || "running";
+        renderTaskProgress(task);
+        if (["completed", "paused", "failed", "cancelled", "interrupted"].includes(task.status)) return task.result || {
+          success: false,
+          markdown: task.status === "cancelled" ? "任务已停止。" : (task.status === "paused" ? "任务已暂停，等待人工处理。" : (task.status === "interrupted" ? "Web 服务重启，原任务已中断。" : "任务执行失败。")),
+          data: {error_code: task.status === "cancelled" ? "task_cancelled" : (task.status === "paused" ? "manual_handoff" : (task.status === "interrupted" ? "task_interrupted" : "collect_failed")), rows: []}
+        };
+        await new Promise(resolve => setTimeout(resolve, 700));
+      }
+    }
+
+    async function stopCurrentTask() {
+      if (!state.taskId || !state.collecting) return;
+      ["stopTaskBtn", "stickyStopBtn"].forEach(id => { if ($(id)) $(id).disabled = true; });
+      const response = await fetch("/api/task/cancel", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({token: state.options.token, task_id: state.taskId})
+      });
+      const result = await response.json();
+      if (result.data) renderTaskProgress(result.data);
+      showNotice(result.markdown || "正在停止采集。", false, "paused");
+    }
+
+    async function loadRecentTaskRun(runId, sourceMode = "rpa", sampleData = false) {
+      if (!runId) return;
+      showNotice(`正在加载历史批次 ${runId}。`, false, "paused");
+      const response = await fetch(`/api/run?run_id=${encodeURIComponent(runId)}`);
+      const result = await response.json();
+      if (!result.success) {
+        showNotice(result.markdown || "历史批次已不存在，可能已被清理。", false, "fail");
+        return;
+      }
+      result.data = result.data || {};
+      result.data.download_url = result.data.download_url || `/download?run_id=${encodeURIComponent(runId)}`;
+      const applied = applyCollectResult(result, {sourceMode, sampleData});
+      if (applied) {
+        setTab("results");
+        $("resultSection")?.scrollIntoView({behavior: "smooth", block: "start"});
+      }
+    }
+
+    function applyCollectResult(result, context = {}) {
+      const sourceMode = context.sourceMode || $("collectSource").value;
+      const sourceUrlsForPayload = context.sourceUrlsForPayload || effectiveSourceUrls();
+      const sampleMode = context.sampleData == null ? state.debugSampleMode : Boolean(context.sampleData);
+      if (result.data && result.data.runtime) {
+        state.runtime = result.data.runtime;
+        renderChromeRuntime();
+        updateCollectModeUI(false);
+      }
+      if (!result.success) {
+        clearRunState();
+        state.filterResults = (result.data && result.data.filter_results) || [];
+        state.filterWarnings = state.filterResults;
+        renderFilterRecords();
+        const errorCode = result.data && result.data.error_code;
+        showNotice(
+          collectFailureNotice(result),
+          false,
+          ["security_verification_required", "login_required", "search_keyword_encoding_error", "search_box_not_found", "search_results_not_loaded", "category_navigation_not_loaded", "navigation_timeout", "direct_url_required", "direct_url_fetch_failed", "task_cancelled", "task_interrupted"].includes(errorCode) ? "paused" : "fail"
+        );
+        return false;
+      }
+      state.selectedRows.clear();
+      state.rows = result.data.rows || [];
+      state.runId = result.data.run_id || "";
+      state.verificationQueue = result.data.verification_queue || [];
+      state.verificationRecords = result.data.verification_records || [];
+      state.filterPlan = result.data.filter_plan || {};
+      state.filterResults = result.data.filter_results || [];
+      state.filterWarnings = result.data.filter_warnings || [];
+      renderTable();
+      updateSummary(result.data);
+      $("downloadLink").href = result.data.download_url;
+      $("downloadLink").hidden = false;
+      $("stickyDownloadLink").href = result.data.download_url;
+      $("stickyDownloadLink").hidden = false;
+      const sourceLabel = collectSourceLabel(sourceMode);
+      const modeText = sampleMode ? "调试样例" : `真实数据/${sourceLabel}`;
+      const queryLabel = sourceMode === "manual_url" ? "当前页" : (sourceUrlsForPayload ? "采集页面" : "查询词");
+      const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
+      const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
+      const targetText = result.data.target_publishable_count
+        ? `可铺目标 ${result.data.publishable_count || 0}/${result.data.target_publishable_count}，可铺/谨慎候选 ${result.data.publishable_candidate_count || 0}，候选扫描 ${result.data.candidate_count || 0}/${result.data.candidate_scan_limit || "-"}，历史跳过 ${result.data.skipped_rejected_count || 0}。`
+        : "";
+      const paginationText = result.data.pagination_pages_visited
+        ? `已读取 ${result.data.pagination_pages_visited} 页，分页采集 ${result.data.pagination_collected_count || 0} 个去重前候选。`
+        : "";
+      const shortfallText = result.data.shortfall_reason ? `未达目标：${result.data.shortfall_reason}。` : "";
+      const autoVerifyText = result.data.auto_verify_details
+        ? `已自动详情核验 ${result.data.verified_count || 0} 个，剩余待核验 ${state.verificationQueue.length} 个。`
+        : "运费、品退率、发货率等关键字段仍需详情页核验。";
+      const automation = result.data.automation_state || {};
+      const stateText = automation.message ? `状态：${automation.message}` : autoVerifyText;
+      const ok = (state.filterWarnings || []).length === 0 && !["paused", "failed", "partial"].includes(automation.status || "");
+      showNotice(`已生成 ${result.data.row_count} 条筛选结果（${modeText}）；${targetText}${paginationText}${shortfallText}${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}${autoVerifyText}${stateText ? ` ${stateText}` : ""}`, ok, automationNoticeMode(automation));
+      return true;
+    }
+
+    async function resumeActiveTask(task) {
+      if (!task?.task_id || !["queued", "running", "cancelling"].includes(task.status)) return;
+      state.taskId = task.task_id;
+      state.taskStatus = task.status;
+      setCollecting(true);
+      renderTaskProgress(task);
+      showNotice("检测到仍在执行的后台任务，已恢复进度跟踪。", false, "paused");
+      try {
+        const result = await waitForTask(state.taskId);
+        applyCollectResult(result);
+      } catch (err) {
+        showNotice(`恢复任务状态失败：${err.message}`, false);
+      } finally {
+        setCollecting(false);
+        state.taskId = "";
+      }
+    }
+
     async function runCollect() {
       if (state.collecting) {
         showNotice("已有采集任务正在执行，请等待当前任务完成后再启动新任务。", false, "paused");
         return;
       }
+      unlockSoundAlerts();
       setCollecting(true);
       try {
         const sourceMode = $("collectSource").value;
+        const keywordText = $("keywords").value.trim();
+        if (!state.debugSampleMode && sourceMode === "rpa" && !state.selectedCategories.size && !keywordText) {
+          setCategoryPanelOpen(true);
+          showNotice("为避免大类目混入错误商品，请先选到最右侧叶子类目；如果确实要按词搜索，也可以填写明确商品关键词。", false, "paused");
+          return;
+        }
         if (!state.debugSampleMode && sourceMode === "url_direct" && !$("sourceUrls").value.trim()) {
           focusSourceUrlBox();
           showNotice("还没有粘贴 1688 链接：请先去 1688 手动搜索/筛选商品，复制浏览器地址栏链接，再粘贴到下方蓝色 URL 输入框。", false, "paused");
@@ -4813,10 +6820,10 @@ HTML_PAGE = r"""<!doctype html>
           library_filters: libraryFilters,
           multi_category_mode: multiCategoryModeEnabled(),
           max_queries: Number($("maxQueries").value || 20),
-          max_items_per_query: Number($("maxItems").value || 5),
-          target_publishable_count: Number($("maxItems").value || 5),
+          max_items_per_query: Number($("maxItems").value || 200),
+          target_publishable_count: Number($("targetPublishableCount").value || 60),
           auto_verify_details: $("autoVerifyDetails").checked,
-          auto_verify_max_items: Number($("autoVerifyMax").value || $("maxItems").value || 20),
+          auto_verify_max_items: Number($("autoVerifyMax").value || $("maxItems").value || 200),
           output_format: $("outputFormat").value,
           collect_source: sourceMode,
           sample_data: state.debugSampleMode,
@@ -4828,64 +6835,25 @@ HTML_PAGE = r"""<!doctype html>
           false,
           "paused"
         );
-        const response = await fetch("/api/collect", {
+        const response = await fetch("/api/task/start", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
         });
-        const result = await response.json();
-        if (result.data && result.data.runtime) {
-          state.runtime = result.data.runtime;
-          renderChromeRuntime();
-          updateCollectModeUI(false);
+        const started = await response.json();
+        let result = started;
+        if (started.success && started.data?.task_id) {
+          state.taskId = started.data.task_id;
+          state.taskStatus = started.data.status || "queued";
+          renderTaskProgress(started.data);
+          result = await waitForTask(state.taskId);
         }
-        if (!result.success) {
-          clearRunState();
-          state.filterResults = (result.data && result.data.filter_results) || [];
-          state.filterWarnings = state.filterResults;
-          renderFilterRecords();
-          const errorCode = result.data && result.data.error_code;
-          showNotice(
-            collectFailureNotice(result),
-            false,
-            ["security_verification_required", "login_required", "search_keyword_encoding_error", "search_box_not_found", "search_results_not_loaded", "category_navigation_not_loaded", "navigation_timeout", "direct_url_required", "direct_url_fetch_failed"].includes(errorCode) ? "paused" : "fail"
-          );
-          return;
-        }
-        state.selectedRows.clear();
-        state.rows = result.data.rows || [];
-        state.runId = result.data.run_id || "";
-        state.verificationQueue = result.data.verification_queue || [];
-        state.verificationRecords = result.data.verification_records || [];
-        state.filterPlan = result.data.filter_plan || {};
-        state.filterResults = result.data.filter_results || [];
-        state.filterWarnings = result.data.filter_warnings || [];
-        renderTable();
-        updateSummary(result.data);
-        $("downloadLink").href = result.data.download_url;
-        $("downloadLink").hidden = false;
-        $("stickyDownloadLink").href = result.data.download_url;
-        $("stickyDownloadLink").hidden = false;
-        const sourceLabel = collectSourceLabel($("collectSource").value);
-        const modeText = state.debugSampleMode ? "调试样例" : `真实数据/${sourceLabel}`;
-        const queryLabel = sourceMode === "manual_url" ? "当前页" : (sourceUrlsForPayload ? "采集页面" : "查询词");
-        const warningText = (state.filterWarnings || []).map(item => `${item.label || item.tag || item.filter_key}:${item.status}`).join("；");
-        const nativeText = ((state.filterPlan.native_filters || []).map(item => item.label || item.tag).filter(Boolean)).join("，");
-        const targetText = result.data.target_publishable_count
-          ? `可铺目标 ${result.data.publishable_count || 0}/${result.data.target_publishable_count}，可铺/谨慎候选 ${result.data.publishable_candidate_count || 0}，候选扫描 ${result.data.candidate_count || 0}/${result.data.candidate_scan_limit || "-"}，历史跳过 ${result.data.skipped_rejected_count || 0}。`
-          : "";
-        const shortfallText = result.data.shortfall_reason ? `未达目标：${result.data.shortfall_reason}。` : "";
-        const autoVerifyText = result.data.auto_verify_details
-          ? `已自动详情核验 ${result.data.verified_count || 0} 个，剩余待核验 ${state.verificationQueue.length} 个。`
-          : "运费、品退率、发货率等关键字段仍需详情页核验。";
-        const automation = result.data.automation_state || {};
-        const stateText = automation.message ? `状态：${automation.message}` : autoVerifyText;
-        const ok = (state.filterWarnings || []).length === 0 && !["paused", "failed", "partial"].includes(automation.status || "");
-        showNotice(`已生成 ${result.data.row_count} 条筛选结果（${modeText}）；${targetText}${shortfallText}${queryLabel}：${(result.data.queries || []).join("，")}。原生筛选：${nativeText || "无"}。${warningText ? `筛选提示：${warningText}。` : ""}${autoVerifyText}${stateText ? ` ${stateText}` : ""}`, ok, automationNoticeMode(automation));
+        applyCollectResult(result, {sourceMode, sourceUrlsForPayload});
       } catch (err) {
         showNotice(`采集失败：${err.message}`, false);
       } finally {
         setCollecting(false);
+        state.taskId = "";
       }
     }
 
@@ -4946,10 +6914,14 @@ HTML_PAGE = r"""<!doctype html>
       if (!target.matches("input[type='checkbox'][data-kind]")) return;
       if (target.dataset.kind === "category") {
         collectLibraryFilters();
-        setCategorySelection(target.value, target.checked);
         const parts = target.value.split(">");
         if (parts[0]) state.activeCategoryParent = parts[0];
         if (parts[1]) state.activeCategoryChild = parts[1];
+        if (target.dataset.categoryGroup === "true" && parts[0] && parts[1]) {
+          setCategoryGroupSelection(target.value, target.checked);
+        } else {
+          setCategorySelection(target.value, target.checked);
+        }
       } else {
         target.checked ? state.selectedTags.add(target.value) : state.selectedTags.delete(target.value);
       }
@@ -4979,7 +6951,56 @@ HTML_PAGE = r"""<!doctype html>
       target.scrollIntoView({behavior: "smooth", block: "start"});
     });
 
+    document.addEventListener("click", async (event) => {
+      const action = event.target.closest("[data-recent-run]");
+      if (!action) return;
+      action.disabled = true;
+      try {
+        await loadRecentTaskRun(
+          action.dataset.recentRun,
+          action.dataset.recentSource || "rpa",
+          action.dataset.recentSample === "1"
+        );
+      } catch (err) {
+        showNotice(`历史结果加载失败：${err.message}`, false, "fail");
+      } finally {
+        action.disabled = false;
+      }
+    });
+
     document.addEventListener("click", (event) => {
+      const view = event.target.closest("[data-category-view]");
+      if (view) {
+        state.categoryViewMode = view.dataset.categoryView === "favorite" ? "favorite" : "all";
+        state.activeCategoryParent = "";
+        state.activeCategoryChild = "";
+        renderCategories(false);
+        return;
+      }
+      const favorite = event.target.closest("[data-category-favorite]");
+      if (favorite) {
+        toggleFavoriteCategory(favorite.dataset.categoryFavorite);
+        renderCategories();
+        return;
+      }
+      const groupAction = event.target.closest("[data-category-group-action]");
+      if (groupAction) {
+        collectLibraryFilters();
+        setCategoryGroupSelection(groupAction.dataset.categoryGroupAction);
+        renderCategories();
+        renderLibraryFilters();
+        updateSelectedSummary();
+        return;
+      }
+      const selectAll = event.target.closest("[data-category-select-all]");
+      if (selectAll) {
+        collectLibraryFilters();
+        setCategoryGroupSelection(`${state.activeCategoryParent}>${state.activeCategoryChild}`);
+        renderCategories();
+        renderLibraryFilters();
+        updateSelectedSummary();
+        return;
+      }
       const remove = event.target.closest("[data-category-remove]");
       if (remove) {
         collectLibraryFilters();
@@ -5011,7 +7032,10 @@ HTML_PAGE = r"""<!doctype html>
         state.activeCategoryChild = parts[1] || "";
         if (path) setCategorySelection(path, true);
       }
-      renderCategories();
+      const scrollPolicy = nav.dataset.categoryNav === "parent"
+        ? ["parent"]
+        : (nav.dataset.categoryNav === "child" ? ["parent", "child"] : ["parent", "child", "grand"]);
+      renderCategories(scrollPolicy);
       renderLibraryFilters();
       updateSelectedSummary();
     });
@@ -5044,17 +7068,38 @@ HTML_PAGE = r"""<!doctype html>
       });
     });
 
-    $("categorySearch").addEventListener("input", renderCategories);
-    $("toggleCategoryPanel").addEventListener("click", () => {
-      const panel = $("categoryPanel");
-      panel.classList.toggle("is-open");
-      $("toggleCategoryPanel").textContent = panel.classList.contains("is-open") ? "收起类目" : "选择类目";
+    $("categorySearch").addEventListener("input", () => renderCategories(false));
+    $("toggleCategoryPanel").addEventListener("click", () => setCategoryPanelOpen(true));
+    $("closeCategoryPanel").addEventListener("click", () => setCategoryPanelOpen(false));
+    $("confirmCategoryPanel").addEventListener("click", () => setCategoryPanelOpen(false));
+    $("categoryPanel").addEventListener("click", (event) => {
+      if (event.target === $("categoryPanel")) setCategoryPanelOpen(false);
+    });
+    $("categoryPanel").addEventListener("wheel", (event) => {
+      const delta = event.deltaY;
+      if (!delta || !(event.target instanceof Element)) return;
+      let node = event.target;
+      let canConsume = false;
+      while (node && node !== $("categoryPanel")) {
+        if (node.matches?.("[data-category-list], .category-modal-content, .category-modal-body, .category-picker")) {
+          const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+          if (maxScrollTop > 0 && ((delta < 0 && node.scrollTop > 0) || (delta > 0 && node.scrollTop < maxScrollTop))) {
+            canConsume = true;
+            break;
+          }
+        }
+        node = node.parentElement;
+      }
+      if (!canConsume) event.preventDefault();
+    }, {passive: false});
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && $("categoryPanel").classList.contains("is-open")) setCategoryPanelOpen(false);
     });
     $("multiCategoryMode").addEventListener("change", () => {
       collectLibraryFilters();
       const before = state.selectedCategories.size;
       normalizeCategorySelectionMode();
-      renderCategories();
+      renderCategories(false);
       renderLibraryFilters();
       updateCategoryTaskMode();
       updateSelectedSummary();
@@ -5067,7 +7112,7 @@ HTML_PAGE = r"""<!doctype html>
       state.selectedCategories.clear();
       state.activeCategoryParent = "";
       state.activeCategoryChild = "";
-      renderCategories();
+      renderCategories(false);
       renderLibraryFilters();
       updateSelectedSummary();
     });
@@ -5079,6 +7124,8 @@ HTML_PAGE = r"""<!doctype html>
       state.selectedLibrary = {};
       state.selectedRows.clear();
       if ($("multiCategoryMode")) $("multiCategoryMode").checked = false;
+      if ($("templateSelect")) $("templateSelect").value = "";
+      if ($("deleteTemplateBtn")) $("deleteTemplateBtn").disabled = true;
       ["keywords", "sourceUrls", "excludeTags", "historyKeyword", "templateName", "titleFilter"].forEach(id => {
         if ($(id)) $(id).value = "";
       });
@@ -5086,7 +7133,9 @@ HTML_PAGE = r"""<!doctype html>
         if ($(id)) $(id).value = "0";
       });
       if ($("autoVerifyDetails")) $("autoVerifyDetails").checked = true;
-      if ($("autoVerifyMax")) $("autoVerifyMax").value = "20";
+      if ($("autoVerifyMax")) $("autoVerifyMax").value = "200";
+      if ($("maxItems")) $("maxItems").value = "200";
+      if ($("targetPublishableCount")) $("targetPublishableCount").value = "60";
       if ($("matchType")) $("matchType").value = "模糊匹配";
       if ($("collectSource")) $("collectSource").value = "rpa";
       if ($("statPeriod")) $("statPeriod").value = "近30天";
@@ -5105,7 +7154,9 @@ HTML_PAGE = r"""<!doctype html>
       renderTable();
       updateCategoryTaskMode();
       updateCollectModeUI();
+      updateScanEstimate();
       updateSelectedSummary();
+      if ($("taskProgress") && !state.collecting) $("taskProgress").hidden = true;
       showNotice("筛选条件已重置。", true);
     });
     $("selectAllRows").addEventListener("change", (event) => {
@@ -5122,13 +7173,20 @@ HTML_PAGE = r"""<!doctype html>
     $("statPeriod").addEventListener("change", (event) => {
       $("periodView").value = event.target.value;
     });
-    ["saveTemplateBtn", "saveFilterBtn"].forEach(id => {
-      $(id).addEventListener("click", () => {
-        showNotice("该功能接口已预留，当前版本不会伪造执行结果。", false);
-      });
+    ["saveTemplateBtn", "saveFilterBtn"].forEach(id => $(id).addEventListener("click", saveCurrentTemplate));
+    $("deleteTemplateBtn").addEventListener("click", deleteCurrentTemplate);
+    $("templateSelect").addEventListener("change", (event) => {
+      const template = (state.templates || []).find(item => item.name === event.target.value);
+      $("deleteTemplateBtn").disabled = !template;
+      if (!template) return;
+      $("templateName").value = template.name;
+      applyTemplate(template);
     });
     $("runBtn").addEventListener("click", runCollect);
     $("stickyRunBtn").addEventListener("click", runCollect);
+    $("stopTaskBtn").addEventListener("click", stopCurrentTask);
+    $("stickyStopBtn").addEventListener("click", stopCurrentTask);
+    $("taskProgressStopBtn").addEventListener("click", stopCurrentTask);
     $("readCurrentPageBtn").addEventListener("click", runCollect);
     $("startChromeBtn").addEventListener("click", startCollectChrome);
     $("refreshChromeBtn").addEventListener("click", () => refreshChromeStatus(true));
@@ -5139,6 +7197,20 @@ HTML_PAGE = r"""<!doctype html>
       document.body.classList.toggle("review-mode", state.reviewMode);
       showNotice(state.reviewMode ? "调试视图已开启：会显示字段映射、预留字段和执行记录。" : "调试视图已关闭：仅显示业务筛选和结果。", true);
     });
+    $("soundAlertsToggle").addEventListener("change", (event) => {
+      state.soundAlertsEnabled = Boolean(event.target.checked);
+      saveSoundAlertPreference();
+      if (state.soundAlertsEnabled) unlockSoundAlerts();
+      showNotice(state.soundAlertsEnabled ? "声音提醒已开启：需要人工处理时双滴提示，任务完成时播放完成音。" : "声音提醒已关闭。", true);
+    });
+    $("maxItems").addEventListener("input", updateScanEstimate);
+    document.addEventListener("click", (event) => {
+      const preset = event.target.closest("[data-items-preset]");
+      if (!preset) return;
+      $("maxItems").value = preset.dataset.itemsPreset;
+      updateScanEstimate();
+      updateSelectedSummary();
+    });
 
     async function init() {
       const debugFlags = readDebugParams();
@@ -5146,10 +7218,19 @@ HTML_PAGE = r"""<!doctype html>
       const result = await response.json();
       state.options = result.data;
       state.runtime = state.options.runtime || {};
+      state.templates = state.options.templates || [];
+      state.recentTasks = state.options.recent_tasks || [];
+      loadFavoriteCategories();
+      loadSoundAlertPreference();
+      renderTemplates();
+      renderRecentTasks();
+      if ($("versionBadge")) $("versionBadge").textContent = `问题修复版 ${state.options.workbench_build || ""}`.trim();
       const caps = state.options.library_capabilities || {};
       $("capabilityBadge").textContent = `已接入 ${((caps.implemented || []).length)} 项 / 预留 ${((caps.reserved || []).length)} 项`;
       $("maxQueries").max = state.options.limits.max_queries;
       $("maxItems").max = state.options.limits.max_items_per_query;
+      $("autoVerifyMax").max = state.options.limits.max_items_per_query;
+      $("targetPublishableCount").max = state.options.limits.max_target_publishable_count;
       state.debugSampleMode = debugFlags.sample;
       state.debugViewMode = debugFlags.view || debugFlags.sample;
       state.reviewMode = state.debugViewMode;
@@ -5168,7 +7249,9 @@ HTML_PAGE = r"""<!doctype html>
       renderChromeRuntime();
       updateCollectModeUI(true);
       updateCategoryTaskMode();
+      updateScanEstimate();
       updateSelectedSummary();
+      resumeActiveTask(state.options.active_task || {});
     }
 
     init();
