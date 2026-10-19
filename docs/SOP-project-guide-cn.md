@@ -14,6 +14,17 @@ SOP 是一个面向 1688 选品运营的本地工具项目。当前测试口径�
 
 项目不是绕过 1688 风控的爬虫，也不做验证码绕过、账号密码保存或高频抓取。RPA 的用途是按运营筛选条件低频采集和核验真实页面。
 
+### 1.1 Windows 一键安装
+
+项目支持生成单文件 `SOP1688-Setup-x64.exe`。安装包内置 Python、Node.js 和 Playwright 代码，安装后通过桌面/开始菜单启动本地工作台，不要求使用者配置开发环境。
+
+- 程序目录：`%LOCALAPPDATA%\Programs\SOP1688`
+- 运行数据：`%LOCALAPPDATA%\SOP1688`
+- 工作台：`http://127.0.0.1:8765/`
+- 浏览器：优先 Google Chrome，缺失时回退 Microsoft Edge
+
+构建和发布说明见 `packaging/windows/README.md`。安装包不得包含 AK、Cookie、浏览器 Profile、真实采集数据或导出文件；遇到 1688 登录、滑块和验证码仍必须人工处理。
+
 ## 2. 已实现功能
 
 ### 2.1 标签选品 Web 工作台

@@ -14,6 +14,9 @@
 - 风险和禁区：`docs/RISKS.md`
 - 运行记录：`docs/RUNS/`
 - 架构决策：`docs/DECISIONS/`
+- Windows 安装包：`packaging/windows/README.md`
+- Windows 构建脚本：`packaging/windows/build-installer.ps1`
+- Windows 桌面启动器：`packaging/windows/launcher.py`
 
 ## 标签选品采集
 

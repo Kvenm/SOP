@@ -23,6 +23,12 @@ SOP 是一个面向 1688 选品、字段核验、导出复核和后续铺货 dry
 请帮我安装这个 skill：https://github.com/<你的 GitHub 用户名>/SOP.git
 ```
 
+### Windows 一键安装包
+
+标签选品 Web 工作台可以打包为单文件 `SOP1688-Setup-x64.exe`。最终用户双击安装后，通过桌面快捷方式启动，不需要另装 Python、Node.js 或 npm 依赖；浏览器优先使用 Google Chrome，没有 Chrome 时回退到 Windows 自带 Edge。
+
+构建方式和发布检查见 [`packaging/windows/README.md`](./packaging/windows/README.md)。安装包不会包含 AK、Cookie、浏览器 Profile、真实采集数据或导出表格。
+
 ## 使用前准备
 
 1. 下载 [**1688 AI版 APP**](https://air.1688.com/kapp/1688-ai-app/pages/home?from=1688-shopkeeper)
